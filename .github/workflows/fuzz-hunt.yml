@@ -5,26 +5,36 @@ on:
     branches: [fuzz-hunt]
 
 jobs:
-  # bisect: current crate versions vs pinned-back versions, parse-only vs full
-  regression:
-    strategy:
-      fail-fast: false
-      matrix:
-        versions: [current, pinned-back]
+  stackprobe:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.versions }}
-      - name: pin back tree-sitter versions
-        if: matrix.versions == 'pinned-back'
+      - name: big stack 64M
+        run: cargo test -p doover-core --test stackprobe probe_big_stack -- --nocapture
+      - name: small stack 128K
+        if: always()
+        run: cargo test -p doover-core --test stackprobe probe_small_stack -- --nocapture
+
+  minimize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build parse_stdin
+        run: cargo build -p doover-core --example parse_stdin
+      - name: extract crasher bytes
         run: |
-          sed -i 's/tree-sitter = "0.25"/tree-sitter = "=0.24.7"/' Cargo.toml
-          sed -i 's/tree-sitter-bash = "0.25"/tree-sitter-bash = "=0.23.3"/' Cargo.toml
-          cargo update -p tree-sitter -p tree-sitter-bash || cargo update
-      - name: stage 1 — parse only
-        run: cargo test -p doover-core --test segfault_regressions parse_only -- --nocapture
-      - name: stage 2 — full resolve
-        run: cargo test -p doover-core --test segfault_regressions full_resolve -- --nocapture
+          cat > /tmp/write_crasher.rs <<'EOF'
+          fn main() {
+              let c = "Z#`|.u` d=?M}M\nu&c?-Ii\\'~{r]&& *'\u{62fe7}~z.\u{bc6a7}(\u{104f28}'>?}Wf)3e]$f@mcf}{\u{cd4b6} ?[)mE*.d{>>)6\n$\u{f109c}dr~Ujc\"-Ca=(*`>vz𪽉}~)&oa=KC)\n\"$`$\u{98975}v`\u{6fd66}!/v\u{e001e}f";
+              std::io::Write::write_all(&mut std::io::stdout(), c.as_bytes()).unwrap();
+          }
+          EOF
+          rustc -O /tmp/write_crasher.rs -o /tmp/write_crasher
+          /tmp/write_crasher > /tmp/crasher.bin
+          wc -c /tmp/crasher.bin
+      - name: minimize
+        run: bash scripts/minimize.sh /tmp/crasher.bin target/debug/examples/parse_stdin
