@@ -68,7 +68,32 @@ const OPAQUE_COMMANDS: &[&str] = &[
 
 const GLOB_CHARS: &[char] = &['*', '?', '['];
 
+/// tree-sitter-bash's error recovery can recurse pathologically deep in its C
+/// code — a minimized 7-byte input (`''{` + one astral-plane char, found by
+/// fuzz-hunt 2026-07-06) needs >2 MB of stack and segfaults default threads on
+/// Linux. Parsing therefore runs on a dedicated thread with a generous stack;
+/// any panic or spawn failure degrades to a conservative Unknown resolution.
+const RESOLVER_STACK_BYTES: usize = 32 * 1024 * 1024;
+
 pub fn resolve(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("doover-resolver".into())
+            .stack_size(RESOLVER_STACK_BYTES)
+            .spawn_scoped(scope, || resolve_inner(command, registry, ctx));
+        match handle.map(|h| h.join()) {
+            Ok(Ok(resolution)) => resolution,
+            _ => Resolution {
+                severity: Severity::Unknown,
+                paths: Vec::new(),
+                rule_id: None,
+                has_unknown: true,
+            },
+        }
+    })
+}
+
+fn resolve_inner(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
     let mut out = Out::default();
 
     let mut parser = tree_sitter::Parser::new();
