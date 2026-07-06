@@ -43,6 +43,14 @@ pub struct ScopeSpec {
     pub paths: PathSource,
     #[serde(default = "default_true")]
     pub globs: bool,
+    /// Leading positional arguments that are not paths (sed scripts, chmod
+    /// modes) and must be dropped before scope extraction.
+    #[serde(default)]
+    pub skip: usize,
+    /// Flags that consume the following argument (`truncate -s 0`): that
+    /// argument is not a path and must not enter the scope.
+    #[serde(default)]
+    pub flag_args: Vec<String>,
     #[serde(default)]
     pub recursive_flags: Vec<String>,
 }
@@ -110,6 +118,7 @@ const SHIPPED: &[(&str, &str)] = &[
     ("shell.yaml", include_str!("../registry/shell.yaml")),
     ("git.yaml", include_str!("../registry/git.yaml")),
     ("net.yaml", include_str!("../registry/net.yaml")),
+    ("posix.yaml", include_str!("../registry/posix.yaml")),
 ];
 
 pub struct Registry {

@@ -1,0 +1,61 @@
+# T1 corpus — opaque constructs. Load-bearing invariant: these must NEVER
+# classify as safe. `unknown: true` routes them through the unknown policy.
+
+cases:
+  - name: opaque-eval-direct
+    cmd: "eval 'rm -rf ./x'"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-source
+    cmd: "source setup.sh"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-dot-source
+    cmd: ". ./env.sh"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-bash-c
+    cmd: "bash -c 'rm -rf ./x'"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-sh-c
+    cmd: 'sh -c "rm -rf ./x"'
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-zsh-c
+    cmd: "zsh -c 'rm x'"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-xargs-pipeline
+    cmd: "find . -name '*.log' | xargs rm"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-command-substitution-statement
+    cmd: "$(cat cmds.txt)"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-backtick-statement
+    cmd: "`cat cmds.txt`"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-variable-as-command
+    cmd: "$CLEANER ./data"
+    expect: { effect: unknown, unknown: true }
+
+  - name: opaque-var-arg-keeps-rm-severity
+    # rm is registered (destructive wins the severity merge) but its target is
+    # unresolvable, so the unknown flag must also be set
+    cmd: "rm -rf $TARGET"
+    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.rm }
+
+  - name: opaque-sudo-wrapper
+    cmd: "sudo rm -rf ./cache"
+    expect: { effect: unknown, unknown: true }
+
+  - name: find-delete-destructive-no-scope
+    cmd: "find . -delete"
+    expect: { effect: destructive, paths: [], unknown: true, rule: posix.find-delete }
+
+  - name: unregistered-interpreter
+    cmd: "python cleanup.py"
+    expect: { effect: unknown, unknown: true }

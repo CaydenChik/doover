@@ -1,0 +1,39 @@
+# T1 corpus — glob expansion against the jail filesystem at hook time.
+
+cases:
+  - name: glob-star-bak
+    cmd: "rm *.bak"
+    cwd_fixture: ["a.bak", "b.bak", "keep.txt"]
+    expect: { effect: destructive, paths: ["a.bak", "b.bak"], rule: coreutils.rm }
+
+  - name: glob-subdir
+    cmd: "rm -f logs/*.log"
+    cwd_fixture: ["logs/one.log", "logs/two.log", "logs/keep.md"]
+    expect: { effect: destructive, paths: ["logs/one.log", "logs/two.log"], rule: coreutils.rm }
+
+  - name: glob-question-mark
+    cmd: "rm f?.txt"
+    cwd_fixture: ["f1.txt", "f2.txt", "keep.txt"]
+    expect: { effect: destructive, paths: ["f1.txt", "f2.txt"], rule: coreutils.rm }
+
+  - name: glob-char-class
+    cmd: "rm [ab].txt"
+    cwd_fixture: ["a.txt", "b.txt", "c.txt"]
+    expect: { effect: destructive, paths: ["a.txt", "b.txt"], rule: coreutils.rm }
+
+  - name: glob-no-match-flags-unknown
+    # nothing matches, nothing can be pre-snapshotted; the conservative flag
+    # routes this through the unknown policy instead of claiming coverage
+    cmd: "rm *.tmp"
+    cwd_fixture: ["keep.txt"]
+    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.rm }
+
+  - name: glob-quoted-is-literal
+    cmd: "rm '*.bak'"
+    cwd_fixture: ["a.bak"]
+    expect: { effect: destructive, paths: ["*.bak"], rule: coreutils.rm }
+
+  - name: glob-after-cd
+    cmd: "cd sub && rm *.dat"
+    cwd_fixture: ["sub/x.dat", "sub/y.dat"]
+    expect: { effect: destructive, paths: ["sub/x.dat", "sub/y.dat"], rule: coreutils.rm }

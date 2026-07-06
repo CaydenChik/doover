@@ -1,0 +1,19 @@
+# T1 corpus — externalizing actions: effects leave the machine; journal + flag,
+# nothing to snapshot.
+
+cases:
+  - name: curl-post
+    cmd: "curl -X POST -d @payload.json https://api.example.com/v1/items"
+    expect: { effect: externalizing, paths: [], rule: net.curl }
+
+  - name: curl-get-still-externalizing
+    cmd: "curl https://example.com"
+    expect: { effect: externalizing, paths: [], rule: net.curl }
+
+  - name: wget-download-is-mutating
+    cmd: "wget https://example.com/release.tgz"
+    expect: { effect: mutating, paths: [], rule: net.wget }
+
+  - name: curl-in-pipeline
+    cmd: "curl https://example.com | grep token"
+    expect: { effect: externalizing, paths: [], rule: net.curl }

@@ -32,3 +32,18 @@ rules:
     effect: externalizing
     undo: none
     notes: "Leaves the machine. --force rewrites remote history — flagged HIGH in the journal."
+
+  - id: git.log
+    match: { command: git, subcommand: log }
+    effect: safe
+    undo: none
+
+  - id: git.diff
+    match: { command: git, subcommand: diff }
+    effect: safe
+    undo: none
+
+  - id: git.show
+    match: { command: git, subcommand: show }
+    effect: safe
+    undo: none

@@ -1,0 +1,30 @@
+# T1 corpus — in-place editors, flag-target commands, degenerate inputs.
+
+cases:
+  - name: sed-in-place-gnu-form
+    # scope skip:1 drops the script argument, leaving the file
+    cmd: "sed -i s/alpha/beta/ config.ini"
+    expect: { effect: destructive, paths: ["config.ini"], rule: posix.sed-in-place }
+
+  - name: dd-flag-target-flags-unknown
+    # of= is not extractable yet (scope: none): destructive with zero concrete
+    # paths must set the unknown flag so the engine falls back to cwd snapshot
+    cmd: "dd if=/dev/zero of=disk.img bs=1m count=1"
+    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.dd }
+
+  - name: sort-o-overwrites
+    # over-capture documented: input.txt is snapshotted too (harmless)
+    cmd: "sort -o sorted.txt input.txt"
+    expect: { effect: destructive, paths: ["sorted.txt", "input.txt"], rule: posix.sort-o }
+
+  - name: find-exec-rm
+    cmd: 'find . -name "*.tmp" -exec rm {} ;'
+    expect: { effect: destructive, paths: [], unknown: true, rule: posix.find-exec }
+
+  - name: bare-variable-assignment-is-safe
+    cmd: "FOO=bar"
+    expect: { effect: safe, paths: [] }
+
+  - name: comment-only-is-safe
+    cmd: "# nothing to see here"
+    expect: { effect: safe, paths: [] }

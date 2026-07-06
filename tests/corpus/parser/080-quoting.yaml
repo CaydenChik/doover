@@ -1,0 +1,26 @@
+# T1 corpus — quoting, spaces, escapes, unicode: paths must survive exactly.
+
+cases:
+  - name: quote-double-space
+    cmd: 'rm "my file.txt"'
+    expect: { effect: destructive, paths: ["my file.txt"], rule: coreutils.rm }
+
+  - name: quote-single-space
+    cmd: "rm 'other file.txt'"
+    expect: { effect: destructive, paths: ["other file.txt"], rule: coreutils.rm }
+
+  - name: unicode-cyrillic
+    cmd: "rm фото.jpg"
+    expect: { effect: destructive, paths: ["фото.jpg"], rule: coreutils.rm }
+
+  - name: unicode-emoji-dir
+    cmd: "rm -rf ./📸-pics"
+    expect: { effect: destructive, paths: ["📸-pics"], rule: coreutils.rm }
+
+  - name: concat-quoted-and-bare
+    cmd: 'rm "back"up.txt'
+    expect: { effect: destructive, paths: ["backup.txt"], rule: coreutils.rm }
+
+  - name: escaped-space
+    cmd: 'rm my\ file.txt'
+    expect: { effect: destructive, paths: ["my file.txt"], rule: coreutils.rm }

@@ -1,0 +1,49 @@
+# T1 corpus — git footguns. Repo scope resolves to the enclosing repo root
+# (".git/" in the fixture); "." in expected paths means the jail cwd itself.
+
+cases:
+  - name: git-reset-hard
+    cmd: "git reset --hard"
+    cwd_fixture: [".git/"]
+    expect: { effect: destructive, paths: ["."], rule: git.reset-hard }
+
+  - name: git-reset-hard-ref
+    cmd: "git reset --hard HEAD~1"
+    cwd_fixture: [".git/"]
+    expect: { effect: destructive, paths: ["."], rule: git.reset-hard }
+
+  - name: git-clean-fd
+    cmd: "git clean -fd"
+    cwd_fixture: [".git/"]
+    expect: { effect: destructive, paths: ["."], rule: git.clean }
+
+  - name: git-checkout-pathspec
+    cmd: "git checkout -- ."
+    cwd_fixture: [".git/"]
+    expect: { effect: destructive, paths: ["."], rule: git.checkout }
+
+  - name: git-checkout-branch-conservative
+    cmd: "git checkout main"
+    cwd_fixture: [".git/"]
+    expect: { effect: destructive, paths: ["."], rule: git.checkout }
+
+  - name: git-reset-hard-outside-repo-is-unknown
+    # no .git anywhere up the tree: repo scope unresolvable, fall to unknown policy
+    cmd: "git reset --hard"
+    expect: { effect: destructive, paths: [], unknown: true, rule: git.reset-hard }
+
+  - name: git-push
+    cmd: "git push origin main"
+    expect: { effect: externalizing, paths: [], rule: git.push }
+
+  - name: git-push-force
+    cmd: "git push --force"
+    expect: { effect: externalizing, paths: [], rule: git.push }
+
+  - name: git-log-safe
+    cmd: "git log --oneline"
+    expect: { effect: safe, paths: [], rule: git.log }
+
+  - name: git-unregistered-subcommand-unknown
+    cmd: "git rebase main"
+    expect: { effect: unknown, unknown: true }

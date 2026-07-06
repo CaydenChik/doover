@@ -1,0 +1,69 @@
+# T1 corpus — coreutils destructive basics.
+# Path conventions in `expect.paths`: leading "~/" = fixture home, leading "/" =
+# absolute literal (never touched on disk), otherwise relative to the jail cwd.
+
+cases:
+  - name: rm-multiple-args
+    cmd: "rm -f a.txt b.txt"
+    expect: { effect: destructive, paths: ["a.txt", "b.txt"], rule: coreutils.rm }
+
+  - name: rm-no-flags-file
+    cmd: "rm notes.txt"
+    expect: { effect: destructive, paths: ["notes.txt"], rule: coreutils.rm }
+
+  - name: rm-r-dir
+    cmd: "rm -r cache"
+    expect: { effect: destructive, paths: ["cache"], rule: coreutils.rm }
+
+  - name: rm-double-dash-weird-name
+    cmd: "rm -- -weird"
+    expect: { effect: destructive, paths: ["-weird"], rule: coreutils.rm }
+
+  - name: rm-absolute-path
+    cmd: "rm -rf /tmp/doover-test-cache"
+    expect: { effect: destructive, paths: ["/tmp/doover-test-cache"], rule: coreutils.rm }
+
+  - name: rm-tilde-outside-workspace
+    cmd: "rm -rf ~/photos-backup"
+    cwd_fixture: ["home/photos-backup/img.jpg"]
+    expect: { effect: destructive, paths: ["~/photos-backup"], rule: coreutils.rm }
+
+  - name: rmdir-empty
+    cmd: "rmdir empty-dir"
+    expect: { effect: destructive, paths: ["empty-dir"], rule: coreutils.rmdir }
+
+  - name: unlink-file
+    cmd: "unlink f.txt"
+    expect: { effect: destructive, paths: ["f.txt"], rule: coreutils.unlink }
+
+  - name: mv-source-and-dest
+    cmd: "mv src.txt dst.txt"
+    expect: { effect: destructive, paths: ["src.txt", "dst.txt"], rule: coreutils.mv }
+
+  - name: cp-snapshots-dest-only
+    cmd: "cp src.txt dst.txt"
+    expect: { effect: destructive, paths: ["dst.txt"], rule: coreutils.cp }
+
+  - name: truncate-to-zero
+    cmd: "truncate -s 0 big.log"
+    expect: { effect: destructive, paths: ["big.log"], rule: coreutils.truncate }
+
+  - name: shred-is-irreversible
+    cmd: "shred secret.key"
+    expect: { effect: irreversible, paths: ["secret.key"], rule: coreutils.shred }
+
+  - name: tee-two-targets
+    cmd: "tee out1.txt out2.txt"
+    expect: { effect: destructive, paths: ["out1.txt", "out2.txt"], rule: coreutils.tee }
+
+  - name: chmod-recursive-skips-mode-arg
+    cmd: "chmod -R 700 private"
+    expect: { effect: destructive, paths: ["private"], rule: coreutils.chmod }
+
+  - name: chown-skips-owner-arg
+    cmd: "chown -R user:grp data"
+    expect: { effect: destructive, paths: ["data"], rule: coreutils.chown }
+
+  - name: ln-sf-replaces-link-target
+    cmd: "ln -sf target.txt link.txt"
+    expect: { effect: destructive, paths: ["link.txt"], rule: coreutils.ln }

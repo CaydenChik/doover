@@ -9,6 +9,7 @@
 //! - `undo` (step 6): restore engine with conflict detection
 
 pub mod registry;
+pub mod resolver;
 
 /// Crate version, single source of truth for the CLI `--version` output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

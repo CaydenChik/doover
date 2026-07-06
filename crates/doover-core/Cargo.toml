@@ -12,7 +12,11 @@ rust-version.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+glob.workspace = true
 
 [dev-dependencies]
 insta.workspace = true
 tempfile.workspace = true
+proptest.workspace = true

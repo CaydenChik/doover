@@ -1,0 +1,34 @@
+# T1 corpus — safe passthrough: zero snapshots, zero prompts, terse journal.
+
+cases:
+  - name: safe-ls
+    cmd: "ls"
+    expect: { effect: safe, paths: [], rule: coreutils.ls }
+
+  - name: safe-ls-la
+    cmd: "ls -la"
+    expect: { effect: safe, paths: [], rule: coreutils.ls }
+
+  - name: safe-cat
+    cmd: "cat notes.txt"
+    expect: { effect: safe, paths: [], rule: coreutils.cat }
+
+  - name: safe-grep-recursive
+    cmd: "grep -r needle ."
+    expect: { effect: safe, paths: [], rule: posix.grep }
+
+  - name: safe-pwd
+    cmd: "pwd"
+    expect: { effect: safe, paths: [], rule: posix.pwd }
+
+  - name: safe-which
+    cmd: "which cargo"
+    expect: { effect: safe, paths: [], rule: posix.which }
+
+  - name: safe-head
+    cmd: "head -n 5 f.txt"
+    expect: { effect: safe, paths: [], rule: posix.head }
+
+  - name: safe-wc
+    cmd: "wc -l f.txt"
+    expect: { effect: safe, paths: [], rule: posix.wc }

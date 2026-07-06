@@ -1,0 +1,39 @@
+# T1 corpus — multi-command lines: cwd tracking through cd, lists, pipelines,
+# subshell isolation.
+
+cases:
+  - name: cd-absolute-then-rm
+    cmd: "cd /tmp && rm -rf cache; ls"
+    expect: { effect: destructive, paths: ["/tmp/cache"], rule: coreutils.rm }
+
+  - name: cd-relative-then-rm
+    cmd: "cd sub && rm -f data.bin"
+    cwd_fixture: ["sub/data.bin"]
+    expect: { effect: destructive, paths: ["sub/data.bin"], rule: coreutils.rm }
+
+  - name: cd-down-and-back-up
+    cmd: "cd sub && cd .. && rm f.txt"
+    cwd_fixture: ["sub/", "f.txt"]
+    expect: { effect: destructive, paths: ["f.txt"], rule: coreutils.rm }
+
+  - name: semicolon-sequence
+    cmd: "touch a.log; rm b.log"
+    expect: { effect: destructive, paths: ["b.log"], rule: coreutils.rm }
+
+  - name: and-or-chain
+    cmd: "cat x.txt && rm x.txt || echo missing"
+    expect: { effect: destructive, paths: ["x.txt"], rule: coreutils.rm }
+
+  - name: pipeline-tee-then-redirect
+    cmd: "cat a.txt | tee b.txt | sort > c.txt"
+    cwd_fixture: ["a.txt"]
+    expect: { effect: destructive, paths: ["b.txt", "c.txt"], rule: coreutils.tee }
+
+  - name: cd-variable-poisons-cwd
+    cmd: "cd $WORKDIR && rm -rf temp"
+    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.rm }
+
+  - name: subshell-cwd-is-isolated
+    cmd: "(cd sub && rm -f inner.txt) && rm -f outer.txt"
+    cwd_fixture: ["sub/inner.txt", "outer.txt"]
+    expect: { effect: destructive, paths: ["outer.txt", "sub/inner.txt"], rule: coreutils.rm }

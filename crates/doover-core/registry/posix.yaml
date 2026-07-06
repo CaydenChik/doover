@@ -1,0 +1,88 @@
+# doover reversibility registry — POSIX / common userland (data: CC0-1.0)
+
+rules:
+  - id: posix.grep
+    match: { command: grep }
+    effect: safe
+    undo: none
+
+  - id: posix.head
+    match: { command: head }
+    effect: safe
+    undo: none
+
+  - id: posix.tail
+    match: { command: tail }
+    effect: safe
+    undo: none
+
+  - id: posix.wc
+    match: { command: wc }
+    effect: safe
+    undo: none
+
+  - id: posix.pwd
+    match: { command: pwd }
+    effect: safe
+    undo: none
+
+  - id: posix.which
+    match: { command: which }
+    effect: safe
+    undo: none
+
+  - id: posix.echo
+    match: { command: echo }
+    effect: safe
+    undo: none
+    notes: "Writes stdout only; a redirect target matches its own rule."
+
+  - id: posix.stat
+    match: { command: stat }
+    effect: safe
+    undo: none
+
+  - id: posix.du
+    match: { command: du }
+    effect: safe
+    undo: none
+
+  - id: posix.sort
+    match: { command: sort }
+    effect: safe
+    undo: none
+    notes: "stdout only — but see posix.sort-o."
+
+  - id: posix.sort-o
+    match: { command: sort, flags_any: ["-o"] }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+    notes: "-o overwrites in place; positional over-capture of inputs is harmless."
+
+  - id: posix.sed-in-place
+    match: { command: sed, flags_any: ["-i", "--in-place"] }
+    effect: destructive
+    scope: { paths: positional, skip: 1 }
+    undo: snapshot-restore
+    notes: "skip:1 drops the script argument (GNU form). macOS `-i ''` form over-captures; harmless."
+
+  - id: posix.find
+    match: { command: find }
+    effect: safe
+    undo: none
+    notes: "Bare find only lists. -delete/-exec match their own, stricter rules."
+
+  - id: posix.find-delete
+    match: { command: find, flags_any: ["-delete"] }
+    effect: destructive
+    scope: { paths: none }
+    undo: snapshot-restore
+    notes: "Targets are computed at runtime; zero extractable paths → unknown policy."
+
+  - id: posix.find-exec
+    match: { command: find, flags_any: ["-exec", "-execdir", "-ok"] }
+    effect: destructive
+    scope: { paths: none }
+    undo: snapshot-restore
+    notes: "Arbitrary command over computed targets; unknown policy applies."

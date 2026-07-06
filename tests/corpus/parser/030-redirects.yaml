@@ -1,0 +1,40 @@
+# T1 corpus — redirections. `>` truncation is a top real-world data-loss vector.
+
+cases:
+  - name: redir-create-new
+    cmd: "echo hi > new.txt"
+    expect: { effect: destructive, paths: ["new.txt"], rule: shell.redirect-truncate }
+
+  - name: redir-clobber-existing
+    cmd: "cat data.txt > out.txt"
+    cwd_fixture: ["data.txt", "out.txt"]
+    expect: { effect: destructive, paths: ["out.txt"], rule: shell.redirect-truncate }
+
+  - name: redir-append-is-mutating
+    cmd: "echo hi >> log.txt"
+    expect: { effect: mutating, paths: ["log.txt"], rule: shell.redirect-append }
+
+  - name: redir-stderr-to-file
+    cmd: "grep x f.txt 2> err.log"
+    expect: { effect: destructive, paths: ["err.log"], rule: shell.redirect-truncate }
+
+  - name: redir-both-streams-unknown-cmd
+    cmd: "make &> build.log"
+    expect: { effect: destructive, paths: ["build.log"], unknown: true, rule: shell.redirect-truncate }
+
+  - name: redir-clobber-operator
+    cmd: "sort f.txt >| f.txt"
+    cwd_fixture: ["f.txt"]
+    expect: { effect: destructive, paths: ["f.txt"], rule: shell.redirect-truncate }
+
+  - name: redir-tilde-target
+    cmd: "echo x > ~/notes.txt"
+    expect: { effect: destructive, paths: ["~/notes.txt"], rule: shell.redirect-truncate }
+
+  - name: redir-subdir-target
+    cmd: "echo x > logs/out.txt"
+    expect: { effect: destructive, paths: ["logs/out.txt"], rule: shell.redirect-truncate }
+
+  - name: redir-fd-dup-no-path
+    cmd: "echo hi >&2"
+    expect: { effect: safe, paths: [] }
