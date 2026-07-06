@@ -1,0 +1,36 @@
+#!/usr/bin/env bats
+# S0 — smoke: binary runs, honest not-implemented behavior, jail hygiene.
+#
+# E2E safety rules (doover-implementation-plan.md §3):
+#   every test runs inside a fresh mktemp jail with HOME overridden;
+#   nothing may read or write the real user environment.
+
+setup() {
+  [ -n "$DOOVER_BIN" ] || { echo "DOOVER_BIN not set (run via 'make e2e')" >&2; return 1; }
+  JAIL="$(mktemp -d)"
+  export HOME="$JAIL/home"
+  mkdir -p "$HOME"
+  cd "$JAIL"
+}
+
+teardown() {
+  rm -rf "$JAIL"
+}
+
+@test "S0: --version exits 0 and prints the crate version" {
+  run "$DOOVER_BIN" --version
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"0.0.1"* ]]
+}
+
+@test "S0: unimplemented subcommand exits 64 and says so" {
+  run "$DOOVER_BIN" undo
+  [ "$status" -eq 64 ]
+  [[ "$output" == *"not implemented"* ]]
+}
+
+@test "S0: running doover leaves no droppings in the jail HOME" {
+  run "$DOOVER_BIN" --version
+  [ "$status" -eq 0 ]
+  [ -z "$(ls -A "$HOME")" ]
+}

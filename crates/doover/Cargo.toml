@@ -1,0 +1,16 @@
+[package]
+name = "doover"
+description = "Your agent's checkpoints don't cover bash. Doover does — snapshot, journal, and undo for AI agent shell actions."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

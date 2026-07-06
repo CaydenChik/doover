@@ -1,0 +1,11 @@
+[package]
+name = "doover-core"
+description = "Core library for doover: session-scoped snapshot, journal, and undo for AI agent shell actions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+
+[dependencies]

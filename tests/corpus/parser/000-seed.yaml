@@ -1,0 +1,37 @@
+# Parser/scope-resolver corpus — data-driven test cases (consumed from step 2).
+#
+# Schema per case:
+#   name:        unique case id
+#   cmd:         raw command string as received from the harness hook
+#   cwd_fixture: relative layout of files that must exist in the test jail
+#   expect:
+#     effect:    safe | mutating | destructive | externalizing | irreversible | unknown
+#     paths:     affected paths relative to jail root (omit when effect=unknown)
+#     rule:      registry rule id that must have matched (omit when effect=unknown)
+#
+# Invariant (property-tested in code): any cmd containing an opaque construct
+# (eval, command substitution, sh -c, xargs, source) must classify as `unknown`
+# or stricter — NEVER `safe`.
+
+cases:
+  - name: seed-rm-recursive
+    cmd: "rm -rf ./build"
+    cwd_fixture: ["build/a.txt", "build/sub/b.txt"]
+    expect:
+      effect: destructive
+      paths: ["build"]
+      rule: coreutils.rm
+
+  - name: seed-redirect-self-truncate
+    cmd: "sort notes.txt > notes.txt"
+    cwd_fixture: ["notes.txt"]
+    expect:
+      effect: destructive
+      paths: ["notes.txt"]
+      rule: shell.redirect-truncate
+
+  - name: seed-opaque-eval-is-unknown
+    cmd: 'eval "$CLEANUP_CMD"'
+    cwd_fixture: []
+    expect:
+      effect: unknown
