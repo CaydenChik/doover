@@ -1,0 +1,22 @@
+{
+  "cwd": "/Users/tester/project/cache-dir",
+  "duration_ms": 42,
+  "hook_event_name": "PostToolUse",
+  "permission_mode": "default",
+  "prompt_id": "d0000000-0000-4000-8000-000000000002",
+  "session_id": "d0000000-0000-4000-8000-000000000001",
+  "tool_input": {
+    "command": "pwd",
+    "description": "Print working directory"
+  },
+  "tool_name": "Bash",
+  "tool_response": {
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false,
+    "stderr": "",
+    "stdout": "/private/tmp/claude-501/-Users-cayden-Desktop-Research/f4be12c9-771b-45d4-bbd5-520dce7ce343/scratchpad/hookcap/cache-dir"
+  },
+  "tool_use_id": "toolu_0000000000000000000000000",
+  "transcript_path": "/Users/tester/.claude/projects/-Users-tester-project/d0000000-0000-4000-8000-000000000001.jsonl"
+}

@@ -1,0 +1,14 @@
+{
+  "cwd": "/Users/tester/project/cache-dir",
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "default",
+  "prompt_id": "d0000000-0000-4000-8000-000000000002",
+  "session_id": "d0000000-0000-4000-8000-000000000001",
+  "tool_input": {
+    "command": "echo \"фото 📸\" > note.txt",
+    "description": "Write Unicode text to note.txt file"
+  },
+  "tool_name": "Bash",
+  "tool_use_id": "toolu_0000000000000000000000000",
+  "transcript_path": "/Users/tester/.claude/projects/-Users-tester-project/d0000000-0000-4000-8000-000000000001.jsonl"
+}
