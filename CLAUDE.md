@@ -32,6 +32,11 @@ confirm green → only then claim done. Build order and per-step test gates are 
 
 ## Hard rules
 
+- Never pipe a gate command through grep/tail/head when deciding success —
+  the pipe replaces the exit code and a red gate ships as green. Capture to a
+  log (`make test > target/gate.log 2>&1`), check `$?`, then read the log.
+  This shipped a red commit to main once already.
+
 - E2E tests must never touch the real `$HOME`, `~/.claude`, `~/.doover`, or any
   user data. Fixture jails only.
 - NOTICE.md lists unlicensed repos (ccundo, DiffBack) we may study but must never
