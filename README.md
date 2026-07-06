@@ -22,8 +22,9 @@ test-first build order, and the research this is based on (Atomix, Parallax, Yol
 
 1. A `PreToolUse` hook (Claude Code first; Cursor/Gemini/OpenClaw later) intercepts
    every Bash tool call.
-2. An open **reversibility registry** (`registry/`, CC0 data) classifies the command
-   and resolves the paths it will affect — including redirect targets.
+2. An open **reversibility registry** (`crates/doover-core/registry/`, CC0 data)
+   classifies the command and resolves the paths it will affect — including
+   redirect targets.
 3. Destructive effects are snapshotted into a content-addressed store using
    copy-on-write clones (`clonefile` on APFS, reflinks on Linux) — near-zero cost.
 4. Everything lands in a SQLite journal. `doover log` shows what the agent did;

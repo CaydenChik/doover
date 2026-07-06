@@ -1,0 +1,14 @@
+# doover reversibility registry — network clients (data: CC0-1.0)
+
+rules:
+  - id: net.curl
+    match: { command: curl }
+    effect: externalizing
+    undo: none
+    notes: "May POST/PUT/upload; effects live on remote systems no snapshot can reach."
+
+  - id: net.wget
+    match: { command: wget }
+    effect: mutating
+    undo: none
+    notes: "Downloads create local files; additive. -O over an existing file is a gap until parser flag handling (step 2)."

@@ -8,6 +8,8 @@
 //! - `hooks` (step 5): harness adapters (Claude Code first)
 //! - `undo` (step 6): restore engine with conflict detection
 
+pub mod registry;
+
 /// Crate version, single source of truth for the CLI `--version` output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

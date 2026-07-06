@@ -1,0 +1,15 @@
+# doover reversibility registry — shell constructs (data: CC0-1.0)
+
+rules:
+  - id: shell.redirect-truncate
+    match: { redirect: ">" }
+    effect: destructive
+    scope: { paths: redirect-target }
+    undo: snapshot-restore
+    notes: "Truncates before the command runs; `sort f > f` empties f. Top real-world data-loss vector."
+
+  - id: shell.redirect-append
+    match: { redirect: ">>" }
+    effect: mutating
+    undo: none
+    notes: "Additive; original bytes remain."

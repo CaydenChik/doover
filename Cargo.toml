@@ -13,3 +13,8 @@ rust-version = "1.85"
 [workspace.dependencies]
 doover-core = { path = "crates/doover-core", version = "0.0.1" }
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"
+insta = "1"
+tempfile = "3"

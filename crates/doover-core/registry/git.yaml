@@ -1,0 +1,34 @@
+# doover reversibility registry — git (data: CC0-1.0)
+
+rules:
+  - id: git.status
+    match: { command: git, subcommand: status }
+    effect: safe
+    undo: none
+
+  - id: git.reset-hard
+    match: { command: git, subcommand: reset, flags_any: ["--hard"] }
+    effect: destructive
+    scope: { paths: repo }
+    undo: snapshot-restore
+    notes: "Discards uncommitted work; reflog does not cover the working tree."
+
+  - id: git.clean
+    match: { command: git, subcommand: clean }
+    effect: destructive
+    scope: { paths: repo }
+    undo: snapshot-restore
+    notes: "Deletes untracked files git has never seen; unrecoverable via git."
+
+  - id: git.checkout
+    match: { command: git, subcommand: checkout }
+    effect: destructive
+    scope: { paths: repo }
+    undo: snapshot-restore
+    notes: "Conservative: pathspec form (`git checkout -- .`) clobbers the working tree. Branch-switch refinement lands with the parser (step 2)."
+
+  - id: git.push
+    match: { command: git, subcommand: push }
+    effect: externalizing
+    undo: none
+    notes: "Leaves the machine. --force rewrites remote history — flagged HIGH in the journal."

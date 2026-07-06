@@ -24,7 +24,8 @@ confirm green → only then claim done. Build order and per-step test gates are 
 
 - `crates/doover-core` — library: registry, parser, snapshot, journal, hooks, undo
 - `crates/doover` — CLI binary
-- `registry/` — reversibility data (YAML, CC0-licensed; code is Apache-2.0)
+- `crates/doover-core/registry/` — reversibility data (YAML, CC0-licensed; code is
+  Apache-2.0). Lives inside the crate so `include_str!` embedding survives publish.
 - `tests/corpus/parser/` — data-driven parser cases (YAML)
 - `tests/fixtures/hook-events/` — golden Claude Code hook payloads
 - `tests/e2e/` — bats scenarios; ALL run inside mktemp jails with HOME overridden

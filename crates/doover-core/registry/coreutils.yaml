@@ -1,0 +1,106 @@
+# doover reversibility registry — coreutils (data: CC0-1.0)
+# Schema: doover-mvp-spec.md §4.5. Effects: safe | mutating | externalizing |
+# destructive | irreversible. Undo: snapshot-restore | none | recompute.
+
+rules:
+  - id: coreutils.rm
+    match: { command: rm }
+    effect: destructive
+    scope: { paths: positional, globs: true, recursive_flags: ["-r", "-R", "--recursive"] }
+    undo: snapshot-restore
+    notes: "Bypasses Trash; no native recovery."
+
+  - id: coreutils.rmdir
+    match: { command: rmdir }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+
+  - id: coreutils.unlink
+    match: { command: unlink }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+
+  - id: coreutils.mv
+    match: { command: mv }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+    notes: "Destination overwrite and source relocation both need pre-state."
+
+  - id: coreutils.cp
+    match: { command: cp }
+    effect: destructive
+    scope: { paths: positional-last }
+    undo: snapshot-restore
+    notes: "Only the destination is at risk; snapshot the last positional."
+
+  - id: coreutils.dd
+    match: { command: dd }
+    effect: destructive
+    scope: { paths: none }
+    undo: snapshot-restore
+    notes: "Target is of=; needs parser flag handling (step 2). Until then scope=none falls back to the unknown policy."
+
+  - id: coreutils.truncate
+    match: { command: truncate }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+
+  - id: coreutils.shred
+    match: { command: shred }
+    effect: irreversible
+    scope: { paths: positional }
+    undo: snapshot-restore
+    notes: "Snapshot best-effort; the whole point of shred is that recovery fails. Gate."
+
+  - id: coreutils.tee
+    match: { command: tee }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+    notes: "-a appends (additive); plain tee truncates targets."
+
+  - id: coreutils.chmod
+    match: { command: chmod }
+    effect: destructive
+    scope: { paths: positional, recursive_flags: ["-R"] }
+    undo: snapshot-restore
+    notes: "Metadata-only loss; snapshots preserve mode bits."
+
+  - id: coreutils.chown
+    match: { command: chown }
+    effect: destructive
+    scope: { paths: positional, recursive_flags: ["-R"] }
+    undo: snapshot-restore
+
+  - id: coreutils.ln
+    match: { command: ln }
+    effect: destructive
+    scope: { paths: positional-last }
+    undo: snapshot-restore
+    notes: "-sf silently replaces the target."
+
+  - id: coreutils.mkdir
+    match: { command: mkdir }
+    effect: mutating
+    undo: none
+
+  - id: coreutils.touch
+    match: { command: touch }
+    effect: mutating
+    undo: none
+    notes: "Creates or bumps mtime; content never lost."
+
+  - id: coreutils.ls
+    match: { command: ls }
+    effect: safe
+    undo: none
+
+  - id: coreutils.cat
+    match: { command: cat }
+    effect: safe
+    undo: none
+    notes: "Read-only unless combined with a redirect; redirects match their own rules."
