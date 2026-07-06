@@ -10,6 +10,7 @@
 
 pub mod registry;
 pub mod resolver;
+pub mod snapshot;
 
 /// Crate version, single source of truth for the CLI `--version` output.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
