@@ -138,7 +138,7 @@ fn dir_tree_round_trip_exact() {
     write(&d.join("sub dir/файл.txt"), "unicode + spaces");
     write(&d.join("sub dir/deep/📸.dat"), "emoji");
     fs::create_dir_all(d.join("empty-dir")).unwrap();
-    fs::set_permissions(&d.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(d.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
     let before = fingerprint(&d);
 
     let m = j.store.snapshot(&d, None).unwrap();
