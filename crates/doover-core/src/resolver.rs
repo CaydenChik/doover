@@ -120,7 +120,7 @@ fn resolve_inner(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
         out,
     };
     let mut cur = Some(normalize_lexical(ctx.cwd));
-    walker.walk(root, &mut cur);
+    walker.walk(root, &mut cur, 0);
     walker.out.finish()
 }
 
@@ -174,10 +174,22 @@ struct Walker<'a> {
     out: Out,
 }
 
+/// No legitimate shell command nests this deep; beyond it the tree is almost
+/// certainly error-recovery output (fuzz-found trees reach depths that
+/// overflow even 32 MB when walked with Rust-sized frames). Fail safe.
+const MAX_WALK_DEPTH: usize = 256;
+
+/// Literal reconstruction (concatenations, strings) nesting cap.
+const MAX_LITERAL_DEPTH: usize = 64;
+
 impl Walker<'_> {
     /// `cur` is the tracked working directory; `None` means a `cd` made it
     /// unresolvable and every later relative path is unknown.
-    fn walk(&mut self, node: Node, cur: &mut Option<PathBuf>) {
+    fn walk(&mut self, node: Node, cur: &mut Option<PathBuf>, depth: usize) {
+        if depth > MAX_WALK_DEPTH {
+            self.out.mark_unknown();
+            return;
+        }
         match node.kind() {
             "comment" => {}
             "variable_assignment" => {
@@ -189,7 +201,7 @@ impl Walker<'_> {
             "command" => self.handle_command(node, cur),
             "redirected_statement" => {
                 if let Some(body) = node.child_by_field_name("body") {
-                    self.walk(body, cur);
+                    self.walk(body, cur, depth + 1);
                 }
                 let mut c = node.walk();
                 for child in node.named_children(&mut c) {
@@ -203,14 +215,14 @@ impl Walker<'_> {
                 let mut c = node.walk();
                 for child in node.named_children(&mut c) {
                     let mut seg_cur = cur.clone();
-                    self.walk(child, &mut seg_cur);
+                    self.walk(child, &mut seg_cur, depth + 1);
                 }
             }
             "subshell" => {
                 let mut sub_cur = cur.clone();
                 let mut c = node.walk();
                 for child in node.named_children(&mut c) {
-                    self.walk(child, &mut sub_cur);
+                    self.walk(child, &mut sub_cur, depth + 1);
                 }
             }
             _ => {
@@ -223,7 +235,7 @@ impl Walker<'_> {
                 // below still route through handle_command.
                 let mut c = node.walk();
                 for child in node.named_children(&mut c) {
-                    self.walk(child, cur);
+                    self.walk(child, cur, depth + 1);
                 }
             }
         }
@@ -494,13 +506,16 @@ impl Walker<'_> {
     }
 
     fn extract_arg(&mut self, node: Node) -> ArgVal {
-        match self.extract_literal(node) {
+        match self.extract_literal(node, 0) {
             Some((text, quoted)) => ArgVal::Lit { text, quoted },
             None => ArgVal::Opaque,
         }
     }
 
-    fn extract_literal(&mut self, node: Node) -> Option<(String, bool)> {
+    fn extract_literal(&mut self, node: Node, depth: usize) -> Option<(String, bool)> {
+        if depth > MAX_LITERAL_DEPTH {
+            return None;
+        }
         match node.kind() {
             "word" => Some((unescape_word(&self.node_text(node)?), false)),
             "number" => Some((self.node_text(node)?, false)),
@@ -528,7 +543,7 @@ impl Walker<'_> {
                 let mut all_quoted = true;
                 let mut c = node.walk();
                 for child in node.named_children(&mut c) {
-                    let (part, quoted) = self.extract_literal(child)?;
+                    let (part, quoted) = self.extract_literal(child, depth + 1)?;
                     result.push_str(&part);
                     all_quoted &= quoted;
                 }
@@ -544,11 +559,17 @@ impl Walker<'_> {
 }
 
 fn contains_kind(node: Node, kinds: &[&str]) -> bool {
-    if kinds.contains(&node.kind()) {
-        return true;
+    // iterative: fuzz-found error-recovery trees are deep enough to overflow
+    // recursive traversal
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        if kinds.contains(&n.kind()) {
+            return true;
+        }
+        let mut c = n.walk();
+        stack.extend(n.children(&mut c));
     }
-    let mut c = node.walk();
-    node.children(&mut c).any(|ch| contains_kind(ch, kinds))
+    false
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
