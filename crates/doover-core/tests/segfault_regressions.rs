@@ -1,8 +1,9 @@
-//! Regression inputs for the Linux-only SIGSEGV found by fuzz-hunt on
-//! 2026-07-06: tree-sitter-bash error recovery recurses pathologically deep
-//! (>2 MB of C stack for a 7-byte input), overflowing default thread stacks on
-//! Linux. macOS happened to survive the same inputs. Mitigated by running
-//! `resolve()` on a dedicated big-stack thread; upstream report pending.
+//! Regression inputs from the 2026-07-06 fuzz-hunt. These segfaulted the
+//! process under the original tree-sitter-bash backend (heap-layout-dependent
+//! memory corruption in its C error recovery, glibc-manifesting; 7-byte
+//! minimized repro below). The parser was replaced with pure-Rust
+//! brush-parser; these inputs must now resolve — conservatively — on a
+//! default-sized caller stack, forever.
 
 /// The delta-minimized trigger: two single quotes, an open brace, and one
 /// astral-plane character.
@@ -17,30 +18,19 @@ const CRASHERS: &[&str] = &[
     "o\u{f4bd9}; {\u{d5a22}7A>d?`j?}#%:& \u{4c87d}mi\n:\n#(\ncp\u{cb57c}.~>[.dap%(}Ua{mV\n \u{37940}i.`W&/>\u{16433}Y\u{338b7};\u{b7f02}s?*J#g/麼{v/r\\\n\\]\u{8feed}.\u{d0d78}c&G\u{34a43}L<[&3*imB\n5\\P ;z\n;J\u{aadbd}{(.\u{f17e8}9!.r|\"C$a=q]f[-&m?iZvHd\\..Hm./rm&k[\n~#\u{8f442}y[J'p\n",
 ];
 
-/// Documents the upstream bug shape: raw parse completes when (and only when)
-/// given a generous stack. If this starts passing on a small stack, the
-/// upstream fix landed and RESOLVER_STACK_BYTES can be reconsidered.
+/// Raw parse of the crashers must complete (Ok or Err, never a crash).
 #[test]
-fn raw_parse_survives_crashers_on_big_stack() {
-    std::thread::Builder::new()
-        .stack_size(32 * 1024 * 1024)
-        .spawn(|| {
-            let mut parser = tree_sitter::Parser::new();
-            parser
-                .set_language(&tree_sitter_bash::LANGUAGE.into())
-                .unwrap();
-            for (i, input) in CRASHERS.iter().enumerate() {
-                let tree = parser.parse(input, None);
-                assert!(tree.is_some(), "parse returned None for crasher {i}");
-            }
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+fn raw_parse_survives_crashers() {
+    let options = brush_parser::ParserOptions::default();
+    for input in CRASHERS {
+        if let Ok(tokens) = brush_parser::tokenize_str(input) {
+            let _ = brush_parser::parse_tokens(&tokens, &options);
+        }
+    }
 }
 
 /// The public contract: `resolve()` survives the crashers on any caller
-/// thread, because it manages its own parsing stack.
+/// thread and classifies garbage conservatively.
 #[test]
 fn resolve_survives_crashers_on_default_stack() {
     use doover_core::registry::Registry;

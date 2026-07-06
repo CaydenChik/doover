@@ -1,19 +1,29 @@
 //! Bash command parsing and affected-path scope resolution.
 //!
+//! Parsing uses `brush-parser` (pure Rust). The original tree-sitter-bash
+//! backend was removed after fuzzing found glibc-only segfaults in its C
+//! error recovery (heap-layout-dependent; 7-byte minimized repro) — a safety
+//! tool whose input is adversarial by definition cannot keep a memory-unsafe
+//! parser in the trust path. With pure Rust, worst-case failures are panics,
+//! which the thread wrapper in [`resolve`] converts into a conservative
+//! Unknown resolution.
+//!
 //! Design invariants (property-tested):
-//! - never panics on any input;
+//! - never panics or crashes the caller on any input;
 //! - anything the resolver cannot fully account for — opaque constructs
 //!   (`eval`, `$( )`, `sh -c`, `xargs`, wrappers like `sudo`), unresolvable
-//!   variables, parse errors, or a destructive rule that yielded zero concrete
-//!   paths — sets `has_unknown`, which routes the action through the engine's
-//!   unknown policy instead of silently under-protecting;
+//!   variables, parse errors, control-flow compounds, or a destructive rule
+//!   that yielded zero concrete paths — sets `has_unknown`, which routes the
+//!   action through the engine's unknown policy instead of silently
+//!   under-protecting;
 //! - resolution is deterministic and purely lexical except for glob expansion
 //!   and git-repo-root discovery, which read (never write) the filesystem.
 
 use crate::registry::{Effect, PathSource, Registry, Rule};
+use brush_parser::ast;
+use brush_parser::word::{TildeExpr, WordPiece, WordPieceWithSource};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use tree_sitter::Node;
 
 /// Classification severity. Extends registry [`Effect`] with `Unknown`,
 /// ordered so that a destructive-with-known-scope part still dominates an
@@ -68,11 +78,14 @@ const OPAQUE_COMMANDS: &[&str] = &[
 
 const GLOB_CHARS: &[char] = &['*', '?', '['];
 
-/// tree-sitter-bash's error recovery can recurse pathologically deep in its C
-/// code — a minimized 7-byte input (`''{` + one astral-plane char, found by
-/// fuzz-hunt 2026-07-06) needs >2 MB of stack and segfaults default threads on
-/// Linux. Parsing therefore runs on a dedicated thread with a generous stack;
-/// any panic or spawn failure degrades to a conservative Unknown resolution.
+/// Nesting cap for subshells/brace groups and for literal reconstruction; no
+/// legitimate agent command comes close, and capping keeps stack usage bounded
+/// on adversarial input. Fail safe (Unknown) beyond it.
+const MAX_WALK_DEPTH: usize = 256;
+const MAX_LITERAL_DEPTH: usize = 64;
+
+/// Generous stack for the recursive-descent parser on pathological inputs;
+/// panics anywhere in resolution degrade to a conservative Unknown.
 const RESOLVER_STACK_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn resolve(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
@@ -81,7 +94,7 @@ pub fn resolve(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
             .name("doover-resolver".into())
             .stack_size(RESOLVER_STACK_BYTES)
             .spawn_scoped(scope, || resolve_inner(command, registry, ctx));
-        match handle.map(|h| h.join()) {
+        match handle.map(std::thread::ScopedJoinHandle::join) {
             Ok(Ok(resolution)) => resolution,
             _ => Resolution {
                 severity: Severity::Unknown,
@@ -94,33 +107,24 @@ pub fn resolve(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
 }
 
 fn resolve_inner(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
-    let mut out = Out::default();
-
-    let mut parser = tree_sitter::Parser::new();
-    if parser
-        .set_language(&tree_sitter_bash::LANGUAGE.into())
-        .is_err()
-    {
-        out.mark_unknown();
-        return out.finish();
-    }
-    let Some(tree) = parser.parse(command, None) else {
-        out.mark_unknown();
-        return out.finish();
-    };
-    let root = tree.root_node();
-    if root.has_error() {
-        out.mark_unknown();
-    }
-
     let mut walker = Walker {
         registry,
         ctx,
-        src: command.as_bytes(),
-        out,
+        options: brush_parser::ParserOptions::default(),
+        out: Out::default(),
     };
     let mut cur = Some(normalize_lexical(ctx.cwd));
-    walker.walk(root, &mut cur, 0);
+    match brush_parser::tokenize_str(command) {
+        Ok(tokens) => match brush_parser::parse_tokens(&tokens, &walker.options) {
+            Ok(program) => {
+                for complete_command in &program.complete_commands {
+                    walker.walk_compound_list(complete_command, &mut cur, 0);
+                }
+            }
+            Err(_) => walker.out.mark_unknown(),
+        },
+        Err(_) => walker.out.mark_unknown(),
+    }
     walker.out.finish()
 }
 
@@ -157,8 +161,15 @@ impl Out {
     }
 }
 
+/// A word reduced to its literal text. `glob_ok` is true only when glob
+/// metacharacters appeared *unquoted* — `rm '*.bak'` must not expand.
+struct Lit {
+    text: String,
+    glob_ok: bool,
+}
+
 enum ArgVal {
-    Lit { text: String, quoted: bool },
+    Lit(Lit),
     Opaque,
 }
 
@@ -170,96 +181,99 @@ enum Tok {
 struct Walker<'a> {
     registry: &'a Registry,
     ctx: &'a Ctx<'a>,
-    src: &'a [u8],
+    options: brush_parser::ParserOptions,
     out: Out,
 }
-
-/// No legitimate shell command nests this deep; beyond it the tree is almost
-/// certainly error-recovery output (fuzz-found trees reach depths that
-/// overflow even 32 MB when walked with Rust-sized frames). Fail safe.
-const MAX_WALK_DEPTH: usize = 256;
-
-/// Literal reconstruction (concatenations, strings) nesting cap.
-const MAX_LITERAL_DEPTH: usize = 64;
 
 impl Walker<'_> {
     /// `cur` is the tracked working directory; `None` means a `cd` made it
     /// unresolvable and every later relative path is unknown.
-    fn walk(&mut self, node: Node, cur: &mut Option<PathBuf>, depth: usize) {
+    fn walk_compound_list(
+        &mut self,
+        list: &ast::CompoundList,
+        cur: &mut Option<PathBuf>,
+        depth: usize,
+    ) {
         if depth > MAX_WALK_DEPTH {
             self.out.mark_unknown();
             return;
         }
-        match node.kind() {
-            "comment" => {}
-            "variable_assignment" => {
-                // FOO=bar is inert, but FOO=$(cmd) executes.
-                if contains_kind(node, &["command_substitution"]) {
-                    self.out.mark_unknown();
-                }
+        for ast::CompoundListItem(and_or, _sep) in &list.0 {
+            self.walk_pipeline(&and_or.first, cur, depth);
+            for branch in &and_or.additional {
+                let (ast::AndOr::And(p) | ast::AndOr::Or(p)) = branch;
+                self.walk_pipeline(p, cur, depth);
             }
-            "command" => self.handle_command(node, cur),
-            "redirected_statement" => {
-                if let Some(body) = node.child_by_field_name("body") {
-                    self.walk(body, cur, depth + 1);
+        }
+    }
+
+    fn walk_pipeline(&mut self, pipeline: &ast::Pipeline, cur: &mut Option<PathBuf>, depth: usize) {
+        if pipeline.seq.len() == 1 {
+            self.walk_command(&pipeline.seq[0], cur, depth);
+        } else {
+            // each segment runs in its own subshell: isolate cwd changes
+            for command in &pipeline.seq {
+                let mut seg_cur = cur.clone();
+                self.walk_command(command, &mut seg_cur, depth);
+            }
+        }
+    }
+
+    fn walk_command(&mut self, command: &ast::Command, cur: &mut Option<PathBuf>, depth: usize) {
+        match command {
+            ast::Command::Simple(simple) => self.handle_simple(simple, cur),
+            ast::Command::Compound(compound, redirects) => {
+                match compound {
+                    ast::CompoundCommand::Subshell(subshell) => {
+                        let mut sub_cur = cur.clone();
+                        self.walk_compound_list(&subshell.list, &mut sub_cur, depth + 1);
+                    }
+                    ast::CompoundCommand::BraceGroup(group) => {
+                        self.walk_compound_list(&group.list, cur, depth + 1);
+                    }
+                    // control flow (if/for/while/case/arith/coproc) executes
+                    // data-dependent bodies: conservative until refined
+                    _ => self.out.mark_unknown(),
                 }
-                let mut c = node.walk();
-                for child in node.named_children(&mut c) {
-                    if child.kind() == "file_redirect" {
-                        self.handle_redirect(child, cur);
+                if let Some(list) = redirects {
+                    for redirect in &list.0 {
+                        self.handle_redirect(redirect, cur);
                     }
                 }
             }
-            "pipeline" => {
-                // each segment runs in its own subshell: isolate cwd changes
-                let mut c = node.walk();
-                for child in node.named_children(&mut c) {
-                    let mut seg_cur = cur.clone();
-                    self.walk(child, &mut seg_cur, depth + 1);
-                }
-            }
-            "subshell" => {
-                let mut sub_cur = cur.clone();
-                let mut c = node.walk();
-                for child in node.named_children(&mut c) {
-                    self.walk(child, &mut sub_cur, depth + 1);
-                }
-            }
-            _ => {
-                if node.is_error() {
-                    self.out.mark_unknown();
-                    return;
-                }
-                // generic descent in source order (program, list,
-                // negated_command, compound statements, …): commands anywhere
-                // below still route through handle_command.
-                let mut c = node.walk();
-                for child in node.named_children(&mut c) {
-                    self.walk(child, cur, depth + 1);
+            // a function *definition* executes nothing; calling it later hits
+            // the unregistered-command path and classifies unknown
+            ast::Command::Function(_) => {}
+            // [[ ... ]] evaluates without filesystem writes
+            ast::Command::ExtendedTest(_, redirects) => {
+                if let Some(list) = redirects {
+                    for redirect in &list.0 {
+                        self.handle_redirect(redirect, cur);
+                    }
                 }
             }
         }
     }
 
-    fn handle_command(&mut self, node: Node, cur: &mut Option<PathBuf>) {
-        let Some(name_node) = node.child_by_field_name("name") else {
-            self.out.mark_unknown();
-            return;
-        };
-        let Some(name) = self.command_name_text(name_node) else {
-            self.out.mark_unknown();
-            return;
-        };
-
-        // collect argument values (everything after the name node)
-        let mut args = Vec::new();
-        let mut c = node.walk();
-        for child in node.named_children(&mut c) {
-            if child.start_byte() < name_node.end_byte() {
-                continue;
-            }
-            args.push(self.extract_arg(child));
+    fn handle_simple(&mut self, simple: &ast::SimpleCommand, cur: &mut Option<PathBuf>) {
+        if let Some(prefix) = &simple.prefix {
+            self.handle_prefix_suffix_items(&prefix.0, None, cur);
         }
+        // suffix first so redirects are honored even when the command name is
+        // opaque (`$CMD > file` must still protect file)
+        let mut args: Vec<ArgVal> = Vec::new();
+        if let Some(suffix) = &simple.suffix {
+            self.handle_prefix_suffix_items(&suffix.0, Some(&mut args), cur);
+        }
+
+        let Some(name_word) = &simple.word_or_name else {
+            return; // bare assignments / redirects only
+        };
+        let Some(name_lit) = self.extract_word(&name_word.value) else {
+            self.out.mark_unknown();
+            return;
+        };
+        let name = name_lit.text;
 
         if name == "cd" {
             self.handle_cd(&args, cur);
@@ -276,13 +290,14 @@ impl Walker<'_> {
         for arg in &args {
             match arg {
                 ArgVal::Opaque => any_opaque = true,
-                ArgVal::Lit { text, quoted } => {
-                    if !after_double_dash && text == "--" {
+                ArgVal::Lit(lit) => {
+                    if !after_double_dash && lit.text == "--" {
                         after_double_dash = true;
-                    } else if !after_double_dash && text.len() > 1 && text.starts_with('-') {
-                        tokens.push(Tok::Flag(text.clone()));
+                    } else if !after_double_dash && lit.text.len() > 1 && lit.text.starts_with('-')
+                    {
+                        tokens.push(Tok::Flag(lit.text.clone()));
                     } else {
-                        tokens.push(Tok::Pos(text.clone(), *quoted));
+                        tokens.push(Tok::Pos(lit.text.clone(), lit.glob_ok));
                     }
                 }
             }
@@ -324,11 +339,11 @@ impl Walker<'_> {
                         consume_next = true;
                     }
                 }
-                Tok::Pos(text, quoted) => {
+                Tok::Pos(text, glob_ok) => {
                     if consume_next {
                         consume_next = false;
                     } else {
-                        positionals.push((text.clone(), *quoted));
+                        positionals.push((text.clone(), *glob_ok));
                     }
                 }
             }
@@ -339,6 +354,38 @@ impl Walker<'_> {
             // destructive action with no pre-snapshottable paths: the engine
             // must fall back to the unknown policy rather than claim coverage
             self.out.mark_unknown();
+        }
+    }
+
+    fn handle_prefix_suffix_items(
+        &mut self,
+        items: &[ast::CommandPrefixOrSuffixItem],
+        mut args: Option<&mut Vec<ArgVal>>,
+        cur: &Option<PathBuf>,
+    ) {
+        for item in items {
+            match item {
+                ast::CommandPrefixOrSuffixItem::Word(word) => {
+                    if let Some(args) = args.as_deref_mut() {
+                        args.push(match self.extract_word(&word.value) {
+                            Some(lit) => ArgVal::Lit(lit),
+                            None => ArgVal::Opaque,
+                        });
+                    }
+                }
+                ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
+                    self.handle_redirect(redirect, cur);
+                }
+                ast::CommandPrefixOrSuffixItem::AssignmentWord(_assignment, word) => {
+                    // FOO=bar is inert, but FOO=$(cmd) executes
+                    if self.word_has_command_substitution(&word.value) {
+                        self.out.mark_unknown();
+                    }
+                }
+                ast::CommandPrefixOrSuffixItem::ProcessSubstitution(..) => {
+                    self.out.mark_unknown();
+                }
+            }
         }
     }
 
@@ -354,13 +401,13 @@ impl Walker<'_> {
         let mut contributed = 0usize;
         match scope.paths {
             PathSource::Positional => {
-                for (text, quoted) in path_args.iter().copied() {
-                    contributed += self.add_path(text, *quoted, scope.globs, cur);
+                for (text, glob_ok) in path_args.iter().copied() {
+                    contributed += self.add_path(text, *glob_ok, scope.globs, cur);
                 }
             }
             PathSource::PositionalLast => {
-                if let Some((text, quoted)) = path_args.last().copied() {
-                    contributed += self.add_path(text, *quoted, scope.globs, cur);
+                if let Some((text, glob_ok)) = path_args.last().copied() {
+                    contributed += self.add_path(text, *glob_ok, scope.globs, cur);
                 }
             }
             PathSource::Repo => {
@@ -376,11 +423,14 @@ impl Walker<'_> {
 
     /// Resolve one path argument (tilde, cwd join, normalize, optional glob
     /// expansion) and record the results. Returns how many paths were added.
-    fn add_path(&mut self, text: &str, quoted: bool, globs: bool, cur: &Option<PathBuf>) -> usize {
+    fn add_path(&mut self, text: &str, glob_ok: bool, globs: bool, cur: &Option<PathBuf>) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
         let Some(resolved) = self.resolve_path(text, cur) else {
             return 0;
         };
-        if !quoted && globs && text.contains(GLOB_CHARS) {
+        if glob_ok && globs {
             let pattern = resolved.to_string_lossy().into_owned();
             match glob::glob(&pattern) {
                 Ok(matches) => {
@@ -427,17 +477,19 @@ impl Walker<'_> {
 
     fn handle_cd(&mut self, args: &[ArgVal], cur: &mut Option<PathBuf>) {
         let target = args.iter().find(|a| match a {
-            ArgVal::Lit { text, .. } => !(text.len() > 1 && text.starts_with('-')) && text != "--",
+            ArgVal::Lit(lit) => {
+                !(lit.text.len() > 1 && lit.text.starts_with('-')) && lit.text != "--"
+            }
             ArgVal::Opaque => true,
         });
         match target {
             None => *cur = Some(normalize_lexical(self.ctx.home)),
-            Some(ArgVal::Lit { text, .. }) if text == "-" => {
+            Some(ArgVal::Lit(lit)) if lit.text == "-" => {
                 // previous directory is untracked
                 self.out.mark_unknown();
                 *cur = None;
             }
-            Some(ArgVal::Lit { text, .. }) => match self.resolve_path(text, cur) {
+            Some(ArgVal::Lit(lit)) => match self.resolve_path(&lit.text, cur) {
                 Some(p) => *cur = Some(p),
                 None => *cur = None,
             },
@@ -448,128 +500,103 @@ impl Walker<'_> {
         }
     }
 
-    fn handle_redirect(&mut self, node: Node, cur: &Option<PathBuf>) {
-        // operator is an unnamed token child; input-only redirects are safe
-        let mut op: Option<String> = None;
-        let mut c = node.walk();
-        for child in node.children(&mut c) {
-            if !child.is_named() && child.kind().contains('>') {
-                op = Some(child.kind().to_string());
-                break;
+    fn handle_redirect(&mut self, redirect: &ast::IoRedirect, cur: &Option<PathBuf>) {
+        use ast::{IoFileRedirectKind as Kind, IoFileRedirectTarget as Target, IoRedirect as R};
+        match redirect {
+            R::File(_fd, kind, target) => {
+                let op = match kind {
+                    Kind::Write | Kind::Clobber | Kind::ReadAndWrite => ">",
+                    Kind::Append => ">>",
+                    Kind::Read | Kind::DuplicateInput | Kind::DuplicateOutput => return,
+                };
+                match target {
+                    Target::Filename(word) => self.redirect_to(op, &word.value, cur),
+                    Target::Fd(_) | Target::Duplicate(_) => {}
+                    Target::ProcessSubstitution(..) => self.out.mark_unknown(),
+                }
             }
+            // &> / &>>
+            R::OutputAndError(word, append) => {
+                let op = if *append { ">>" } else { ">" };
+                self.redirect_to(op, &word.value, cur);
+            }
+            // input-only
+            R::HereDocument(..) | R::HereString(..) => {}
         }
-        let Some(op) = op else { return };
+    }
 
-        let dest = node
-            .child_by_field_name("destination")
-            .or_else(|| node.named_children(&mut node.walk()).last());
-        let Some(dest) = dest else {
+    fn redirect_to(&mut self, op: &str, raw: &str, cur: &Option<PathBuf>) {
+        let Some(lit) = self.extract_word(raw) else {
             self.out.mark_unknown();
             return;
         };
-        // fd targets (>&2) have no path
-        if matches!(dest.kind(), "number" | "file_descriptor") {
+        // numeric target is an fd, not a file
+        if lit.text.is_empty() || lit.text.chars().all(|ch| ch.is_ascii_digit()) {
             return;
         }
-        let text = match self.extract_arg(dest) {
-            ArgVal::Lit { text, .. } => text,
-            ArgVal::Opaque => {
-                self.out.mark_unknown();
-                return;
-            }
-        };
-        if text.chars().all(|ch| ch.is_ascii_digit()) {
-            return;
-        }
-
-        let rule = self.registry.lookup_redirect(&op).or_else(|| {
-            // fallback for &>, >|, &>> …: append-family keeps append semantics
-            let fallback = if op.contains(">>") { ">>" } else { ">" };
-            self.registry.lookup_redirect(fallback)
-        });
-        let Some(rule) = rule else {
+        let Some(rule) = self.registry.lookup_redirect(op) else {
             self.out.mark_unknown();
             return;
         };
         self.out.contribute(Severity::from(rule.effect), &rule.id);
-        if let Some(p) = self.resolve_path(&text, cur) {
+        if let Some(p) = self.resolve_path(&lit.text, cur) {
             self.out.paths.insert(p);
         }
     }
 
-    fn command_name_text(&mut self, name_node: Node) -> Option<String> {
-        let inner = name_node.named_child(0).unwrap_or(name_node);
-        match inner.kind() {
-            "word" | "number" => self.node_text(inner).map(|t| unescape_word(&t)),
-            _ => None,
-        }
+    fn extract_word(&self, raw: &str) -> Option<Lit> {
+        let pieces = brush_parser::word::parse(raw, &self.options).ok()?;
+        pieces_to_literal(&pieces, 0)
     }
 
-    fn extract_arg(&mut self, node: Node) -> ArgVal {
-        match self.extract_literal(node, 0) {
-            Some((text, quoted)) => ArgVal::Lit { text, quoted },
-            None => ArgVal::Opaque,
+    fn word_has_command_substitution(&self, raw: &str) -> bool {
+        fn scan(pieces: &[WordPieceWithSource], depth: usize) -> bool {
+            depth > MAX_LITERAL_DEPTH
+                || pieces.iter().any(|pw| match &pw.piece {
+                    WordPiece::CommandSubstitution(_)
+                    | WordPiece::BackquotedCommandSubstitution(_) => true,
+                    WordPiece::DoubleQuotedSequence(inner)
+                    | WordPiece::GettextDoubleQuotedSequence(inner) => scan(inner, depth + 1),
+                    _ => false,
+                })
         }
-    }
-
-    fn extract_literal(&mut self, node: Node, depth: usize) -> Option<(String, bool)> {
-        if depth > MAX_LITERAL_DEPTH {
-            return None;
+        match brush_parser::word::parse(raw, &self.options) {
+            Ok(pieces) => scan(&pieces, 0),
+            Err(_) => true, // unparseable assignment value: assume the worst
         }
-        match node.kind() {
-            "word" => Some((unescape_word(&self.node_text(node)?), false)),
-            "number" => Some((self.node_text(node)?, false)),
-            "raw_string" => {
-                let t = self.node_text(node)?;
-                Some((t.trim_matches('\'').to_string(), true))
-            }
-            "string" => {
-                let mut result = String::new();
-                let mut c = node.walk();
-                for child in node.named_children(&mut c) {
-                    match child.kind() {
-                        "string_content" => result.push_str(&self.node_text(child)?),
-                        "escape_sequence" => {
-                            let t = self.node_text(child)?;
-                            result.push_str(t.strip_prefix('\\').unwrap_or(&t));
-                        }
-                        _ => return None, // expansion, command_substitution, …
-                    }
-                }
-                Some((result, true))
-            }
-            "concatenation" => {
-                let mut result = String::new();
-                let mut all_quoted = true;
-                let mut c = node.walk();
-                for child in node.named_children(&mut c) {
-                    let (part, quoted) = self.extract_literal(child, depth + 1)?;
-                    result.push_str(&part);
-                    all_quoted &= quoted;
-                }
-                Some((result, all_quoted))
-            }
-            _ => None,
-        }
-    }
-
-    fn node_text(&self, node: Node) -> Option<String> {
-        node.utf8_text(self.src).ok().map(str::to_string)
     }
 }
 
-fn contains_kind(node: Node, kinds: &[&str]) -> bool {
-    // iterative: fuzz-found error-recovery trees are deep enough to overflow
-    // recursive traversal
-    let mut stack = vec![node];
-    while let Some(n) = stack.pop() {
-        if kinds.contains(&n.kind()) {
-            return true;
-        }
-        let mut c = n.walk();
-        stack.extend(n.children(&mut c));
+fn pieces_to_literal(pieces: &[WordPieceWithSource], depth: usize) -> Option<Lit> {
+    if depth > MAX_LITERAL_DEPTH {
+        return None;
     }
-    false
+    let mut text = String::new();
+    let mut glob_ok = false;
+    for pw in pieces {
+        match &pw.piece {
+            WordPiece::Text(s) => {
+                if s.contains(GLOB_CHARS) {
+                    glob_ok = true;
+                }
+                text.push_str(s);
+            }
+            WordPiece::SingleQuotedText(s) | WordPiece::AnsiCQuotedText(s) => text.push_str(s),
+            WordPiece::DoubleQuotedSequence(inner)
+            | WordPiece::GettextDoubleQuotedSequence(inner) => {
+                // quoted glob chars don't expand: inner glob_ok is discarded
+                let lit = pieces_to_literal(inner, depth + 1)?;
+                text.push_str(&lit.text);
+            }
+            WordPiece::EscapeSequence(s) => {
+                text.push_str(s.strip_prefix('\\').unwrap_or(s));
+            }
+            WordPiece::TildeExpansion(TildeExpr::Home) => text.push('~'),
+            // ~user / ~+ / ~- and all expansions are unresolvable statically
+            _ => return None,
+        }
+    }
+    Some(Lit { text, glob_ok })
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
@@ -577,21 +604,6 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|p| p.join(".git").exists())
         .map(normalize_lexical)
-}
-
-fn unescape_word(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.next() {
-                result.push(next);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
 }
 
 /// Lexical normalization: resolves `.` and `..` without touching the
