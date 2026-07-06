@@ -1,0 +1,25 @@
+name: fuzz-hunt
+
+on:
+  push:
+    branches: [fuzz-hunt]
+
+jobs:
+  hunt:
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: hunt
+        env:
+          DOOVER_FUZZ_ITERS: "500000"
+          DOOVER_FUZZ_SEED: ${{ matrix.seed }}
+        # print only the tail so the crashing input is easy to find
+        run: |
+          set -o pipefail
+          cargo test -p doover-core --test fuzz_hunt -- --nocapture 2>&1 | tail -40
