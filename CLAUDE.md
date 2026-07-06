@@ -45,3 +45,16 @@ confirm green → only then claim done. Build order and per-step test gates are 
   stricter. This is a load-bearing safety invariant with property tests behind it.
 - Exit codes: 0 ok, 1 runtime error, 2 hook block decision, 3 undo conflict,
   64 not-implemented.
+
+## Carried-forward design risks (address at the step noted; do not forget)
+
+- **Snapshot limits must apply to ALL scopes, not just the unknown policy.** A
+  known-destructive command with a huge scope (`chmod -R / …`) would otherwise
+  snapshot unbounded. Step 5 (hook engine) must pass `Limits` to every
+  `snapshot()` call and treat truncation as a loud, journaled gap.
+- **The unknown-policy fallback snapshots cwd only.** Opaque commands touching
+  absolute paths outside cwd (`eval`, function bodies) are only partially
+  covered. This is inherent to static analysis — the README/docs must state it
+  plainly rather than imply total coverage.
+- **`doover` is a safety net, not a security boundary** — reiterate in user
+  docs; a deliberately adversarial agent can still defeat static scoping.

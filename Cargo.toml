@@ -22,6 +22,7 @@ reflink-copy = "0.1"
 blake3 = { version = "1", features = ["mmap", "rayon"] }
 walkdir = "2"
 xattr = "1"
+libc = "0.2"
 insta = "1"
 tempfile = "3"
 proptest = "1"

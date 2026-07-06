@@ -29,8 +29,11 @@ teardown() {
   [[ "$output" == *"not implemented"* ]]
 }
 
-@test "S0: running doover leaves no droppings in the jail HOME" {
+@test "S0: running doover leaves no droppings in HOME or cwd" {
   run "$DOOVER_BIN" --version
   [ "$status" -eq 0 ]
+  # neither the jail HOME (covers XDG paths, ~/.doover) nor the working
+  # directory may gain any file from a read-only invocation
   [ -z "$(ls -A "$HOME")" ]
+  [ -z "$(ls -A "$JAIL" | grep -v '^home$')" ]
 }

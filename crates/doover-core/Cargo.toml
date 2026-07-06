@@ -18,6 +18,7 @@ reflink-copy.workspace = true
 blake3.workspace = true
 walkdir.workspace = true
 xattr.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

@@ -51,6 +51,10 @@ pub struct ScopeSpec {
     /// argument is not a path and must not enter the scope.
     #[serde(default)]
     pub flag_args: Vec<String>,
+    /// Flags whose value *is* a target path to snapshot, in either the
+    /// separate (`-o out.txt`) or attached (`--output=out.txt`) form.
+    #[serde(default)]
+    pub path_flags: Vec<String>,
     #[serde(default)]
     pub recursive_flags: Vec<String>,
 }
@@ -216,7 +220,12 @@ impl Registry {
         match self.index.get(&rule.id) {
             Some(&i) => {
                 let shipped = &self.rules[i];
-                if shipped.effect >= Effect::Destructive && rule.effect < shipped.effect {
+                // never let a user overlay quietly weaken a safety-relevant
+                // shipped classification. Both data-loss (destructive/
+                // irreversible) and exfiltration (externalizing) qualify —
+                // downgrading either could disable a protection the user relies
+                // on without them noticing.
+                if is_protected(shipped.effect) && rule.effect < shipped.effect {
                     warnings.push(format!(
                         "refusing to downgrade `{}` from {:?} to {:?}; overlay rule ignored",
                         rule.id, shipped.effect, rule.effect
@@ -257,7 +266,10 @@ impl Registry {
                     score += 2;
                 }
                 if let Some(want_any) = &m.flags_any {
-                    if !want_any.iter().any(|w| flags.iter().any(|f| f == w)) {
+                    if !want_any
+                        .iter()
+                        .any(|w| flags.iter().any(|f| flag_matches(f, w)))
+                    {
                         return None;
                     }
                     score += 4;
@@ -285,6 +297,22 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+}
+
+/// Whether an observed flag token satisfies a wanted flag. Exact match, or the
+/// `--long=value` form of a `--long` want (`--output=x` matches `--output`).
+fn flag_matches(observed: &str, want: &str) -> bool {
+    observed == want
+        || (want.starts_with("--")
+            && observed
+                .split_once('=')
+                .is_some_and(|(name, _)| name == want))
+}
+
+/// Safety-relevant classifications an overlay may not silently weaken:
+/// externalizing (exfiltration) and above (data loss).
+fn is_protected(effect: Effect) -> bool {
+    effect >= Effect::Externalizing
 }
 
 fn validate(file: &str, rule: &Rule) -> Result<(), RegistryError> {

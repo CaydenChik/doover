@@ -40,3 +40,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: make canary
+
+  # Both crates must stay publishable — the registry data is embedded via
+  # include_str!, so a stray moved/renamed data file breaks packaging silently
+  # otherwise (it regressed once). Gate it in CI, not ad hoc.
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run -p doover-core
+      - run: cargo publish --dry-run -p doover --allow-dirty

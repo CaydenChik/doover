@@ -60,6 +60,8 @@ fn fingerprint(root: &Path) -> BTreeMap<PathBuf, (String, Vec<u8>, u32)> {
                     0,
                 ),
             );
+        } else if std::os::unix::fs::FileTypeExt::is_fifo(&meta.file_type()) {
+            map.insert(rel, ("fifo".into(), Vec::new(), mode));
         } else if meta.is_dir() {
             map.insert(rel, ("dir".into(), Vec::new(), mode));
         } else {
@@ -140,6 +142,10 @@ fn dir_tree_round_trip_exact() {
     fs::create_dir_all(d.join("empty-dir")).unwrap();
     fs::set_permissions(d.join("a.txt"), fs::Permissions::from_mode(0o600)).unwrap();
     let before = fingerprint(&d);
+    let want_mtime = fs::metadata(d.join("sub dir/файл.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
 
     let m = j.store.snapshot(&d, None).unwrap();
 
@@ -154,6 +160,14 @@ fn dir_tree_round_trip_exact() {
         fingerprint(&d),
         before,
         "restore must reproduce the exact tree"
+    );
+    assert_eq!(
+        fs::metadata(d.join("sub dir/файл.txt"))
+            .unwrap()
+            .modified()
+            .unwrap(),
+        want_mtime,
+        "mtimes must survive tree round-trips too"
     );
 }
 
@@ -291,6 +305,107 @@ fn limits_truncate_and_report() {
         .filter(|e| matches!(e.kind, EntryKind::File { .. }))
         .count();
     assert!(captured <= 5, "captured {captured} files, cap was 5");
+}
+
+// --- special files (audit 2026-07-06: FIFO ingestion used to hang forever) -----
+
+#[test]
+fn fifo_in_tree_round_trips_without_hanging() {
+    let j = jail_with(StoreOptions { force_copy: true }); // copy path = the hang path
+    let d = j.world.join("tree");
+    write(&d.join("normal.txt"), "fine");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(d.join("pipe.fifo"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let before = fingerprint(&d);
+
+    // must return promptly instead of blocking on opening the fifo
+    let (tx, rx) = std::sync::mpsc::channel();
+    let store = j.store;
+    let d2 = d.clone();
+    std::thread::spawn(move || {
+        let m = store.snapshot(&d2, None);
+        let _ = tx.send((store, m));
+    });
+    let (store, m) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("snapshot must not hang on a fifo");
+    let m = m.unwrap();
+
+    fs::remove_dir_all(&d).unwrap();
+    store.restore(&m).unwrap();
+    assert_eq!(fingerprint(&d), before, "fifo must be recreated");
+}
+
+#[test]
+fn socket_is_skipped_with_warning_not_a_hang() {
+    let j = jail();
+    let d = j.world.join("tree");
+    write(&d.join("normal.txt"), "fine");
+    let _listener = std::os::unix::net::UnixListener::bind(d.join("live.sock")).unwrap();
+
+    let m = j.store.snapshot(&d, None).unwrap();
+    assert!(
+        m.warnings.iter().any(|w| w.contains("live.sock")),
+        "skipping a socket must be reported: {:?}",
+        m.warnings
+    );
+
+    fs::remove_dir_all(&d).unwrap();
+    let report = j.store.restore(&m).unwrap();
+    assert_eq!(fs::read_to_string(d.join("normal.txt")).unwrap(), "fine");
+    assert!(!d.join("live.sock").exists(), "sockets cannot be recreated");
+    drop(report);
+}
+
+#[test]
+fn unreadable_subdir_warns_instead_of_failing_snapshot() {
+    let j = jail();
+    let d = j.world.join("tree");
+    write(&d.join("ok.txt"), "readable");
+    write(&d.join("locked/secret.txt"), "unreachable");
+    fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = j.store.snapshot(&d, None);
+    // teardown safety before asserting
+    fs::set_permissions(d.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let m = result.expect("one unreadable subdir must not kill the snapshot");
+    assert!(
+        m.warnings.iter().any(|w| w.contains("locked")),
+        "the gap must be reported loudly: {:?}",
+        m.warnings
+    );
+    assert!(
+        m.entries
+            .iter()
+            .any(|e| e.rel == std::path::Path::new("ok.txt")),
+        "readable content still captured"
+    );
+}
+
+// --- restore staging hygiene ----------------------------------------------------
+
+#[test]
+fn restore_leaves_no_staging_droppings() {
+    let j = jail();
+    let d = j.world.join("proj");
+    write(&d.join("f.txt"), "content");
+    let m = j.store.snapshot(&d, None).unwrap();
+    fs::write(d.join("f.txt"), "changed").unwrap();
+    j.store.restore(&m).unwrap();
+
+    let leftovers: Vec<_> = fs::read_dir(&j.world)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".doover-"))
+        .collect();
+    assert!(leftovers.is_empty(), "staging droppings: {leftovers:?}");
 }
 
 // --- extended attributes (skipped on filesystems without support) --------------

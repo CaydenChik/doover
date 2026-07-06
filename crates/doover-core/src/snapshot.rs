@@ -79,6 +79,12 @@ pub enum EntryKind {
     Symlink {
         target: PathBuf,
     },
+    /// Named pipe. Recreated empty on restore (its transient contents are not
+    /// data we can or should capture); never opened during snapshot, which is
+    /// what used to hang the engine.
+    Fifo {
+        mode: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -99,6 +105,10 @@ pub struct Manifest {
     pub truncated: bool,
     /// Files seen but not captured because of limits.
     pub skipped: u64,
+    /// Loud record of anything the snapshot could not fully capture:
+    /// unreadable subtrees, skipped special files (sockets/devices), fifos.
+    /// A non-empty list means coverage has gaps the caller must surface.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -147,6 +157,7 @@ impl Store {
             entries: Vec::new(),
             truncated: false,
             skipped: 0,
+            warnings: Vec::new(),
         };
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -157,54 +168,65 @@ impl Store {
             Err(e) => return Err(io_err(path, e)),
         };
 
-        if meta.file_type().is_symlink() {
-            manifest.entries.push(Entry {
-                rel: PathBuf::new(),
-                kind: EntryKind::Symlink {
-                    target: fs::read_link(path).map_err(|e| io_err(path, e))?,
-                },
-            });
-            return Ok(manifest);
-        }
-        if meta.is_file() {
-            manifest
-                .entries
-                .push(self.file_entry(path, PathBuf::new(), &meta)?);
+        // single non-directory root
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            match self.classify(path, PathBuf::new(), &meta)? {
+                Captured::Entry(entry) => manifest.entries.push(entry),
+                Captured::Skipped(reason) => {
+                    // the root itself is uncapturable (e.g. a device node):
+                    // record an absent-style marker is wrong, so warn and leave
+                    // entries empty — restore of an empty Present manifest is a
+                    // no-op, and the loud warning routes the caller to the
+                    // unknown policy
+                    manifest
+                        .warnings
+                        .push(format!("{}: {reason}", path.display()));
+                }
+            }
             return Ok(manifest);
         }
 
-        // directory tree
+        // directory tree — tolerate per-entry errors (unreadable subdirs) by
+        // recording a warning and continuing, never aborting the whole snapshot
         let mut files: u64 = 0;
         let mut bytes: u64 = 0;
-        for item in walkdir::WalkDir::new(path).sort_by_file_name() {
-            let item = item.map_err(|e| SnapshotError::Io {
-                path: path.display().to_string(),
-                source: e.into(),
-            })?;
+        let walker = walkdir::WalkDir::new(path).sort_by_file_name();
+        for item in walker {
+            let item = match item {
+                Ok(i) => i,
+                Err(e) => {
+                    let at = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| path.display().to_string());
+                    manifest.warnings.push(format!("{at}: unreadable ({e})"));
+                    continue;
+                }
+            };
             let rel = item
                 .path()
                 .strip_prefix(path)
                 .unwrap_or(item.path())
                 .to_path_buf();
-            let meta = item.metadata().map_err(|e| SnapshotError::Io {
-                path: item.path().display().to_string(),
-                source: e.into(),
-            })?;
-            if meta.file_type().is_symlink() {
-                manifest.entries.push(Entry {
-                    rel,
-                    kind: EntryKind::Symlink {
-                        target: fs::read_link(item.path()).map_err(|e| io_err(item.path(), e))?,
-                    },
-                });
-            } else if meta.is_dir() {
+            let meta = match item.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    manifest
+                        .warnings
+                        .push(format!("{}: unreadable ({e})", item.path().display()));
+                    continue;
+                }
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
                 manifest.entries.push(Entry {
                     rel,
                     kind: EntryKind::Dir {
                         mode: meta.permissions().mode() & 0o7777,
                     },
                 });
-            } else {
+                continue;
+            }
+            if meta.is_file() && !meta.file_type().is_symlink() {
                 if let Some(l) = limits {
                     if files + 1 > l.max_files || bytes + meta.len() > l.max_bytes {
                         manifest.truncated = true;
@@ -214,12 +236,65 @@ impl Store {
                 }
                 files += 1;
                 bytes += meta.len();
-                manifest
-                    .entries
-                    .push(self.file_entry(item.path(), rel, &meta)?);
+            }
+            match self.classify(item.path(), rel, &meta)? {
+                Captured::Entry(entry) => manifest.entries.push(entry),
+                Captured::Skipped(reason) => manifest
+                    .warnings
+                    .push(format!("{}: {reason}", item.path().display())),
             }
         }
         Ok(manifest)
+    }
+
+    /// Turn one filesystem object into a manifest entry, or decide it can't be
+    /// captured. Never opens fifos/sockets/devices for I/O.
+    fn classify(
+        &self,
+        abs: &Path,
+        rel: PathBuf,
+        meta: &fs::Metadata,
+    ) -> Result<Captured, SnapshotError> {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = meta.file_type();
+        let mode = meta.permissions().mode() & 0o7777;
+        if ft.is_symlink() {
+            return Ok(Captured::Entry(Entry {
+                rel,
+                kind: EntryKind::Symlink {
+                    target: fs::read_link(abs).map_err(|e| io_err(abs, e))?,
+                },
+            }));
+        }
+        if ft.is_dir() {
+            return Ok(Captured::Entry(Entry {
+                rel,
+                kind: EntryKind::Dir { mode },
+            }));
+        }
+        if ft.is_file() {
+            return Ok(Captured::Entry(self.file_entry(abs, rel, meta)?));
+        }
+        if ft.is_fifo() {
+            // recreated empty; never opened (opening a fifo for read blocks)
+            return Ok(Captured::Entry(Entry {
+                rel,
+                kind: EntryKind::Fifo { mode },
+            }));
+        }
+        // sockets, block/char devices: not restorable data
+        let what = if ft.is_socket() {
+            "socket"
+        } else if ft.is_block_device() {
+            "block device"
+        } else if ft.is_char_device() {
+            "char device"
+        } else {
+            "special file"
+        };
+        Ok(Captured::Skipped(format!(
+            "skipped {what} (cannot snapshot)"
+        )))
     }
 
     /// Restore the exact captured state, replacing whatever is at the path
@@ -235,7 +310,7 @@ impl Store {
             return Ok(report);
         }
 
-        // fail-closed verification pass, deduped by hash
+        // fail-closed verification pass, deduped by hash — before any mutation
         let mut verified = std::collections::BTreeSet::new();
         for entry in &manifest.entries {
             if let EntryKind::File { hash, .. } = &entry.kind {
@@ -253,17 +328,57 @@ impl Store {
             }
         }
 
-        remove_any(target_root)?;
-        if let Some(parent) = target_root.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        let parent = target_root
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| SnapshotError::Io {
+                path: target_root.display().to_string(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot restore a filesystem root",
+                ),
+            })?;
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+
+        // Build the whole restored tree into a sibling staging path first, so
+        // every fallible operation (copy, chmod, set_times, xattr, mkfifo)
+        // happens while the current target is still fully intact. Only once
+        // staging succeeds do we swap — remove target, rename staging in —
+        // which is metadata-only and on the same filesystem. A crash mid-build
+        // leaves the target untouched; a failure is cleaned up.
+        let staging = self.staging_path(parent);
+        let build = self.build_into(&staging, manifest, &mut report);
+        if let Err(e) = build {
+            let _ = remove_any(&staging);
+            return Err(e);
         }
 
+        if let Err(e) = remove_any(target_root) {
+            let _ = remove_any(&staging);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&staging, target_root) {
+            let _ = remove_any(&staging);
+            return Err(io_err(target_root, e));
+        }
+        Ok(report)
+    }
+
+    /// Materialize `manifest` at `base` (a fresh staging path). Directory modes
+    /// are applied deepest-first so a restrictive mode can't block writing its
+    /// own children.
+    fn build_into(
+        &self,
+        base: &Path,
+        manifest: &Manifest,
+        report: &mut RestoreReport,
+    ) -> Result<(), SnapshotError> {
         let mut dir_modes: Vec<(PathBuf, u32)> = Vec::new();
         for entry in &manifest.entries {
             let dest = if entry.rel.as_os_str().is_empty() {
-                target_root.clone()
+                base.to_path_buf()
             } else {
-                target_root.join(&entry.rel)
+                base.join(&entry.rel)
             };
             match &entry.kind {
                 EntryKind::Dir { mode } => {
@@ -271,7 +386,16 @@ impl Store {
                     dir_modes.push((dest, *mode));
                 }
                 EntryKind::Symlink { target } => {
+                    if let Some(p) = dest.parent() {
+                        fs::create_dir_all(p).map_err(|e| io_err(p, e))?;
+                    }
                     std::os::unix::fs::symlink(target, &dest).map_err(|e| io_err(&dest, e))?;
+                }
+                EntryKind::Fifo { mode } => {
+                    if let Some(p) = dest.parent() {
+                        fs::create_dir_all(p).map_err(|e| io_err(p, e))?;
+                    }
+                    make_fifo(&dest, *mode)?;
                 }
                 EntryKind::File {
                     hash,
@@ -280,6 +404,9 @@ impl Store {
                     xattrs,
                     ..
                 } => {
+                    if let Some(p) = dest.parent() {
+                        fs::create_dir_all(p).map_err(|e| io_err(p, e))?;
+                    }
                     let object = self.object_path(hash);
                     self.copy_out(&object, &dest)?;
                     // clones inherit the object's read-only mode: make the
@@ -308,13 +435,16 @@ impl Store {
                 }
             }
         }
-        // apply directory modes deepest-first so restrictive modes can't block
-        // their own children
         for (dir, mode) in dir_modes.into_iter().rev() {
             fs::set_permissions(&dir, fs::Permissions::from_mode(mode))
                 .map_err(|e| io_err(&dir, e))?;
         }
-        Ok(report)
+        Ok(())
+    }
+
+    fn staging_path(&self, parent: &Path) -> PathBuf {
+        let n = self.seq.fetch_add(1, Ordering::Relaxed);
+        parent.join(format!(".doover-restore-{}-{n}", std::process::id()))
     }
 
     /// Probe whether the store's filesystem supports copy-on-write clones.
@@ -410,6 +540,27 @@ impl Store {
             .unwrap_or(0);
         self.tmp.join(format!("{}-{n}-{nanos}", std::process::id()))
     }
+}
+
+enum Captured {
+    Entry(Entry),
+    Skipped(String),
+}
+
+fn make_fifo(path: &Path, mode: u32) -> Result<(), SnapshotError> {
+    use std::os::unix::ffi::OsStrExt;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io_err(
+            path,
+            io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"),
+        )
+    })?;
+    // SAFETY: cpath is a valid NUL-terminated C string for the duration of the call.
+    let rc = unsafe { libc::mkfifo(cpath.as_ptr(), mode as libc::mode_t) };
+    if rc != 0 {
+        return Err(io_err(path, io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 fn read_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {

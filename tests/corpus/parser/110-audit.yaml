@@ -1,0 +1,86 @@
+# T1 corpus — cases from the 2026-07-06 adversarial audit. Every case here
+# encodes a previously-confirmed silent hole (classified safe/covered while
+# bash did something unaccounted). None of these may regress.
+
+cases:
+  # --- brace expansion (was: literal path, false coverage) ---
+  - name: brace-simple
+    cmd: "rm -rf {build,dist}"
+    cwd_fixture: ["build/", "dist/"]
+    expect: { effect: destructive, paths: ["build", "dist"], rule: coreutils.rm }
+
+  - name: brace-prefix-suffix
+    cmd: "rm -rf build/{a,b}.log"
+    expect: { effect: destructive, paths: ["build/a.log", "build/b.log"], rule: coreutils.rm }
+
+  - name: brace-nested
+    cmd: "rm {a,b{1,2}}"
+    expect: { effect: destructive, paths: ["a", "b1", "b2"], rule: coreutils.rm }
+
+  - name: brace-numeric-range
+    cmd: "rm f{1..3}.txt"
+    expect: { effect: destructive, paths: ["f1.txt", "f2.txt", "f3.txt"], rule: coreutils.rm }
+
+  - name: brace-char-range
+    cmd: "rm part-{a..c}"
+    expect: { effect: destructive, paths: ["part-a", "part-b", "part-c"], rule: coreutils.rm }
+
+  - name: brace-quoted-is-literal
+    cmd: "rm '{a,b}'"
+    expect: { effect: destructive, paths: ["{a,b}"], rule: coreutils.rm }
+
+  - name: brace-no-comma-is-literal
+    cmd: "rm {alone}"
+    expect: { effect: destructive, paths: ["{alone}"], rule: coreutils.rm }
+
+  - name: brace-huge-range-is-unknown
+    cmd: "rm x{1..99999}"
+    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.rm }
+
+  # --- command substitution smuggled through input channels (was: safe) ---
+  - name: herestring-subst-is-unknown
+    cmd: "cat <<< $(date)"
+    expect: { effect: unknown, unknown: true }
+
+  - name: herestring-plain-is-safe
+    cmd: 'cat <<< "hello"'
+    expect: { effect: safe, paths: [], unknown: false, rule: coreutils.cat }
+
+  - name: read-redirect-subst-is-unknown
+    cmd: "wc -l < $(echo f)"
+    expect: { effect: unknown, unknown: true }
+
+  - name: read-redirect-plain-is-safe
+    cmd: "wc -l < notes.txt"
+    expect: { effect: safe, paths: [], unknown: false, rule: posix.wc }
+
+  - name: heredoc-subst-is-unknown
+    cmd: "cat <<EOF\n$(date)\nEOF\n"
+    expect: { effect: unknown, unknown: true }
+
+  - name: heredoc-plain-is-safe
+    cmd: "cat <<EOF\nhello world\nEOF\n"
+    expect: { effect: safe, paths: [], unknown: false, rule: coreutils.cat }
+
+  - name: heredoc-quoted-delimiter-suppresses-expansion
+    cmd: "cat <<'EOF'\n$(date)\nEOF\n"
+    expect: { effect: safe, paths: [], unknown: false, rule: coreutils.cat }
+
+  # --- expansions nested inside assignments (was: inert) ---
+  - name: assignment-nested-subst-is-unknown
+    cmd: "FOO=${X:-$(date)}"
+    expect: { effect: unknown, unknown: true }
+
+  - name: assignment-plain-var-is-inert
+    cmd: "FOO=$BAR"
+    expect: { effect: safe, paths: [], unknown: false }
+
+  - name: env-prefix-command-still-resolves
+    cmd: "FOO=1 rm -rf sub"
+    cwd_fixture: ["sub/"]
+    expect: { effect: destructive, paths: ["sub"], unknown: false, rule: coreutils.rm }
+
+  # --- long-form flag with attached value (was: safe classification) ---
+  - name: sort-long-output-attached
+    cmd: "sort --output=out.txt in.txt"
+    expect: { effect: destructive, paths: ["out.txt", "in.txt"], unknown: false, rule: posix.sort-o }

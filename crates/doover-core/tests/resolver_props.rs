@@ -40,6 +40,12 @@ proptest! {
             "sudo rm -rf ./x",
             "rm -rf $TARGET",
             "$CLEANER ./data",
+            // audit 2026-07-06: substitution smuggled through input channels
+            "cat <<< $(rm -rf ./x)",
+            "wc -l < $(ls)",
+            "FOO=${X:-$(rm ./x)}",
+            "cat <<EOF\n$(rm ./x)\nEOF",
+            "diff <(rm ./x) f",
         ]),
         suffix in prop::sample::select(vec!["", " ; ls", " && echo done"]),
     ) {

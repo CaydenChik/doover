@@ -97,13 +97,18 @@ fn run_case(registry: &Registry, case: &Case) -> Result<(), String> {
             return Err(format!("paths: expected {want:?}, got {got:?}"));
         }
     }
-    if let Some(expected_unknown) = case.expect.unknown {
-        if r.has_unknown != expected_unknown {
-            return Err(format!(
-                "unknown flag: expected {expected_unknown}, got {}",
-                r.has_unknown
-            ));
-        }
+    // strict by default: omitting `unknown` asserts it is false unless the
+    // expected effect is itself unknown (audit finding: a spuriously-cleared
+    // unknown flag was previously invisible)
+    let expected_unknown = case
+        .expect
+        .unknown
+        .unwrap_or(case.expect.effect == Severity::Unknown);
+    if r.has_unknown != expected_unknown {
+        return Err(format!(
+            "unknown flag: expected {expected_unknown}, got {}",
+            r.has_unknown
+        ));
     }
     if let Some(rule) = &case.expect.rule {
         if r.rule_id.as_deref() != Some(rule.as_str()) {

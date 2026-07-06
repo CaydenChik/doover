@@ -97,6 +97,18 @@ fn lookup_unknown_command_is_none() {
 }
 
 #[test]
+fn eq_attached_long_flag_matches_flags_any() {
+    // audit finding: `sort --output=out.txt` must match posix.sort-o even
+    // though the flag token carries its value
+    let r = Registry::builtin().unwrap();
+    let rule = r
+        .lookup_command("sort", None, &["--output=out.txt".into()])
+        .expect("--output=x must match");
+    assert_eq!(rule.id, "posix.sort-o");
+    assert_eq!(rule.effect, Effect::Destructive);
+}
+
+#[test]
 fn redirect_lookup_distinguishes_truncate_from_append() {
     let r = Registry::builtin().unwrap();
     assert_eq!(r.lookup_redirect(">").unwrap().effect, Effect::Destructive);
@@ -150,6 +162,27 @@ fn overlay_cannot_silently_downgrade_a_shipped_destructive_rule() {
             .iter()
             .any(|w| w.contains("downgrade") && w.contains("coreutils.rm")),
         "expected a downgrade warning naming the rule, got: {warnings:?}"
+    );
+}
+
+#[test]
+fn overlay_cannot_downgrade_externalizing_either() {
+    // audit finding: exfiltration-relevant classifications deserve the same
+    // downgrade guard as destructive ones
+    let dir = overlay_dir(&[(
+        "custom.yaml",
+        "rules:\n  - id: git.push\n    match: { command: git, subcommand: push }\n    effect: safe\n    undo: none\n",
+    )]);
+    let (r, warnings) = Registry::with_overlay(dir.path()).unwrap();
+    assert_eq!(
+        r.lookup_command("git", Some("push"), &[]).unwrap().effect,
+        Effect::Externalizing
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("downgrade") && w.contains("git.push")),
+        "expected downgrade warning, got: {warnings:?}"
     );
 }
 

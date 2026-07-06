@@ -54,11 +54,11 @@ rules:
     notes: "stdout only — but see posix.sort-o."
 
   - id: posix.sort-o
-    match: { command: sort, flags_any: ["-o"] }
+    match: { command: sort, flags_any: ["-o", "--output"] }
     effect: destructive
-    scope: { paths: positional }
+    scope: { paths: positional, path_flags: ["-o", "--output"] }
     undo: snapshot-restore
-    notes: "-o overwrites in place; positional over-capture of inputs is harmless."
+    notes: "-o/--output overwrites the target; positional over-capture of inputs is harmless."
 
   - id: posix.sed-in-place
     match: { command: sed, flags_any: ["-i", "--in-place"] }
