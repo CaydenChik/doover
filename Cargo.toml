@@ -6,8 +6,8 @@ members = ["crates/doover-core", "crates/doover"]
 version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/do-over/doover"
-homepage = "https://github.com/do-over/doover"
+repository = "https://github.com/CaydenChik/doover"
+homepage = "https://github.com/CaydenChik/doover"
 rust-version = "1.85"
 
 [workspace.dependencies]
