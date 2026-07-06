@@ -5,21 +5,26 @@ on:
     branches: [fuzz-hunt]
 
 jobs:
-  hunt:
+  # bisect: current crate versions vs pinned-back versions, parse-only vs full
+  regression:
     strategy:
       fail-fast: false
       matrix:
-        seed: [1, 2, 3, 4]
+        versions: [current, pinned-back]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: hunt
-        env:
-          DOOVER_FUZZ_ITERS: "500000"
-          DOOVER_FUZZ_SEED: ${{ matrix.seed }}
-        # print only the tail so the crashing input is easy to find
+        with:
+          key: ${{ matrix.versions }}
+      - name: pin back tree-sitter versions
+        if: matrix.versions == 'pinned-back'
         run: |
-          set -o pipefail
-          cargo test -p doover-core --test fuzz_hunt -- --nocapture 2>&1 | tail -40
+          sed -i 's/tree-sitter = "0.25"/tree-sitter = "=0.24.7"/' Cargo.toml
+          sed -i 's/tree-sitter-bash = "0.25"/tree-sitter-bash = "=0.23.3"/' Cargo.toml
+          cargo update -p tree-sitter -p tree-sitter-bash || cargo update
+      - name: stage 1 — parse only
+        run: cargo test -p doover-core --test segfault_regressions parse_only -- --nocapture
+      - name: stage 2 — full resolve
+        run: cargo test -p doover-core --test segfault_regressions full_resolve -- --nocapture
