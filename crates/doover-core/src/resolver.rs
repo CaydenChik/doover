@@ -8,6 +8,13 @@
 //! which the thread wrapper in [`resolve`] converts into a conservative
 //! Unknown resolution.
 //!
+//! Quote-context correctness: every word is carried as *segments* with an
+//! expandability mask (unquoted vs quoted/escaped), because bash only
+//! brace-expands, globs, and tilde-expands unquoted spans. `'{a,b}'{c,d}`
+//! expands only the second group; `'*'x` never globs; `'~/x'` is a literal.
+//! The bash differential oracle (tests/resolver_oracle.rs) enforces this
+//! against real bash.
+//!
 //! Design invariants (property-tested):
 //! - never panics or crashes the caller on any input;
 //! - anything the resolver cannot fully account for — opaque constructs
@@ -83,6 +90,10 @@ const GLOB_CHARS: &[char] = &['*', '?', '['];
 /// on adversarial input. Fail safe (Unknown) beyond it.
 const MAX_WALK_DEPTH: usize = 256;
 const MAX_LITERAL_DEPTH: usize = 64;
+
+/// Cap on brace-expansion fan-out; beyond it the scope is treated as unknown
+/// rather than materializing a huge path list.
+const MAX_BRACE_EXPANSION: usize = 1024;
 
 /// Generous stack for the recursive-descent parser on pathological inputs;
 /// panics anywhere in resolution degrade to a conservative Unknown.
@@ -161,30 +172,60 @@ impl Out {
     }
 }
 
-/// A word reduced to its literal text. `glob_ok`/`brace_ok` are true only when
-/// the respective metacharacters appeared *unquoted* — `rm '*.bak'` must not
-/// glob and `rm '{a,b}'` must not brace-expand.
-struct Lit {
-    text: String,
-    glob_ok: bool,
-    brace_ok: bool,
+/// A word as quote-aware segments: `(text, expandable)`. Only expandable
+/// (unquoted, unescaped) spans participate in brace/glob expansion.
+/// `tilde_home` records an unquoted leading `~` (brush emits a tilde piece
+/// only where bash would actually expand one).
+#[derive(Clone, Debug)]
+struct Word {
+    segs: Vec<(String, bool)>,
+    tilde_home: bool,
 }
 
-#[derive(Clone)]
-struct PosArg {
-    text: String,
-    glob_ok: bool,
-    brace_ok: bool,
+impl Word {
+    fn text(&self) -> String {
+        self.segs.iter().map(|(s, _)| s.as_str()).collect()
+    }
+
+    fn masked_chars(&self) -> Vec<(char, bool)> {
+        self.segs
+            .iter()
+            .flat_map(|(s, exp)| s.chars().map(move |c| (c, *exp)))
+            .collect()
+    }
+
+    fn has_expandable(&self, ch: char) -> bool {
+        self.segs.iter().any(|(s, exp)| *exp && s.contains(ch))
+    }
+
+    /// Split at a byte offset of `text()`, preserving masks; used to peel the
+    /// value off attached flag forms (`-ovalue`, `--output=value`).
+    fn split_off_bytes(&self, at: usize) -> Word {
+        let mut consumed = 0usize;
+        let mut segs = Vec::new();
+        for (s, exp) in &self.segs {
+            let end = consumed + s.len();
+            if end > at {
+                let start = at.saturating_sub(consumed);
+                segs.push((s[start..].to_string(), *exp));
+            }
+            consumed = end;
+        }
+        Word {
+            segs,
+            tilde_home: false,
+        }
+    }
 }
 
 enum ArgVal {
-    Lit(Lit),
+    Lit(Word),
     Opaque,
 }
 
 enum Tok {
-    Flag(String),
-    Pos(PosArg),
+    Flag(Word),
+    Pos(Word),
 }
 
 /// What the next positional token should become, given the preceding flag.
@@ -193,10 +234,6 @@ enum Consume {
     Drop,
     Path,
 }
-
-/// Cap on brace-expansion fan-out; beyond it the scope is treated as unknown
-/// rather than materializing a huge path list.
-const MAX_BRACE_EXPANSION: usize = 1024;
 
 struct Walker<'a> {
     registry: &'a Registry,
@@ -293,7 +330,11 @@ impl Walker<'_> {
             self.out.mark_unknown();
             return;
         };
-        let name = name_lit.text;
+        if name_lit.tilde_home {
+            self.out.mark_unknown();
+            return;
+        }
+        let name = name_lit.text();
 
         if name == "cd" {
             self.handle_cd(&args, cur);
@@ -310,18 +351,14 @@ impl Walker<'_> {
         for arg in &args {
             match arg {
                 ArgVal::Opaque => any_opaque = true,
-                ArgVal::Lit(lit) => {
-                    if !after_double_dash && lit.text == "--" {
+                ArgVal::Lit(word) => {
+                    let text = word.text();
+                    if !after_double_dash && text == "--" {
                         after_double_dash = true;
-                    } else if !after_double_dash && lit.text.len() > 1 && lit.text.starts_with('-')
-                    {
-                        tokens.push(Tok::Flag(lit.text.clone()));
+                    } else if !after_double_dash && text.len() > 1 && text.starts_with('-') {
+                        tokens.push(Tok::Flag(word.clone()));
                     } else {
-                        tokens.push(Tok::Pos(PosArg {
-                            text: lit.text.clone(),
-                            glob_ok: lit.glob_ok,
-                            brace_ok: lit.brace_ok,
-                        }));
+                        tokens.push(Tok::Pos(word.clone()));
                     }
                 }
             }
@@ -333,15 +370,21 @@ impl Walker<'_> {
         let flags: Vec<String> = tokens
             .iter()
             .filter_map(|t| match t {
-                Tok::Flag(f) => Some(f.clone()),
-                Tok::Pos(..) => None,
+                Tok::Flag(w) => Some(w.text()),
+                Tok::Pos(_) => None,
             })
             .collect();
-        let sub = tokens.iter().find_map(|t| match t {
-            Tok::Pos(p) => Some(p.text.as_str()),
-            Tok::Flag(_) => None,
-        });
-        let Some(rule) = self.registry.lookup_command(&name, sub, &flags) else {
+        let subs: Vec<String> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Tok::Pos(w) => Some(w.text()),
+                Tok::Flag(_) => None,
+            })
+            .collect();
+        let Some(rule) =
+            self.registry
+                .lookup_command(&name, subs.first().map(String::as_str), &flags)
+        else {
             self.out.mark_unknown();
             return;
         };
@@ -349,39 +392,47 @@ impl Walker<'_> {
         self.out.contribute(sev, &rule.id);
 
         // separate positionals from flag-carried values. `flag_args` flags
-        // consume a non-path value (dropped); `path_flags` flags consume a
-        // path value (captured), in separate or attached (`=`) form.
+        // consume a non-path value (dropped); `path_flags` flags carry a path
+        // value (captured) — in separate (`-o v`), attached-short (`-ov`), or
+        // attached-long (`--out=v`) form.
         let empty: &[String] = &[];
         let (flag_args, path_flags) = rule
             .scope
             .as_ref()
             .map(|s| (s.flag_args.as_slice(), s.path_flags.as_slice()))
             .unwrap_or((empty, empty));
-        let mut positionals: Vec<PosArg> = Vec::new();
-        let mut flag_paths: Vec<PosArg> = Vec::new();
+        let is_short = |f: &str| f.len() == 2 && f.starts_with('-') && !f.starts_with("--");
+        let mut positionals: Vec<Word> = Vec::new();
+        let mut flag_paths: Vec<Word> = Vec::new();
         let mut consume: Consume = Consume::No;
         for tok in &tokens {
             match tok {
-                Tok::Flag(f) => {
-                    if let Some((name, val)) = f.split_once('=') {
-                        // attached form: only path_flags carry a path
-                        if path_flags.iter().any(|pf| pf == name) {
-                            flag_paths.push(PosArg {
-                                text: val.to_string(),
-                                glob_ok: val.contains(GLOB_CHARS),
-                                brace_ok: val.contains('{'),
-                            });
+                Tok::Flag(w) => {
+                    let t = w.text();
+                    if let Some(eq) = t.find('=') {
+                        if path_flags.iter().any(|pf| pf.as_str() == &t[..eq]) {
+                            flag_paths.push(w.split_off_bytes(eq + 1));
                         }
-                    } else if path_flags.iter().any(|pf| pf == f) {
+                    } else if path_flags.iter().any(|pf| pf.as_str() == t) {
                         consume = Consume::Path;
-                    } else if flag_args.iter().any(|fa| fa == f) {
+                    } else if flag_args.iter().any(|fa| fa.as_str() == t) {
                         consume = Consume::Drop;
+                    } else if let Some(pf) = path_flags
+                        .iter()
+                        .find(|pf| is_short(pf) && t.starts_with(pf.as_str()) && t.len() > 2)
+                    {
+                        flag_paths.push(w.split_off_bytes(pf.len()));
+                    } else if flag_args
+                        .iter()
+                        .any(|fa| is_short(fa) && t.starts_with(fa.as_str()) && t.len() > 2)
+                    {
+                        // attached non-path value: nothing to capture or drop
                     }
                 }
-                Tok::Pos(p) => match std::mem::replace(&mut consume, Consume::No) {
-                    Consume::Path => flag_paths.push(p.clone()),
+                Tok::Pos(w) => match std::mem::replace(&mut consume, Consume::No) {
+                    Consume::Path => flag_paths.push(w.clone()),
                     Consume::Drop => {}
-                    Consume::No => positionals.push(p.clone()),
+                    Consume::No => positionals.push(w.clone()),
                 },
             }
         }
@@ -432,25 +483,20 @@ impl Walker<'_> {
         }
     }
 
-    fn extract_scope(
-        &mut self,
-        rule: &Rule,
-        positionals: &[PosArg],
-        cur: &Option<PathBuf>,
-    ) -> usize {
+    fn extract_scope(&mut self, rule: &Rule, positionals: &[Word], cur: &Option<PathBuf>) -> usize {
         let Some(scope) = &rule.scope else { return 0 };
         let skip = usize::from(rule.matcher.subcommand.is_some()) + scope.skip;
-        let path_args: Vec<&PosArg> = positionals.iter().skip(skip).collect();
+        let path_args: Vec<&Word> = positionals.iter().skip(skip).collect();
         let mut contributed = 0usize;
         match scope.paths {
             PathSource::Positional => {
-                for pa in path_args.iter().copied() {
-                    contributed += self.add_path(pa, scope.globs, cur);
+                for word in path_args {
+                    contributed += self.add_path(word, scope.globs, cur);
                 }
             }
             PathSource::PositionalLast => {
-                if let Some(pa) = path_args.last().copied() {
-                    contributed += self.add_path(pa, scope.globs, cur);
+                if let Some(word) = path_args.last() {
+                    contributed += self.add_path(word, scope.globs, cur);
                 }
             }
             PathSource::Repo => {
@@ -464,15 +510,16 @@ impl Walker<'_> {
         contributed
     }
 
-    /// Resolve one path argument, applying bash expansion order: brace, then
-    /// tilde/normalize, then glob. Returns how many paths were added.
-    fn add_path(&mut self, pa: &PosArg, globs: bool, cur: &Option<PathBuf>) -> usize {
-        if pa.text.is_empty() {
+    /// Resolve one path word, applying bash expansion order — brace, then
+    /// tilde/normalize, then glob — each step honoring the quote mask.
+    /// Returns how many paths were added.
+    fn add_path(&mut self, word: &Word, globs: bool, cur: &Option<PathBuf>) -> usize {
+        if word.segs.is_empty() && !word.tilde_home {
             return 0;
         }
-        // brace expansion happens before all other expansions in bash
-        let words = if pa.brace_ok && pa.text.contains('{') {
-            match expand_braces(&pa.text, MAX_BRACE_EXPANSION) {
+        let chars = word.masked_chars();
+        let expanded: Vec<Vec<(char, bool)>> = if word.has_expandable('{') {
+            match expand_braces_masked(&chars, MAX_BRACE_EXPANSION) {
                 Some(list) => list,
                 None => {
                     // fan-out too large: scope is unresolvable
@@ -481,89 +528,126 @@ impl Walker<'_> {
                 }
             }
         } else {
-            vec![pa.text.clone()]
+            vec![chars]
         };
         let mut total = 0;
-        for word in words {
-            total += self.add_single(&word, pa.glob_ok, globs, cur);
+        for variant in expanded {
+            total += self.add_single(&variant, word.tilde_home, globs, cur);
         }
         total
     }
 
-    /// One fully brace-expanded word → resolved path(s), with optional globbing.
+    /// One fully brace-expanded masked word → resolved path(s), globbing only
+    /// on unquoted glob characters.
     fn add_single(
         &mut self,
-        text: &str,
-        glob_ok: bool,
+        chars: &[(char, bool)],
+        tilde_home: bool,
         globs: bool,
         cur: &Option<PathBuf>,
     ) -> usize {
-        if text.is_empty() {
+        let text: String = chars.iter().map(|(c, _)| c).collect();
+        if text.is_empty() && !tilde_home {
             return 0;
         }
-        let Some(resolved) = self.resolve_path(text, cur) else {
-            return 0;
-        };
-        if glob_ok && globs {
-            let pattern = resolved.to_string_lossy().into_owned();
-            match glob::glob(&pattern) {
-                Ok(matches) => {
-                    let mut n = 0usize;
-                    for m in matches.take(10_000).flatten() {
-                        self.out.paths.insert(normalize_lexical(&m));
-                        n += 1;
-                    }
-                    n
-                }
-                Err(_) => {
-                    self.out.paths.insert(resolved);
-                    1
+
+        // base directory + word remainder
+        let (base, rem): (Option<PathBuf>, &[(char, bool)]) = if tilde_home {
+            let mut start = 0;
+            while start < chars.len() && chars[start].0 == '/' {
+                start += 1;
+            }
+            (Some(self.ctx.home.to_path_buf()), &chars[start..])
+        } else if Path::new(&text).is_absolute() {
+            (None, chars)
+        } else {
+            match cur {
+                Some(dir) => (Some(dir.clone()), chars),
+                None => {
+                    self.out.mark_unknown();
+                    return 0;
                 }
             }
-        } else {
-            self.out.paths.insert(resolved);
-            1
+        };
+        let rem_text: String = rem.iter().map(|(c, _)| c).collect();
+        let literal = match &base {
+            Some(b) => normalize_lexical(&b.join(&rem_text)),
+            None => normalize_lexical(Path::new(&rem_text)),
+        };
+
+        let active_glob = rem.iter().any(|(c, exp)| *exp && GLOB_CHARS.contains(c));
+        if !(globs && active_glob) {
+            self.out.paths.insert(literal);
+            return 1;
+        }
+
+        // glob pattern: escape the base entirely and any QUOTED metacharacters
+        // in the word — only unquoted ones keep their pattern meaning
+        let mut pattern = String::new();
+        if let Some(b) = &base {
+            pattern.push_str(&glob::Pattern::escape(&b.to_string_lossy()));
+            pattern.push('/');
+        }
+        for (c, exp) in rem {
+            if !exp && GLOB_CHARS.contains(c) {
+                pattern.push_str(&glob::Pattern::escape(&c.to_string()));
+            } else {
+                pattern.push(*c);
+            }
+        }
+        match glob::glob(&pattern) {
+            Ok(matches) => {
+                let mut n = 0usize;
+                for m in matches.take(10_000).flatten() {
+                    self.out.paths.insert(normalize_lexical(&m));
+                    n += 1;
+                }
+                n
+            }
+            Err(_) => {
+                self.out.paths.insert(literal);
+                1
+            }
         }
     }
 
-    fn resolve_path(&mut self, text: &str, cur: &Option<PathBuf>) -> Option<PathBuf> {
-        let joined = if text == "~" {
-            self.ctx.home.to_path_buf()
-        } else if let Some(rest) = text.strip_prefix("~/") {
-            self.ctx.home.join(rest)
-        } else if text.starts_with('~') {
-            // ~otheruser — unsupported
-            self.out.mark_unknown();
-            return None;
-        } else if Path::new(text).is_absolute() {
-            PathBuf::from(text)
-        } else {
-            match cur {
-                Some(dir) => dir.join(text),
-                None => {
-                    self.out.mark_unknown();
-                    return None;
-                }
+    /// Literal resolution for words that never glob or brace-expand (cd
+    /// targets, redirect targets).
+    fn resolve_literal(&mut self, word: &Word, cur: &Option<PathBuf>) -> Option<PathBuf> {
+        let text = word.text();
+        if word.tilde_home {
+            return Some(normalize_lexical(
+                &self.ctx.home.join(text.trim_start_matches('/')),
+            ));
+        }
+        if Path::new(&text).is_absolute() {
+            return Some(normalize_lexical(Path::new(&text)));
+        }
+        match cur {
+            Some(dir) => Some(normalize_lexical(&dir.join(&text))),
+            None => {
+                self.out.mark_unknown();
+                None
             }
-        };
-        Some(normalize_lexical(&joined))
+        }
     }
 
     fn handle_cd(&mut self, args: &[ArgVal], cur: &mut Option<PathBuf>) {
         let target = args.iter().find(|a| match a {
-            ArgVal::Lit(lit) => {
-                !(lit.text.len() > 1 && lit.text.starts_with('-')) && lit.text != "--"
+            ArgVal::Lit(w) => {
+                let t = w.text();
+                !(t.len() > 1 && t.starts_with('-')) && t != "--"
             }
             ArgVal::Opaque => true,
         });
         match target {
             None => *cur = Some(normalize_lexical(self.ctx.home)),
-            Some(ArgVal::Lit(lit)) if lit.text == "-" => {
+            Some(ArgVal::Lit(w)) if w.text() == "-" => {
                 // previous directory is untracked
                 self.out.mark_unknown();
                 *cur = None;
             }
-            Some(ArgVal::Lit(lit)) => match self.resolve_path(&lit.text, cur) {
+            Some(ArgVal::Lit(w)) => match self.resolve_literal(w, cur) {
                 Some(p) => *cur = Some(p),
                 None => *cur = None,
             },
@@ -620,12 +704,13 @@ impl Walker<'_> {
     }
 
     fn redirect_to(&mut self, op: &str, raw: &str, cur: &Option<PathBuf>) {
-        let Some(lit) = self.extract_word(raw) else {
+        let Some(word) = self.extract_word(raw) else {
             self.out.mark_unknown();
             return;
         };
+        let text = word.text();
         // numeric target is an fd, not a file
-        if lit.text.is_empty() || lit.text.chars().all(|ch| ch.is_ascii_digit()) {
+        if (text.is_empty() && !word.tilde_home) || text.chars().all(|ch| ch.is_ascii_digit()) {
             return;
         }
         let Some(rule) = self.registry.lookup_redirect(op) else {
@@ -633,14 +718,14 @@ impl Walker<'_> {
             return;
         };
         self.out.contribute(Severity::from(rule.effect), &rule.id);
-        if let Some(p) = self.resolve_path(&lit.text, cur) {
+        if let Some(p) = self.resolve_literal(&word, cur) {
             self.out.paths.insert(p);
         }
     }
 
-    fn extract_word(&self, raw: &str) -> Option<Lit> {
+    fn extract_word(&self, raw: &str) -> Option<Word> {
         let pieces = brush_parser::word::parse(raw, &self.options).ok()?;
-        pieces_to_literal(&pieces, 0)
+        pieces_to_word(&pieces, 0)
     }
 
     /// True if the word can execute a command when expanded: a direct command
@@ -671,73 +756,74 @@ impl Walker<'_> {
     }
 }
 
-fn pieces_to_literal(pieces: &[WordPieceWithSource], depth: usize) -> Option<Lit> {
+/// Reduce parsed word pieces to quote-aware segments. Only a *leading*
+/// unquoted `~` piece becomes tilde expansion, matching where brush emits it.
+fn pieces_to_word(pieces: &[WordPieceWithSource], depth: usize) -> Option<Word> {
     if depth > MAX_LITERAL_DEPTH {
         return None;
     }
-    let mut text = String::new();
-    let mut glob_ok = false;
-    let mut brace_ok = false;
-    for pw in pieces {
+    let mut word = Word {
+        segs: Vec::new(),
+        tilde_home: false,
+    };
+    for (i, pw) in pieces.iter().enumerate() {
         match &pw.piece {
-            WordPiece::Text(s) => {
-                if s.contains(GLOB_CHARS) {
-                    glob_ok = true;
-                }
-                if s.contains('{') {
-                    brace_ok = true;
-                }
-                text.push_str(s);
+            WordPiece::Text(s) => word.segs.push((s.clone(), true)),
+            WordPiece::SingleQuotedText(s) | WordPiece::AnsiCQuotedText(s) => {
+                word.segs.push((s.clone(), false));
             }
-            WordPiece::SingleQuotedText(s) | WordPiece::AnsiCQuotedText(s) => text.push_str(s),
             WordPiece::DoubleQuotedSequence(inner)
             | WordPiece::GettextDoubleQuotedSequence(inner) => {
-                // quoted metacharacters don't expand: inner flags discarded
-                let lit = pieces_to_literal(inner, depth + 1)?;
-                text.push_str(&lit.text);
+                // quoted metacharacters don't expand: the whole sequence is a
+                // non-expandable segment
+                let lit = pieces_to_word(inner, depth + 1)?;
+                if lit.tilde_home {
+                    return None; // "~" quoted-with-tilde-piece: shouldn't occur
+                }
+                word.segs.push((lit.text(), false));
             }
             WordPiece::EscapeSequence(s) => {
-                text.push_str(s.strip_prefix('\\').unwrap_or(s));
+                word.segs
+                    .push((s.strip_prefix('\\').unwrap_or(s).to_string(), false));
             }
-            WordPiece::TildeExpansion(TildeExpr::Home) => text.push('~'),
-            // ~user / ~+ / ~- and all expansions are unresolvable statically
+            WordPiece::TildeExpansion(TildeExpr::Home) if i == 0 => {
+                word.tilde_home = true;
+            }
+            // ~user / ~+ / ~- / mid-word tilde pieces and all expansions are
+            // unresolvable statically
             _ => return None,
         }
     }
-    Some(Lit {
-        text,
-        glob_ok,
-        brace_ok,
-    })
+    Some(word)
 }
 
-/// Bash-style brace expansion. `Some(list)` on success — a word with no
-/// expandable brace group yields `[input]`. `None` if the fan-out would exceed
-/// `limit`, so the caller treats the scope as unknown.
-fn expand_braces(text: &str, limit: usize) -> Option<Vec<String>> {
+/// Bash-style brace expansion over quote-masked characters: only expandable
+/// braces/commas have structural meaning. `Some(list)` on success (a word with
+/// no expandable group yields itself); `None` when fan-out exceeds `limit`.
+fn expand_braces_masked(chars: &[(char, bool)], limit: usize) -> Option<Vec<Vec<(char, bool)>>> {
     let mut out = Vec::new();
-    if expand_braces_rec(text, &mut out, limit) {
+    if expand_rec(chars, &mut out, limit) {
         Some(out)
     } else {
         None
     }
 }
 
-fn expand_braces_rec(text: &str, out: &mut Vec<String>, limit: usize) -> bool {
+fn expand_rec(chars: &[(char, bool)], out: &mut Vec<Vec<(char, bool)>>, limit: usize) -> bool {
     if out.len() > limit {
         return false;
     }
-    let chars: Vec<char> = text.chars().collect();
     for i in 0..chars.len() {
-        if chars[i] != '{' {
+        if chars[i] != ('{', true) {
             continue;
         }
-        match parse_brace(&chars, i, limit) {
+        match parse_brace(chars, i, limit) {
             BraceParse::Expand(close, options) => {
-                let pre: String = chars[..i].iter().collect();
-                let post: String = chars[close + 1..].iter().collect();
                 for opt in options {
-                    if !expand_braces_rec(&format!("{pre}{opt}{post}"), out, limit) {
+                    let mut next = chars[..i].to_vec();
+                    next.extend(opt);
+                    next.extend_from_slice(&chars[close + 1..]);
+                    if !expand_rec(&next, out, limit) {
                         return false;
                     }
                 }
@@ -747,21 +833,24 @@ fn expand_braces_rec(text: &str, out: &mut Vec<String>, limit: usize) -> bool {
             BraceParse::NotHere => {}
         }
     }
-    out.push(text.to_string());
+    out.push(chars.to_vec());
     out.len() <= limit
 }
 
 enum BraceParse {
-    Expand(usize, Vec<String>),
+    Expand(usize, Vec<Vec<(char, bool)>>),
     Overflow,
     NotHere,
 }
 
-fn parse_brace(chars: &[char], open: usize, limit: usize) -> BraceParse {
+fn parse_brace(chars: &[(char, bool)], open: usize, limit: usize) -> BraceParse {
     let mut depth = 0usize;
     let mut close = None;
     let mut commas = Vec::new();
-    for (i, &c) in chars.iter().enumerate().skip(open) {
+    for (i, &(c, exp)) in chars.iter().enumerate().skip(open) {
+        if !exp {
+            continue; // quoted braces/commas are content, not structure
+        }
         match c {
             '{' => depth += 1,
             '}' => {
@@ -782,59 +871,78 @@ fn parse_brace(chars: &[char], open: usize, limit: usize) -> BraceParse {
         let mut options = Vec::new();
         let mut start = open + 1;
         for &c in &commas {
-            options.push(chars[start..c].iter().collect::<String>());
+            options.push(chars[start..c].to_vec());
             start = c + 1;
         }
-        options.push(chars[start..close].iter().collect::<String>());
+        options.push(chars[start..close].to_vec());
         return BraceParse::Expand(close, options);
     }
-    let inner: String = chars[open + 1..close].iter().collect();
+    // range form: only when the whole interior is unquoted
+    let interior = &chars[open + 1..close];
+    if interior.is_empty() || interior.iter().any(|(_, exp)| !exp) {
+        return BraceParse::NotHere;
+    }
+    let inner: String = interior.iter().map(|(c, _)| c).collect();
     match parse_range(&inner, limit) {
-        Some(Some(options)) => BraceParse::Expand(close, options),
+        Some(Some(options)) => BraceParse::Expand(
+            close,
+            options
+                .into_iter()
+                .map(|s| s.chars().map(|c| (c, true)).collect())
+                .collect(),
+        ),
         Some(None) => BraceParse::Overflow,
         None => BraceParse::NotHere, // {literal}
     }
 }
 
-/// `{m..n}` / `{a..c}` with optional `..step`. Returns `Some(Some(list))` on a
-/// valid range, `Some(None)` when it exceeds `limit`, `None` when the content
-/// is not a range at all.
+/// `{m..n}` / `{a..c}` ranges, using i128 internally so extreme i64 bounds
+/// cannot overflow. `Some(Some(list))` on a valid range, `Some(None)` when it
+/// exceeds `limit` OR is version-divergent, `None` when not a range at all.
+///
+/// Version portability (bash-oracle finding): stepped ranges (`{1..9..2}`)
+/// and zero-padded ranges (`{01..03}`) behave differently between bash 3.2
+/// (macOS default) and bash 4+. We cannot know which bash executes the
+/// command, so those forms are "cannot safely expand" → unknown policy,
+/// never a confidently-wrong path list.
 fn parse_range(inner: &str, limit: usize) -> Option<Option<Vec<String>>> {
     let parts: Vec<&str> = inner.split("..").collect();
     if parts.len() != 2 && parts.len() != 3 {
         return None;
     }
-    let step: i64 = if parts.len() == 3 {
-        let s: i64 = parts[2].parse().ok()?;
-        if s == 0 { return None } else { s.abs() }
-    } else {
-        1
+    if parts.len() == 3 {
+        // stepped range: bash-version-divergent (3.2 leaves it literal)
+        let looks_like_range = parts[2].parse::<i128>().is_ok();
+        return if looks_like_range { Some(None) } else { None };
+    }
+    let step: i128 = 1;
+
+    let make = |a: i128, b: i128, fmt: &dyn Fn(i128) -> String| -> Option<Vec<String>> {
+        let count = (a - b).unsigned_abs() / step.unsigned_abs() + 1;
+        if count > limit as u128 {
+            return None;
+        }
+        let dir: i128 = if a <= b { step } else { -step };
+        let mut v = Vec::with_capacity(count as usize);
+        let mut cur = a;
+        while (dir > 0 && cur <= b) || (dir < 0 && cur >= b) {
+            v.push(fmt(cur));
+            cur += dir;
+        }
+        Some(v)
     };
 
-    // numeric range (with simple zero-pad support)
-    if let (Ok(a), Ok(b)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
-        let count = ((a - b).unsigned_abs() as usize) / (step as usize) + 1;
-        if count > limit {
+    // numeric range
+    if let (Ok(a), Ok(b)) = (parts[0].parse::<i128>(), parts[1].parse::<i128>()) {
+        let zero_padded = (parts[0].starts_with('0') && parts[0].len() > 1)
+            || (parts[1].starts_with('0') && parts[1].len() > 1)
+            || parts[0].starts_with("-0")
+            || parts[1].starts_with("-0");
+        if zero_padded {
+            // bash-version-divergent (3.2 strips padding, 4+ pads)
             return Some(None);
         }
-        let width = if (parts[0].starts_with('0') && parts[0].len() > 1)
-            || (parts[1].starts_with('0') && parts[1].len() > 1)
-        {
-            parts[0].len().max(parts[1].len())
-        } else {
-            0
-        };
-        let mut v = Vec::with_capacity(count);
-        let mut cur = a;
-        while (a <= b && cur <= b) || (a > b && cur >= b) {
-            v.push(if width > 0 {
-                format!("{cur:0width$}")
-            } else {
-                cur.to_string()
-            });
-            cur += if a <= b { step } else { -step };
-        }
-        return Some(Some(v));
+        return Some(make(a, b, &|n| n.to_string()));
     }
 
     // single-character alphabetic range
@@ -844,18 +952,9 @@ fn parse_range(inner: &str, limit: usize) -> Option<Option<Vec<String>>> {
     );
     if sc.len() == 1 && ec.len() == 1 && sc[0].is_ascii_alphabetic() && ec[0].is_ascii_alphabetic()
     {
-        let (a, b) = (sc[0] as i64, ec[0] as i64);
-        let count = ((a - b).unsigned_abs() as usize) / (step as usize) + 1;
-        if count > limit {
-            return Some(None);
-        }
-        let mut v = Vec::with_capacity(count);
-        let mut cur = a;
-        while (a <= b && cur <= b) || (a > b && cur >= b) {
-            v.push(((cur as u8) as char).to_string());
-            cur += if a <= b { step } else { -step };
-        }
-        return Some(Some(v));
+        return Some(make(sc[0] as i128, ec[0] as i128, &|n| {
+            ((n as u8) as char).to_string()
+        }));
     }
     None
 }
@@ -883,4 +982,127 @@ pub fn normalize_lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn masked(parts: &[(&str, bool)]) -> Vec<(char, bool)> {
+        parts
+            .iter()
+            .flat_map(|(s, e)| s.chars().map(move |c| (c, *e)))
+            .collect()
+    }
+
+    fn texts(result: Option<Vec<Vec<(char, bool)>>>) -> Option<Vec<String>> {
+        result.map(|list| {
+            list.into_iter()
+                .map(|cs| cs.into_iter().map(|(c, _)| c).collect())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn unquoted_group_expands() {
+        let r = texts(expand_braces_masked(&masked(&[("{a,b}", true)]), 64));
+        assert_eq!(r, Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn quoted_group_is_inert() {
+        let r = texts(expand_braces_masked(&masked(&[("{a,b}", false)]), 64));
+        assert_eq!(r, Some(vec!["{a,b}".into()]));
+    }
+
+    #[test]
+    fn quoted_prefix_with_unquoted_group() {
+        // the audit-2 bug: '{a,b}'{c,d} must expand ONLY {c,d}
+        let r = texts(expand_braces_masked(
+            &masked(&[("{a,b}", false), ("{c,d}", true)]),
+            64,
+        ));
+        assert_eq!(r, Some(vec!["{a,b}c".into(), "{a,b}d".into()]));
+    }
+
+    #[test]
+    fn cartesian_product() {
+        let r = texts(expand_braces_masked(&masked(&[("{a,b}{1,2}", true)]), 64));
+        assert_eq!(
+            r,
+            Some(vec!["a1".into(), "a2".into(), "b1".into(), "b2".into()])
+        );
+    }
+
+    #[test]
+    fn nested_groups() {
+        let r = texts(expand_braces_masked(&masked(&[("{a,b{1,2}}", true)]), 64));
+        assert_eq!(r, Some(vec!["a".into(), "b1".into(), "b2".into()]));
+    }
+
+    #[test]
+    fn comma_free_brace_is_literal() {
+        let r = texts(expand_braces_masked(&masked(&[("x{alone}y", true)]), 64));
+        assert_eq!(r, Some(vec!["x{alone}y".into()]));
+    }
+
+    #[test]
+    fn portable_ranges_expand() {
+        assert_eq!(
+            texts(expand_braces_masked(&masked(&[("{1..3}", true)]), 64)),
+            Some(vec!["1".into(), "2".into(), "3".into()])
+        );
+        assert_eq!(
+            texts(expand_braces_masked(&masked(&[("{c..a}", true)]), 64)),
+            Some(vec!["c".into(), "b".into(), "a".into()])
+        );
+    }
+
+    #[test]
+    fn version_divergent_ranges_are_unknown_not_guessed() {
+        // bash 3.2 (macOS) vs 4+ disagree on steps and zero-padding: we must
+        // never emit a confidently-wrong path list (bash-oracle finding)
+        assert_eq!(
+            texts(expand_braces_masked(&masked(&[("{1..9..4}", true)]), 64)),
+            None
+        );
+        assert_eq!(
+            texts(expand_braces_masked(&masked(&[("{01..03}", true)]), 64)),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_range_interior_is_literal() {
+        // {'1..3'} — interior quoted: not a range
+        let r = texts(expand_braces_masked(
+            &masked(&[("{", true), ("1..3", false), ("}", true)]),
+            64,
+        ));
+        assert_eq!(r, Some(vec!["{1..3}".into()]));
+    }
+
+    #[test]
+    fn fanout_cap_returns_none() {
+        assert_eq!(
+            texts(expand_braces_masked(&masked(&[("{1..2000}", true)]), 1024)),
+            None
+        );
+    }
+
+    #[test]
+    fn extreme_i64_range_no_panic_no_overflow() {
+        // would overflow i64 subtraction; must cleanly report over-limit
+        let r = expand_braces_masked(
+            &masked(&[("{-9223372036854775808..9223372036854775807}", true)]),
+            1024,
+        );
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn identity_without_braces() {
+        let r = texts(expand_braces_masked(&masked(&[("plain.txt", true)]), 64));
+        assert_eq!(r, Some(vec!["plain.txt".into()]));
+    }
 }

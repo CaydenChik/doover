@@ -38,6 +38,20 @@ fn write(path: &Path, content: &str) {
     fs::write(path, content).unwrap();
 }
 
+/// Strict-by-default snapshot: most scenarios must produce ZERO warnings — a
+/// spurious (or vanished) warning is a failure. Tests that expect gaps call
+/// `snapshot()` directly and assert their warnings explicitly.
+fn snap(store: &Store, path: &Path, limits: Option<&Limits>) -> doover_core::snapshot::Manifest {
+    let m = store.snapshot(path, limits).unwrap();
+    assert!(
+        m.warnings.is_empty(),
+        "expected a warning-free snapshot of {}, got: {:?}",
+        path.display(),
+        m.warnings
+    );
+    m
+}
+
 /// Full recursive fingerprint: path → (type marker, content, mode bits).
 fn fingerprint(root: &Path) -> BTreeMap<PathBuf, (String, Vec<u8>, u32)> {
     let mut map = BTreeMap::new();
@@ -81,7 +95,7 @@ fn file_round_trip_content_mode_mtime() {
     fs::set_permissions(&f, fs::Permissions::from_mode(0o640)).unwrap();
     let want_mtime = fs::metadata(&f).unwrap().modified().unwrap();
 
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
     assert_eq!(m.root, Root::Present);
 
     fs::write(&f, "clobbered").unwrap();
@@ -101,7 +115,7 @@ fn empty_file_round_trip() {
     let j = jail();
     let f = j.world.join("empty");
     write(&f, "");
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
     fs::write(&f, "no longer empty").unwrap();
     j.store.restore(&m).unwrap();
     assert_eq!(fs::read(&f).unwrap(), Vec::<u8>::new());
@@ -111,7 +125,7 @@ fn empty_file_round_trip() {
 fn absent_marker_round_trip_deletes_created_file() {
     let j = jail();
     let f = j.world.join("did-not-exist.txt");
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
     assert_eq!(m.root, Root::Absent);
 
     write(&f, "the action created me");
@@ -126,7 +140,7 @@ fn absent_marker_round_trip_deletes_created_file() {
 fn absent_marker_round_trip_deletes_created_dir() {
     let j = jail();
     let d = j.world.join("newdir");
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
     write(&d.join("sub/file.txt"), "x");
     j.store.restore(&m).unwrap();
     assert!(!d.exists());
@@ -147,7 +161,7 @@ fn dir_tree_round_trip_exact() {
         .modified()
         .unwrap();
 
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
 
     // mangle: modify, delete, add
     fs::write(d.join("a.txt"), "MANGLED").unwrap();
@@ -180,7 +194,7 @@ fn symlink_round_trip_not_followed() {
     std::os::unix::fs::symlink("/nowhere/dangling", d.join("dangler")).unwrap();
     let before = fingerprint(&d);
 
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
     // the symlink itself is an entry; its target file appears once, not twice
     let link_entries: Vec<_> = m
         .entries
@@ -201,7 +215,7 @@ fn restore_recreates_missing_parent_dirs() {
     let j = jail();
     let f = j.world.join("deep/nested/dir/file.txt");
     write(&f, "content");
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
     fs::remove_dir_all(j.world.join("deep")).unwrap();
     j.store.restore(&m).unwrap();
     assert_eq!(fs::read_to_string(&f).unwrap(), "content");
@@ -227,7 +241,7 @@ fn hardlinked_files_both_captured() {
     write(&d.join("original.txt"), "shared inode");
     fs::hard_link(d.join("original.txt"), d.join("alias.txt")).unwrap();
 
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
     fs::remove_dir_all(&d).unwrap();
     j.store.restore(&m).unwrap();
 
@@ -250,7 +264,7 @@ fn forced_plain_copy_backend_round_trips() {
     let d = j.world.join("tree");
     write(&d.join("x.txt"), "copied not cloned");
     let before = fingerprint(&d);
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
     fs::remove_dir_all(&d).unwrap();
     j.store.restore(&m).unwrap();
     assert_eq!(fingerprint(&d), before);
@@ -263,7 +277,7 @@ fn corrupted_object_refused_and_destination_untouched() {
     let j = jail();
     let f = j.world.join("precious.txt");
     write(&f, "original precious content");
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
 
     // flip a byte in the stored object
     let object = j.store.object_paths().unwrap().pop().expect("one object");
@@ -296,7 +310,7 @@ fn limits_truncate_and_report() {
         max_files: 5,
         max_bytes: u64::MAX,
     };
-    let m = j.store.snapshot(&d, Some(&limits)).unwrap();
+    let m = snap(&j.store, &d, Some(&limits));
     assert!(m.truncated, "exceeding max_files must set truncated");
     assert!(m.skipped > 0, "skipped count must be reported");
     let captured = m
@@ -388,6 +402,142 @@ fn unreadable_subdir_warns_instead_of_failing_snapshot() {
     );
 }
 
+// --- round-2 audit regressions ---------------------------------------------------
+
+#[test]
+fn empty_present_manifest_restore_is_a_noop_not_destruction() {
+    // a socket at the snapshot ROOT: Present, zero entries, warned. Restoring
+    // it must leave the live target alone (audit round 2: it was deleted, then
+    // the swap errored — data loss).
+    let j = jail();
+    let sock = j.world.join("live.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+    let m = j.store.snapshot(&sock, None).unwrap();
+    assert_eq!(m.root, Root::Present);
+    assert!(m.entries.is_empty());
+    assert!(!m.warnings.is_empty(), "uncapturable root must warn");
+
+    let report = j.store.restore(&m).expect("no-op restore must succeed");
+    assert!(
+        sock.exists(),
+        "restore must not destroy the un-restorable target"
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.contains("no-op")),
+        "the no-op must be reported: {:?}",
+        report.warnings
+    );
+}
+
+#[test]
+fn fifo_mode_survives_round_trip() {
+    let j = jail();
+    let d = j.world.join("tree");
+    write(&d.join("f.txt"), "x");
+    let fifo = d.join("pipe");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // 0o622 is altered by any usual umask, so mkfifo-without-chmod fails this
+    fs::set_permissions(&fifo, fs::Permissions::from_mode(0o622)).unwrap();
+    let before = fingerprint(&d);
+
+    let m = snap(&j.store, &d, None);
+    fs::remove_dir_all(&d).unwrap();
+    j.store.restore(&m).unwrap();
+    assert_eq!(
+        fingerprint(&d),
+        before,
+        "fifo mode must survive (umask must not mask it)"
+    );
+}
+
+#[test]
+fn failed_restore_leaves_target_intact_and_no_staging() {
+    // force the staging build to fail (read-only parent) and prove the
+    // current state survives untouched — the point of stage-then-swap
+    let j = jail();
+    let d = j.world.join("sub");
+    write(&d.join("f.txt"), "original");
+    let m = snap(&j.store, &d.join("f.txt"), None);
+    fs::write(d.join("f.txt"), "current-state").unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = j.store.restore(&m);
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap(); // teardown safety
+
+    assert!(result.is_err(), "read-only parent must fail the restore");
+    assert_eq!(
+        fs::read_to_string(d.join("f.txt")).unwrap(),
+        "current-state",
+        "failed restore must leave the target exactly as it was"
+    );
+    let staging: Vec<_> = fs::read_dir(&d)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".doover-"))
+        .collect();
+    assert!(
+        staging.is_empty(),
+        "staging droppings after failure: {staging:?}"
+    );
+}
+
+#[test]
+fn orphaned_staging_is_detectable() {
+    let j = jail();
+    let orphan = j.world.join(".doover-restore-999-0");
+    fs::create_dir_all(&orphan).unwrap();
+    write(&j.world.join("normal.txt"), "x");
+    let found = doover_core::snapshot::orphaned_staging(&j.world).unwrap();
+    assert_eq!(found, vec![orphan], "doctor needs to find crash leftovers");
+}
+
+#[test]
+fn concurrent_ingestion_same_content_is_race_free() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("store");
+    let world = tmp.path().join("world");
+    fs::create_dir_all(&world).unwrap();
+    for i in 0..8 {
+        write(
+            &world.join(format!("f{i}.txt")),
+            "identical content across all files",
+        );
+    }
+    let world2 = world.clone();
+    let root2 = root.clone();
+
+    let t1 = std::thread::spawn(move || {
+        let store = Store::open_with(root2, StoreOptions::default()).unwrap();
+        for _ in 0..25 {
+            store.snapshot(&world2, None).unwrap();
+        }
+    });
+    let store = Store::open_with(&root, StoreOptions::default()).unwrap();
+    for _ in 0..25 {
+        store.snapshot(&world, None).unwrap();
+    }
+    t1.join().expect("concurrent ingester must not panic");
+
+    assert_eq!(
+        store.object_count().unwrap(),
+        1,
+        "same content = one object, despite racing"
+    );
+    let leftovers: Vec<_> = fs::read_dir(root.join("tmp"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(leftovers.is_empty(), "tmp droppings after racing ingesters");
+}
+
 // --- restore staging hygiene ----------------------------------------------------
 
 #[test]
@@ -395,7 +545,7 @@ fn restore_leaves_no_staging_droppings() {
     let j = jail();
     let d = j.world.join("proj");
     write(&d.join("f.txt"), "content");
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
     fs::write(d.join("f.txt"), "changed").unwrap();
     j.store.restore(&m).unwrap();
 
@@ -419,7 +569,7 @@ fn xattr_round_trip_when_supported() {
         eprintln!("skipping: filesystem does not support user xattrs");
         return;
     }
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
     fs::remove_file(&f).unwrap();
     write(&f, "replaced");
     j.store.restore(&m).unwrap();
@@ -448,7 +598,7 @@ fn sparse_large_file_round_trip() {
         fh.seek(SeekFrom::End(-4)).unwrap();
         fh.write_all(b"TAIL").unwrap();
     }
-    let m = j.store.snapshot(&f, None).unwrap();
+    let m = snap(&j.store, &f, None);
     fs::write(&f, "tiny now").unwrap();
     j.store.restore(&m).unwrap();
 
@@ -481,7 +631,7 @@ fn large_tree_round_trip() {
         );
     }
     let before = fingerprint(&d);
-    let m = j.store.snapshot(&d, None).unwrap();
+    let m = snap(&j.store, &d, None);
     fs::remove_dir_all(&d).unwrap();
     j.store.restore(&m).unwrap();
     assert_eq!(fingerprint(&d), before);

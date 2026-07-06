@@ -14,6 +14,9 @@ clippy:
 
 unit:
 	$(CARGO) test --workspace
+	# deterministic newline-rich fuzz slice in the main gate (the full fuzz
+	# matrix lives on the fuzz-hunt branch)
+	DOOVER_FUZZ_ITERS=5000 DOOVER_FUZZ_SEED=42 $(CARGO) test -p doover-core --test fuzz_hunt -- --nocapture > target/fuzz-gate.log 2>&1 || (tail -5 target/fuzz-gate.log; exit 1)
 
 build:
 	$(CARGO) build --workspace

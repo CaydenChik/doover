@@ -266,9 +266,18 @@ impl Registry {
                     score += 2;
                 }
                 if let Some(want_any) = &m.flags_any {
+                    // a flag is value-taking when the rule itself declares it
+                    // consumes/carries a value; only then can `-oVALUE`
+                    // attached-short forms match (never `-rf` boolean clusters)
+                    let value_taking = |w: &str| {
+                        rule.scope.as_ref().is_some_and(|s| {
+                            s.path_flags.iter().any(|x| x == w)
+                                || s.flag_args.iter().any(|x| x == w)
+                        })
+                    };
                     if !want_any
                         .iter()
-                        .any(|w| flags.iter().any(|f| flag_matches(f, w)))
+                        .any(|w| flags.iter().any(|f| flag_matches(f, w, value_taking(w))))
                     {
                         return None;
                     }
@@ -299,14 +308,21 @@ impl Registry {
     }
 }
 
-/// Whether an observed flag token satisfies a wanted flag. Exact match, or the
-/// `--long=value` form of a `--long` want (`--output=x` matches `--output`).
-fn flag_matches(observed: &str, want: &str) -> bool {
+/// Whether an observed flag token satisfies a wanted flag: exact match, the
+/// `--long=value` attached form, or — only for value-taking flags — the
+/// `-oVALUE` attached-short form.
+fn flag_matches(observed: &str, want: &str, value_taking: bool) -> bool {
     observed == want
         || (want.starts_with("--")
             && observed
                 .split_once('=')
                 .is_some_and(|(name, _)| name == want))
+        || (value_taking
+            && want.len() == 2
+            && want.starts_with('-')
+            && !want.starts_with("--")
+            && observed.len() > 2
+            && observed.starts_with(want))
 }
 
 /// Safety-relevant classifications an overlay may not silently weaken:

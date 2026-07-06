@@ -12,10 +12,16 @@ fn ctx_dirs() -> (tempfile::TempDir, std::path::PathBuf) {
     (jail, home)
 }
 
+/// Arbitrary input INCLUDING newlines — `.{n}` regex strategies exclude `\n`,
+/// which silently exempted heredoc parsing from fuzzing (audit round 2).
+fn arb_input() -> impl Strategy<Value = String> {
+    prop::collection::vec(prop::char::any(), 0..160).prop_map(|v| v.into_iter().collect())
+}
+
 proptest! {
     /// P1 — arbitrary input (including newlines, quotes, unicode) never panics.
     #[test]
-    fn p1_never_panics(input in ".{0,160}") {
+    fn p1_never_panics(input in arb_input()) {
         let registry = Registry::builtin().unwrap();
         let (jail, home) = ctx_dirs();
         let ctx = Ctx { cwd: jail.path(), home: &home };
@@ -62,7 +68,7 @@ proptest! {
 
     /// P3 — same input, same context ⇒ identical resolution.
     #[test]
-    fn p3_deterministic(input in ".{0,120}") {
+    fn p3_deterministic(input in arb_input()) {
         let registry = Registry::builtin().unwrap();
         let (jail, home) = ctx_dirs();
         let ctx = Ctx { cwd: jail.path(), home: &home };

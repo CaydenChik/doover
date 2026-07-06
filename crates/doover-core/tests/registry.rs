@@ -115,6 +115,65 @@ fn redirect_lookup_distinguishes_truncate_from_append() {
     assert_eq!(r.lookup_redirect(">>").unwrap().effect, Effect::Mutating);
 }
 
+// --- data lints (audit round 2) ------------------------------------------------
+
+/// Every 2-char short flag in a matching/consuming list must have a long twin
+/// in the same list — short-only lists caused the `sort --output` bypass.
+#[test]
+fn short_flags_always_have_a_long_twin() {
+    let r = Registry::builtin().unwrap();
+    let mut violations = Vec::new();
+    for rule in r.rules() {
+        let mut lists: Vec<(&str, &Vec<String>)> = Vec::new();
+        if let Some(fa) = &rule.matcher.flags_any {
+            lists.push(("flags_any", fa));
+        }
+        if let Some(scope) = &rule.scope {
+            lists.push(("flag_args", &scope.flag_args));
+            lists.push(("path_flags", &scope.path_flags));
+        }
+        for (name, list) in lists {
+            let has_short = list
+                .iter()
+                .any(|f| f.len() == 2 && f.starts_with('-') && !f.starts_with("--"));
+            let has_long = list.iter().any(|f| f.starts_with("--"));
+            if has_short && !has_long {
+                violations.push(format!("{}: {name} {list:?}", rule.id));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "short flags without long twins:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// A rule that captures paths from flags must also *select* on those flags,
+/// otherwise the capture can never fire.
+#[test]
+fn path_flags_are_a_subset_of_flags_any() {
+    let r = Registry::builtin().unwrap();
+    for rule in r.rules() {
+        let Some(scope) = &rule.scope else { continue };
+        if scope.path_flags.is_empty() {
+            continue;
+        }
+        let fa = rule
+            .matcher
+            .flags_any
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: path_flags without flags_any", rule.id));
+        for pf in &scope.path_flags {
+            assert!(
+                fa.contains(pf),
+                "{}: path_flag {pf} not in flags_any {fa:?}",
+                rule.id
+            );
+        }
+    }
+}
+
 // --- user overlay ------------------------------------------------------------
 
 fn overlay_dir(files: &[(&str, &str)]) -> tempfile::TempDir {

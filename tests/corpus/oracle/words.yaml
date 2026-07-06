@@ -1,0 +1,46 @@
+# Bash differential oracle — word-expansion ground truth.
+# Each word is expanded by REAL bash (printf '%s\n', executes nothing) inside
+# the jail with HOME set to the fixture home, and compared against the
+# resolver's expansion of `rm -- <word>`. If the resolver claims uncertainty
+# (has_unknown) the strict comparison is skipped — claiming uncertainty is
+# always allowed; claiming a *wrong* expansion is not.
+#
+# Empty expansion products are dropped on both sides.
+
+words:
+  # braces
+  - { word: "{a,b}" }
+  - { word: "a{1,2}b" }
+  - { word: "'{a,b}'{c,d}" }
+  - { word: "\"{x,y}\"{1,2}" }
+  - { word: '\{a,b\}' }
+  - { word: "{a,b}{1,2}" }
+  - { word: "f{1..3}" }
+  - { word: "{01..03}" }
+  - { word: "{a..c}" }
+  - { word: "{a..c..2}" }
+  - { word: "{5..1}" }
+  - { word: "{a,}" }
+  - { word: "x{}y" }
+  - { word: "{alone}" }
+  - { word: "n{a,b{1,2}}" }
+  - { word: "{a,b}/{c,d}" }
+  # tilde
+  - { word: "~/x" }
+  - { word: "~/{a,b}" }
+  - { word: "'~/lit'" }
+  - { word: '\~esc' }
+  - { word: "~" }
+  # quoting + globs (fixtures give the glob something to match)
+  - { word: "*.bak", cwd_fixture: ["a.bak", "b.bak", "keep.txt"] }
+  - { word: "'*.bak'", cwd_fixture: ["a.bak"] }
+  - { word: "'*'x", cwd_fixture: ["*x", "ax"] }
+  - { word: "f?.txt", cwd_fixture: ["f1.txt", "f2.txt"] }
+  - { word: "sub/*.log", cwd_fixture: ["sub/x.log", "sub/y.log"] }
+  - { word: "{p,q}*.txt", cwd_fixture: ["p1.txt", "q2.txt", "r3.txt"] }
+  # spaces, escapes, unicode
+  - { word: "'sp ace'{1,2}" }
+  - { word: 'my\ file{1,2}' }
+  - { word: "фото{1,2}" }
+  - { word: "📸{a,b}" }
+  - { word: '"d q"{a,b}' }

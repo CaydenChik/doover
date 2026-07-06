@@ -1,0 +1,38 @@
+# T1 corpus — round-2 audit cases (2026-07-06): quote-context correctness.
+# Bash expands only UNQUOTED metacharacters; quoted/escaped spans are inert.
+# Path convention notes: "./~x" forces a literal-tilde relative path (the bare
+# "~/" prefix is reserved for the fixture-home convention).
+
+cases:
+  - name: mixedquote-brace-single
+    # bash: only {c,d} expands -> "{a,b}c" "{a,b}d"
+    cmd: "rm '{a,b}'{c,d}"
+    expect: { effect: destructive, paths: ["{a,b}c", "{a,b}d"], rule: coreutils.rm }
+
+  - name: mixedquote-brace-double
+    cmd: 'rm "{a,b}"{c,d}'
+    expect: { effect: destructive, paths: ["{a,b}c", "{a,b}d"], rule: coreutils.rm }
+
+  - name: mixedquote-glob-stays-literal
+    # quoted '*' never globs, even with files present that would match
+    cmd: "rm '*'x"
+    cwd_fixture: ["*x", "ax"]
+    expect: { effect: destructive, paths: ["./*x"], rule: coreutils.rm }
+
+  - name: attached-short-flag-sort
+    # POSIX-legal attached value form; was classified Safe via bare posix.sort
+    cmd: "sort -oout.txt in.txt"
+    expect: { effect: destructive, paths: ["out.txt", "in.txt"], rule: posix.sort-o }
+
+  - name: quoted-tilde-is-literal
+    # bash does not tilde-expand quoted words
+    cmd: "rm '~/notes'"
+    expect: { effect: destructive, paths: ["./~/notes"], rule: coreutils.rm }
+
+  - name: escaped-tilde-is-literal
+    cmd: 'rm \~x'
+    expect: { effect: destructive, paths: ["./~x"], rule: coreutils.rm }
+
+  - name: tilde-then-brace
+    cmd: "rm ~/{a,b}"
+    expect: { effect: destructive, paths: ["~/a", "~/b"], rule: coreutils.rm }

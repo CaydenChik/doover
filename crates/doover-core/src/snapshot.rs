@@ -121,7 +121,13 @@ pub struct Store {
     objects: PathBuf,
     tmp: PathBuf,
     opts: StoreOptions,
-    seq: AtomicU64,
+}
+
+/// Process-global uniquifier for tmp/staging names: two `Store` handles on the
+/// same root (concurrent hook invocations in one process) must never collide.
+fn next_unique() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Store {
@@ -136,12 +142,7 @@ impl Store {
         let tmp = root.join("tmp");
         fs::create_dir_all(&objects).map_err(|e| io_err(&objects, e))?;
         fs::create_dir_all(&tmp).map_err(|e| io_err(&tmp, e))?;
-        Ok(Self {
-            objects,
-            tmp,
-            opts,
-            seq: AtomicU64::new(0),
-        })
+        Ok(Self { objects, tmp, opts })
     }
 
     /// Capture the pre-action state of `path` (file, directory tree, symlink,
@@ -328,6 +329,18 @@ impl Store {
             }
         }
 
+        // A Present manifest with zero entries means the root existed but was
+        // uncapturable (socket/device — see the snapshot warnings). There is
+        // nothing to rebuild, and destroying the live object would turn a
+        // coverage gap into data loss: warn and leave the target alone.
+        if manifest.entries.is_empty() {
+            report.warnings.push(format!(
+                "{}: nothing was capturable at snapshot time; restore is a no-op",
+                target_root.display()
+            ));
+            return Ok(report);
+        }
+
         let parent = target_root
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -396,6 +409,10 @@ impl Store {
                         fs::create_dir_all(p).map_err(|e| io_err(p, e))?;
                     }
                     make_fifo(&dest, *mode)?;
+                    // mkfifo's mode argument is masked by the umask; apply the
+                    // recorded mode explicitly
+                    fs::set_permissions(&dest, fs::Permissions::from_mode(*mode))
+                        .map_err(|e| io_err(&dest, e))?;
                 }
                 EntryKind::File {
                     hash,
@@ -443,8 +460,11 @@ impl Store {
     }
 
     fn staging_path(&self, parent: &Path) -> PathBuf {
-        let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        parent.join(format!(".doover-restore-{}-{n}", std::process::id()))
+        parent.join(format!(
+            ".doover-restore-{}-{}",
+            std::process::id(),
+            next_unique()
+        ))
     }
 
     /// Probe whether the store's filesystem supports copy-on-write clones.
@@ -533,18 +553,32 @@ impl Store {
     }
 
     fn tmp_path(&self) -> PathBuf {
-        let n = self.seq.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
-        self.tmp.join(format!("{}-{n}-{nanos}", std::process::id()))
+        self.tmp
+            .join(format!("{}-{}", std::process::id(), next_unique()))
     }
 }
 
 enum Captured {
     Entry(Entry),
     Skipped(String),
+}
+
+/// Crash leftovers from an interrupted restore swap. `doover doctor` surfaces
+/// these; their contents are a fully-built restore image and may aid recovery.
+pub fn orphaned_staging(dir: &Path) -> Result<Vec<PathBuf>, SnapshotError> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| io_err(dir, e))? {
+        let entry = entry.map_err(|e| io_err(dir, e))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".doover-restore-")
+        {
+            out.push(entry.path());
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 fn make_fifo(path: &Path, mode: u32) -> Result<(), SnapshotError> {
