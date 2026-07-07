@@ -7,10 +7,11 @@
 //! our action left it?" for conflict detection.
 
 use doover_core::hooks::{self, HookConfig, UnknownPolicy};
-use doover_core::journal::Journal;
+use doover_core::journal::{ActionStatus, Journal};
 use doover_core::snapshot::{Limits, Store};
 use doover_core::undo::{Selector, UndoEngine, UndoError};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 struct Rig {
@@ -42,6 +43,20 @@ fn rig() -> Rig {
 }
 
 impl Rig {
+    /// Pre-event + run the command, but NO post-event, then abandon it — the
+    /// shape of a failed command (audit round 10). Returns the action id.
+    fn run_failed(&self, session: &str, tool: &str, cmd: &str) -> i64 {
+        let ev = hooks::parse_pre_event(&mkjson(session, tool, &self.cwd, cmd, false)).unwrap();
+        let out = hooks::handle_pre(&self.cfg, &ev).unwrap();
+        std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", cmd])
+            .current_dir(&self.cwd)
+            .status()
+            .unwrap();
+        self.journal().end_session(session).unwrap(); // abandons the pending action
+        out.action_id
+    }
+
     /// Drive a command through the REAL engine: pre-event, run the command for
     /// real, post-event. Returns the action id.
     fn run(&self, session: &str, tool: &str, cmd: &str) -> i64 {
@@ -250,6 +265,79 @@ fn undo_with_no_undoable_history_is_a_clear_error() {
         .undo(Selector::Latest, false, false)
         .unwrap_err();
     assert!(matches!(err, UndoError::NoUndoableAction), "got {err:?}");
+}
+
+// --- audit round 10 regressions ---------------------------------------------------
+
+#[test]
+fn undo_of_a_failed_command_refuses_without_a_post_oracle() {
+    // an abandoned (failed) action has no post-state to verify against: undo
+    // must refuse-by-default rather than silently clobber later work
+    let r = rig();
+    fs::write(r.cwd.join("f.txt"), "v1").unwrap();
+    r.run_failed("s1", "t1", "echo v2 > f.txt");
+    fs::write(r.cwd.join("f.txt"), "user's own work").unwrap();
+
+    let (j, s) = (r.journal(), r.store());
+    let err = engine(&j, &s)
+        .undo(Selector::Latest, false, false)
+        .unwrap_err();
+    assert!(matches!(err, UndoError::Conflicts(_)), "got {err:?}");
+    assert_eq!(
+        r.read("f.txt").as_deref(),
+        Some("user's own work"),
+        "must not clobber"
+    );
+
+    // --force still lets the user proceed deliberately
+    let j2 = r.journal();
+    engine(&j2, &s).undo(Selector::Latest, true, false).unwrap();
+    assert_eq!(r.read("f.txt").as_deref(), Some("v1"));
+}
+
+#[test]
+fn a_failed_restore_rolls_back_and_leaves_the_target_retryable() {
+    // audit round 10: record-after-restore. A restore failure must NOT mark
+    // the action 'undone' (a lie) — the world rolls back and undo can retry.
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("a")).unwrap();
+    fs::write(r.cwd.join("a/x.txt"), "A-original").unwrap();
+    let id = r.run("s1", "t1", "rm -rf a");
+    assert!(r.read("a/x.txt").is_none());
+
+    // make the cwd read-only so restoring `a` cannot create the directory
+    fs::set_permissions(&r.cwd, fs::Permissions::from_mode(0o555)).unwrap();
+    let (j, s) = (r.journal(), r.store());
+    let err = engine(&j, &s)
+        .undo(Selector::Action(id), false, false)
+        .unwrap_err();
+    fs::set_permissions(&r.cwd, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        matches!(
+            err,
+            UndoError::PartialRolledBack { .. } | UndoError::Snapshot(_)
+        ),
+        "a failed restore must report a rollback/pre-flight error, got {err:?}"
+    );
+    // the crucial invariant: the target is NOT marked undone
+    assert_eq!(
+        j.action(id).unwrap().status,
+        ActionStatus::Completed,
+        "a failed undo must leave the target retryable, not lie that it succeeded"
+    );
+
+    // and retry now succeeds (perms restored)
+    let j2 = r.journal();
+    engine(&j2, &s)
+        .undo(Selector::Action(id), false, false)
+        .unwrap();
+    assert_eq!(
+        r.read("a/x.txt").as_deref(),
+        Some("A-original"),
+        "retry restores"
+    );
+    assert_eq!(j2.action(id).unwrap().status, ActionStatus::Undone);
 }
 
 #[test]

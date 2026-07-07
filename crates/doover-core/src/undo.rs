@@ -9,9 +9,12 @@
 //!
 //! Safety posture:
 //! - conflict-checked by default: if the touched paths changed since the
-//!   action (user edits, later agent actions), refuse unless --force;
-//! - every undo/redo snapshots the CURRENT state onto its own journal row
-//!   before restoring, so even a forced mistake is itself recoverable;
+//!   action (user edits, later agent actions) — or if the action failed and
+//!   left no post-state to verify against — refuse unless --force;
+//! - all-or-nothing and restore-BEFORE-record: a partial failure rolls the
+//!   restored paths back and returns an error WITHOUT recording, so the target
+//!   stays retryable and the journal never claims an undo that only half
+//!   happened;
 //! - dry-run plans without writing anything, journal included.
 
 use crate::journal::{
@@ -48,6 +51,21 @@ pub enum UndoError {
     Journal(#[from] JournalError),
     #[error(transparent)]
     Snapshot(#[from] SnapshotError),
+    #[error(
+        "restore of {path} failed ({cause}); the partial restore was rolled back — \
+         nothing changed, safe to retry"
+    )]
+    PartialRolledBack { path: String, cause: String },
+    #[error(
+        "restore of {path} failed ({cause}) AND rollback failed for: {}; \
+         the tree is in a mixed state — inspect before retrying",
+        .rollback_failures.join(", ")
+    )]
+    PartialInconsistent {
+        path: String,
+        cause: String,
+        rollback_failures: Vec<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -89,7 +107,7 @@ impl<'a> UndoEngine<'a> {
         let post = self
             .journal
             .manifests_by_role(target.id, ManifestRole::Post)?;
-        self.execute(&target, &pre, &post, "undo", force, dry_run)
+        self.execute(&target, &pre, &post, force, dry_run)
     }
 
     /// Re-apply an undone action's effect by restoring its POST manifests.
@@ -138,7 +156,7 @@ impl<'a> UndoEngine<'a> {
         let expect_now = self
             .journal
             .manifests_by_role(original_id, ManifestRole::Pre)?;
-        self.execute(&undo_action, &post, &expect_now, "redo", force, dry_run)
+        self.execute(&undo_action, &post, &expect_now, force, dry_run)
     }
 
     fn select_undo_target(&self, sel: Selector) -> Result<ActionRecord, UndoError> {
@@ -166,14 +184,14 @@ impl<'a> UndoEngine<'a> {
         }
     }
 
-    /// Shared tail: conflict-check against `oracle`, plan, record, snapshot
-    /// current state onto the new journal row, restore `restore_set`.
+    /// Shared tail: conflict-check `restore_set` against `oracle`, then (unless
+    /// dry-run) capture rollback state, restore all-or-nothing, and only record
+    /// the undo once every path is restored.
     fn execute(
         &self,
         journal_target: &ActionRecord,
         restore_set: &[Manifest],
         oracle: &[Manifest],
-        verb: &'static str,
         force: bool,
         dry_run: bool,
     ) -> Result<UndoReport, UndoError> {
@@ -192,8 +210,14 @@ impl<'a> UndoEngine<'a> {
                         conflicts.push(format!("{} changed since the action", m.path.display()));
                     }
                 }
-                None => warnings.push(format!(
-                    "{}: no recorded state to verify against",
+                // no recorded state to verify against (audit round 10): a
+                // failed/abandoned command has no post-snapshot, so we CANNOT
+                // confirm the world is unchanged. Refusing-by-default is the
+                // safe choice — undoing might clobber the user's own work.
+                // --force proceeds.
+                None => conflicts.push(format!(
+                    "{}: cannot verify it is unchanged (no post-state was recorded); \
+                     the command may have failed",
                     m.path.display()
                 )),
             }
@@ -225,40 +249,67 @@ impl<'a> UndoEngine<'a> {
             });
         }
 
-        // record first: the journal transaction is the double-undo guard
-        let recorded = self
-            .journal
-            .record_undo(&journal_target.session_id, journal_target.id)?;
-
-        // capture the CURRENT state onto the new row so even a forced mistake
-        // is recoverable; failures degrade to warnings
+        // All-or-nothing, restore-BEFORE-record (audit round 10): if any path
+        // fails, roll the succeeded ones back to their pre-undo state and
+        // return an error WITHOUT recording — the target stays in its current
+        // status so `doover undo` can simply be retried. The journal never
+        // claims an undo that only partly happened.
+        //
+        // Capture each path's current state first (in memory) as the rollback
+        // point. A path we cannot even snapshot is a path we cannot safely
+        // restore transactionally, so refuse before touching anything.
+        let mut rollback: Vec<Manifest> = Vec::with_capacity(restore_set.len());
         for m in restore_set {
             match self.store.snapshot(&m.path, None) {
-                Ok(current) => {
-                    self.journal
-                        .attach_manifest(recorded, &current, ManifestRole::Pre)?;
+                Ok(current) => rollback.push(current),
+                Err(e) => {
+                    return Err(UndoError::Snapshot(e));
                 }
-                Err(e) => warnings.push(format!(
-                    "could not snapshot current state of {}: {e}",
-                    m.path.display()
-                )),
             }
         }
 
         let mut restored = 0usize;
-        for m in restore_set {
+        for (i, m) in restore_set.iter().enumerate() {
             match self.store.restore(m) {
                 Ok(report) => {
                     restored += 1;
                     warnings.extend(report.warnings);
                 }
                 Err(e) => {
-                    let msg = format!("{verb} of {} failed: {e}", m.path.display());
-                    self.journal.add_note(recorded, &msg)?;
-                    warnings.push(msg);
-                    return Err(e.into());
+                    // roll back everything already restored (best effort) so
+                    // the world returns to its pre-undo state
+                    let mut rollback_failures = Vec::new();
+                    for done in rollback.iter().take(i) {
+                        if let Err(re) = self.store.restore(done) {
+                            rollback_failures.push(format!("{}: {re}", done.path.display()));
+                        }
+                    }
+                    if rollback_failures.is_empty() {
+                        return Err(UndoError::PartialRolledBack {
+                            path: m.path.display().to_string(),
+                            cause: e.to_string(),
+                        });
+                    }
+                    return Err(UndoError::PartialInconsistent {
+                        path: m.path.display().to_string(),
+                        cause: e.to_string(),
+                        rollback_failures,
+                    });
                 }
             }
+        }
+
+        // every path restored: NOW record the undo (flips status). record_undo
+        // is the double-undo guard; if a concurrent undo already recorded, this
+        // errors but the world is already correctly restored (idempotent).
+        let recorded = self
+            .journal
+            .record_undo(&journal_target.session_id, journal_target.id)?;
+        // stash the pre-undo state on the new row for forensics/manual recovery
+        for rb in &rollback {
+            let _ = self
+                .journal
+                .attach_manifest(recorded, rb, ManifestRole::Pre);
         }
 
         Ok(UndoReport {
