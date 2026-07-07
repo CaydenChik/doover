@@ -19,9 +19,10 @@ blake3.workspace = true
 walkdir.workspace = true
 xattr.workspace = true
 libc.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 insta.workspace = true
 tempfile.workspace = true
 proptest.workspace = true

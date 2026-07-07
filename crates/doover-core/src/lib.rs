@@ -8,6 +8,7 @@
 //! - `hooks` (step 5): harness adapters (Claude Code first)
 //! - `undo` (step 6): restore engine with conflict detection
 
+pub mod journal;
 pub mod registry;
 pub mod resolver;
 pub mod snapshot;
