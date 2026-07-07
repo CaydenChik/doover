@@ -66,3 +66,7 @@ confirm green → only then claim done. Build order and per-step test gates are 
   jump makes recent snapshots look old and collectable — the dangerous
   direction. Compute the cutoff relative to MAX(started_at_ms) in the
   journal, not `now()`, or apply generous slack.
+- **A completed action can legitimately have zero manifests** (step 6): a
+  crash between `start_action` and `attach_manifest`, or a safe/mutating
+  action that snapshotted nothing. The undo engine must treat "no manifests"
+  as "nothing to restore, warn" — never assume manifests exist for an action.

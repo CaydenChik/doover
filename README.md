@@ -14,9 +14,15 @@ $ doover undo                                 # …and it's back.
 
 ## Status
 
-**Pre-alpha, build step 0** (scaffold + CI + test harness). Nothing is protected yet.
-See `doover-mvp-spec.md` and `doover-implementation-plan.md` for the design, the
-test-first build order, and the research this is based on (Atomix, Parallax, YoloFS).
+**Pre-alpha, library core in progress.** The `doover-core` crate implements the
+reversibility registry, the bash scope resolver (bash-oracle-verified), the
+content-addressed snapshot store, and the SQLite action journal — all
+test-first with a live-captured Claude Code hook contract pinned in CI. The
+`doover` CLI is still a stub: the hook adapter that wires these together
+(`hook pre/post`) and `undo`/`log` are not built yet, so **nothing is
+protected end to end.** See `doover-mvp-spec.md` and
+`doover-implementation-plan.md` for the design, the build order, and the
+research this is based on (Atomix, Parallax, YoloFS).
 
 ## How it will work
 

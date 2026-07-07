@@ -573,12 +573,29 @@ mod small_model {
             if let Ok(id) = got {
                 ids.push(id);
             }
+            // compare the FULL record, not just status (audit round 5: a bug
+            // that corrupts target_prior_status or kind while leaving status
+            // correct would otherwise pass silently)
             for (i, m) in model.iter().enumerate() {
-                let actual = to_model_status(j.action(ids[i]).unwrap().status);
-                if actual != m.status {
+                let rec = j.action(ids[i]).unwrap();
+                if to_model_status(rec.status) != m.status {
                     return Err(format!(
-                        "seq {seq:?} step {step}: action #{i} model={:?} journal={actual:?}",
-                        m.status
+                        "seq {seq:?} step {step}: action #{i} status model={:?} journal={:?}",
+                        m.status, rec.status
+                    ));
+                }
+                let want_kind_undo = m.is_undo;
+                let got_kind_undo = rec.kind == ActionKind::Undo;
+                if want_kind_undo != got_kind_undo {
+                    return Err(format!(
+                        "seq {seq:?} step {step}: action #{i} kind mismatch (model undo={want_kind_undo})"
+                    ));
+                }
+                let got_prior = rec.target_prior_status.map(to_model_status);
+                if got_prior != m.prior {
+                    return Err(format!(
+                        "seq {seq:?} step {step}: action #{i} target_prior_status model={:?} journal={:?}",
+                        m.prior, got_prior
                     ));
                 }
             }
@@ -614,12 +631,16 @@ mod small_model {
             }
             break;
         }
+        // `checked` counts enumerated tuples; many truncate at step 1 when
+        // their target does not yet exist, so the number of DISTINCT valid
+        // undo paths exercised is smaller — the guard just pins the
+        // enumeration breadth, it is not a "sequences tested" headline.
         assert!(
             failures.is_empty(),
             "journal diverges from the reference model:\n{}",
             failures.join("\n")
         );
-        assert!(checked >= 2000, "enumeration shrank: {checked}");
+        assert!(checked >= 2000, "enumeration breadth shrank: {checked}");
     }
 }
 

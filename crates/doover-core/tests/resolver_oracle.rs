@@ -46,6 +46,10 @@ fn bash_expand(word: &str, cwd: &Path, home: &Path) -> Vec<String> {
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|l| !l.is_empty())
+        // bash prints `.` and `..` for patterns like `.*`, but rm cannot act
+        // on them; doover deliberately excludes them from scope (capturing
+        // `..` would snapshot the entire parent tree)
+        .filter(|l| *l != "." && *l != "..")
         .map(str::to_string)
         .collect()
 }

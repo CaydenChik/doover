@@ -595,10 +595,32 @@ impl Walker<'_> {
                 pattern.push(*c);
             }
         }
+        // bash parity for leading dots (audit round 5): a glob component
+        // matches a hidden entry only when the pattern's own last component
+        // literally begins with `.`. The glob crate's
+        // require_literal_leading_dot is unreliable (misses `.h*`), so we glob
+        // permissively and filter by bash's rule ourselves.
+        let last_component_is_dotted = rem_text
+            .rsplit('/')
+            .next()
+            .is_some_and(|c| c.starts_with('.'));
         match glob::glob(&pattern) {
             Ok(matches) => {
                 let mut n = 0usize;
                 for m in matches.take(10_000).flatten() {
+                    // use the RAW trailing component: Path::file_name()
+                    // normalizes `.`/`..` away, which would let them through
+                    let raw = m.to_string_lossy();
+                    let base = raw.rsplit('/').next().unwrap_or(&raw);
+                    // `.*` yields readdir's `.` and `..`, resolving to the
+                    // directory itself and its PARENT — rm cannot act on them
+                    // and capturing `..` would scope an entire parent tree
+                    if base == "." || base == ".." {
+                        continue;
+                    }
+                    if base.starts_with('.') && !last_component_is_dotted {
+                        continue; // bare `*` doesn't match hidden entries
+                    }
                     self.out.paths.insert(normalize_lexical(&m));
                     n += 1;
                 }

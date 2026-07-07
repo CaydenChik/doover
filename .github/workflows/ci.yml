@@ -52,3 +52,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo publish --dry-run -p doover-core
       - run: cargo publish --dry-run -p doover --allow-dirty
+
+  # Non-gating coverage visibility: "comprehensive" claims should be
+  # inspectable, not asserted. Prints a per-file summary; never fails the build
+  # (line targets would be goodhart bait this early). The bash-oracle and fuzz
+  # slices don't run here, so treat numbers as a floor.
+  coverage:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --summary-only

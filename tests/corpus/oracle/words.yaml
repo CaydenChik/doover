@@ -44,3 +44,10 @@ words:
   - { word: "фото{1,2}" }
   - { word: "📸{a,b}" }
   - { word: '"d q"{a,b}' }
+  # dotfiles (audit round 5): bash's bare globs exclude hidden entries, and
+  # `.`/`..` (which bash prints for `.*` but rm cannot act on) are filtered
+  # from the bash side in the harness — doover deliberately excludes them
+  # from scope so `rm .*` can't capture the parent tree
+  - { word: "*", cwd_fixture: [".hidden", "visible.txt", "also.txt"] }
+  - { word: ".*", cwd_fixture: [".hidden", ".config", "visible.txt"] }
+  - { word: ".h*", cwd_fixture: [".hidden", ".hxyz", "other.txt"] }

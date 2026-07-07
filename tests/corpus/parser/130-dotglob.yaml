@@ -1,0 +1,21 @@
+# T1 corpus — dotfile globbing (2026-07-07 audit). Bash semantics: bare globs
+# never match hidden entries; `.*` matches dotfiles but `.` and `..` are
+# excluded from doover's scope (rm cannot act on them, and capturing `..`
+# would snapshot the entire parent tree — probe-confirmed explosion).
+# Cases run inside sub/ so the harness's fixture-home doesn't join the glob.
+
+cases:
+  - name: dotglob-bare-star-excludes-hidden
+    cmd: "cd sub && rm *"
+    cwd_fixture: ["sub/.hidden", "sub/a.txt", "sub/b.txt"]
+    expect: { effect: destructive, paths: ["sub/a.txt", "sub/b.txt"], rule: coreutils.rm }
+
+  - name: dotglob-dot-star-excludes-self-and-parent
+    cmd: "cd sub && rm .*"
+    cwd_fixture: ["sub/.hidden", "sub/.config", "sub/keep.txt"]
+    expect: { effect: destructive, paths: ["sub/.hidden", "sub/.config"], rule: coreutils.rm }
+
+  - name: dotglob-explicit-dot-prefix
+    cmd: "cd sub && rm .h*"
+    cwd_fixture: ["sub/.hidden", "sub/.hxyz", "sub/zz.txt"]
+    expect: { effect: destructive, paths: ["sub/.hidden", "sub/.hxyz"], rule: coreutils.rm }
