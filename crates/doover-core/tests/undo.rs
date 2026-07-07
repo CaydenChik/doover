@@ -341,6 +341,50 @@ fn a_failed_restore_rolls_back_and_leaves_the_target_retryable() {
 }
 
 #[test]
+fn multipath_failure_rolls_back_the_already_restored_path() {
+    // round-10 follow-up: the rollback LOOP itself (path 0 restored, path 1
+    // fails, path 0 must return to its pre-undo state). The earlier regression
+    // only exercised the i=0 branch where nothing had been restored yet.
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("sub1")).unwrap();
+    fs::create_dir_all(r.cwd.join("sub2")).unwrap();
+    fs::write(r.cwd.join("sub1/a.txt"), "A-original").unwrap();
+    fs::write(r.cwd.join("sub2/b.txt"), "B-original").unwrap();
+    let id = r.run("s1", "t1", "rm sub1/a.txt sub2/b.txt");
+    assert!(r.read("sub1/a.txt").is_none() && r.read("sub2/b.txt").is_none());
+
+    // only sub2 becomes read-only: restoring a.txt succeeds, b.txt fails
+    fs::set_permissions(r.cwd.join("sub2"), fs::Permissions::from_mode(0o555)).unwrap();
+    let (j, s) = (r.journal(), r.store());
+    let err = engine(&j, &s)
+        .undo(Selector::Action(id), false, false)
+        .unwrap_err();
+    fs::set_permissions(r.cwd.join("sub2"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        matches!(err, UndoError::PartialRolledBack { .. }),
+        "got {err:?}"
+    );
+    assert!(
+        r.read("sub1/a.txt").is_none(),
+        "the successfully-restored path must be rolled back to its pre-undo (absent) state"
+    );
+    assert_eq!(
+        j.action(id).unwrap().status,
+        ActionStatus::Completed,
+        "retryable"
+    );
+
+    // retry succeeds once the obstacle is gone
+    let j2 = r.journal();
+    engine(&j2, &s)
+        .undo(Selector::Action(id), false, false)
+        .unwrap();
+    assert_eq!(r.read("sub1/a.txt").as_deref(), Some("A-original"));
+    assert_eq!(r.read("sub2/b.txt").as_deref(), Some("B-original"));
+}
+
+#[test]
 fn undo_recreates_a_file_the_command_created() {
     // pre-state was ABSENT (file didn't exist): undo must DELETE it
     let r = rig();
