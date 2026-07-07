@@ -120,6 +120,46 @@ fn hook_pre_then_post_journals_and_completes_through_the_real_binary() {
 }
 
 #[test]
+fn hook_pre_warns_loudly_when_a_destructive_action_is_unprotected() {
+    // audit round 9: exit 0 (never block) but WARN — a destructive command
+    // whose snapshot failed must not pass silently
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(cwd.join("build")).unwrap();
+    std::fs::write(cwd.join("build/a.txt"), "precious").unwrap();
+
+    let ev = |cmd: &str| {
+        serde_json::json!({
+            "session_id": "s1", "cwd": cwd.to_string_lossy(),
+            "hook_event_name": "PreToolUse", "tool_name": "Bash",
+            "tool_use_id": "t1", "tool_input": { "command": cmd }
+        })
+        .to_string()
+    };
+
+    // a destructive priming action creates the store, then make it unwritable
+    std::fs::write(cwd.join("prime.txt"), "x").unwrap();
+    hook_cmd(&dh, "pre")
+        .write_stdin(ev("rm prime.txt"))
+        .assert()
+        .success();
+    let objects = dh.join("store/objects");
+    std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let assert = hook_cmd(&dh, "pre")
+        .write_stdin(ev("rm -rf build"))
+        .assert()
+        .success(); // still fail-open: never block the agent
+    std::fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert.stderr(
+        predicate::str::contains("PROTECTION INCOMPLETE")
+            .or(predicate::str::contains("UNPROTECTED")),
+    );
+}
+
+#[test]
 fn hook_post_without_pre_fails_open() {
     let tmp = tempfile::tempdir().unwrap();
     let post = serde_json::json!({

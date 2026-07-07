@@ -9,6 +9,7 @@ use doover_core::hooks::{self, HookConfig, UnknownPolicy};
 use doover_core::journal::{ActionStatus, Journal};
 use doover_core::snapshot::Limits;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 struct Rig {
@@ -221,6 +222,79 @@ fn user_registry_overlay_is_honored() {
     let a = &j.session_actions("s1").unwrap()[0];
     assert_eq!(a.rule_id.as_deref(), Some("my.nuke"));
     assert_eq!(j.manifests(a.id).unwrap().len(), 1);
+}
+
+/// Audit round 9 (the fail-open dual): a DESTRUCTIVE action whose snapshot
+/// fails must surface a loud protection gap, not pass silently. The engine
+/// carries the gaps up so the binary can warn while still exiting 0.
+#[test]
+fn destructive_with_failed_snapshot_reports_a_protection_gap() {
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("build")).unwrap();
+    fs::write(r.cwd.join("build/a.txt"), "precious").unwrap();
+
+    // a destructive priming action creates the store; then jam its object dir
+    // read-only so the real action's writes fail
+    fs::write(r.cwd.join("prime.txt"), "x").unwrap();
+    hooks::handle_pre(
+        &r.cfg,
+        &hooks::parse_pre_event(&pre_json("s0", "t0", &r.cwd, "rm prime.txt")).unwrap(),
+    )
+    .unwrap();
+    let objects = r.cfg.doover_home.join("store/objects");
+    fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf build")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(outcome.severity >= doover_core::resolver::Severity::Destructive);
+    assert_eq!(
+        outcome.manifests_attached, 0,
+        "the snapshot could not be written"
+    );
+    assert!(
+        !outcome.gaps.is_empty(),
+        "a destructive action with a failed snapshot must report a gap for the binary to warn on"
+    );
+    assert!(outcome.gaps.iter().any(|g| g.contains("UNPROTECTED")));
+}
+
+#[test]
+fn fully_protected_destructive_reports_no_gap() {
+    // the dual: don't cry wolf. A clean destructive snapshot has no gaps (the
+    // binary must stay quiet to avoid the 93%-approval alarm-fatigue trap).
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("build")).unwrap();
+    fs::write(r.cwd.join("build/a.txt"), "A").unwrap();
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf build")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    assert!(outcome.manifests_attached >= 1);
+    assert!(
+        outcome.gaps.is_empty(),
+        "a clean snapshot must not warn: {:?}",
+        outcome.gaps
+    );
+}
+
+#[test]
+fn truncated_snapshot_of_a_destructive_action_is_a_gap() {
+    let mut r = rig();
+    r.cfg.limits = Limits {
+        max_files: 2,
+        max_bytes: u64::MAX,
+    };
+    fs::create_dir_all(r.cwd.join("big")).unwrap();
+    for i in 0..10 {
+        fs::write(r.cwd.join(format!("big/f{i}.txt")), "x").unwrap();
+    }
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf big")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    assert!(
+        outcome.gaps.iter().any(|g| g.contains("truncated")),
+        "a truncated (partial) snapshot is a protection gap: {:?}",
+        outcome.gaps
+    );
 }
 
 // --- post ------------------------------------------------------------------------

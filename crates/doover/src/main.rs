@@ -109,7 +109,19 @@ fn run_hook(kind: HookCommand) -> Result<(), String> {
     match kind {
         HookCommand::Pre => {
             let ev = doover_core::hooks::parse_pre_event(&input).map_err(|e| e.to_string())?;
-            doover_core::hooks::handle_pre(&cfg, &ev).map_err(|e| e.to_string())?;
+            let outcome = doover_core::hooks::handle_pre(&cfg, &ev).map_err(|e| e.to_string())?;
+            // Never block (exit 0), but never stay silent about a destructive
+            // action we could not fully protect (audit round 9): the whole
+            // point is the safety net — a hole in it must be loud.
+            if outcome.needs_warning() {
+                eprintln!(
+                    "doover: PROTECTION INCOMPLETE for a {:?} action — undo may not fully recover:",
+                    outcome.severity
+                );
+                for gap in &outcome.gaps {
+                    eprintln!("doover:   {gap}");
+                }
+            }
         }
         HookCommand::Post => {
             let ev = doover_core::hooks::parse_post_event(&input).map_err(|e| e.to_string())?;

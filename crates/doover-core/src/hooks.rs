@@ -149,11 +149,24 @@ pub fn parse_post_event(json: &str) -> Result<PostEvent, HookError> {
     })
 }
 
-/// Outcome summary for logging/tests.
+/// Outcome summary for logging and, crucially, for the binary's runtime
+/// warning. `gaps` holds the loud protection-gap messages (snapshot failures,
+/// truncations) — non-empty means coverage is incomplete. The binary warns
+/// when a destructive+ action has gaps, so "I ran but couldn't fully protect
+/// you" is never silent (audit round 9).
 pub struct PreOutcome {
     pub action_id: ActionId,
     pub manifests_attached: usize,
     pub severity: Severity,
+    pub gaps: Vec<String>,
+}
+
+impl PreOutcome {
+    /// True when the binary should emit a loud (but non-blocking) warning: a
+    /// destructive-or-worse action whose protection is incomplete.
+    pub fn needs_warning(&self) -> bool {
+        self.severity >= Severity::Destructive && !self.gaps.is_empty()
+    }
 }
 
 fn open_journal(cfg: &HookConfig) -> Result<Journal, HookError> {
@@ -204,17 +217,25 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
     }
 
     let mut attached = 0usize;
+    let mut gaps: Vec<String> = Vec::new();
+    // record a gap both in the journal (for `log`) and in the outcome (for
+    // the binary's runtime warning)
+    let mut note_gap = |journal: &Journal, msg: String| -> Result<(), HookError> {
+        journal.add_note(action, &msg)?;
+        gaps.push(msg);
+        Ok(())
+    };
     if !targets.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
         for path in &targets {
-            // once the action exists, per-path failures become loud notes,
-            // never lost protection for the OTHER paths
+            // once the action exists, per-path failures become loud gaps,
+            // never lost protection for the OTHER paths — and never silent
             match store.snapshot(path, Some(&cfg.limits)) {
                 Ok(manifest) => {
                     if manifest.truncated {
-                        journal.add_note(
-                            action,
-                            &format!(
+                        note_gap(
+                            &journal,
+                            format!(
                                 "UNPROTECTED: snapshot of {} truncated at limits ({} files skipped)",
                                 path.display(),
                                 manifest.skipped
@@ -222,10 +243,10 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
                         )?;
                     }
                     if !manifest.warnings.is_empty() {
-                        journal.add_note(
-                            action,
-                            &format!(
-                                "snapshot gaps at {}: {}",
+                        note_gap(
+                            &journal,
+                            format!(
+                                "PARTIAL: snapshot gaps at {}: {}",
                                 path.display(),
                                 manifest.warnings.join("; ")
                             ),
@@ -235,9 +256,9 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
                     attached += 1;
                 }
                 Err(e) => {
-                    journal.add_note(
-                        action,
-                        &format!("UNPROTECTED: snapshot of {} failed: {e}", path.display()),
+                    note_gap(
+                        &journal,
+                        format!("UNPROTECTED: snapshot of {} failed: {e}", path.display()),
                     )?;
                 }
             }
@@ -248,6 +269,7 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
         action_id: action,
         manifests_attached: attached,
         severity: r.severity,
+        gaps,
     })
 }
 
