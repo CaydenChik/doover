@@ -20,14 +20,36 @@ struct Cli {
 enum Command {
     /// Set up the snapshot store and install harness hooks
     Init,
-    /// List journaled agent actions
-    Log,
+    /// List recent journaled agent actions
+    Log {
+        /// How many actions to show
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: i64,
+    },
     /// Show one action's snapshot manifest and diff
     Show,
-    /// Restore pre-action state (session-scoped, selective)
-    Undo,
-    /// Revert an undo
-    Redo,
+    /// Restore the state from before an action (latest undoable by default)
+    Undo {
+        /// Journal action id (defaults to the latest undoable action)
+        id: Option<i64>,
+        /// Restore even if the touched paths changed since the action
+        #[arg(long)]
+        force: bool,
+        /// Print the restore plan without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Revert an undo, re-applying the action's effect
+    Redo {
+        /// Journal id of the undo action (defaults to the latest undo)
+        id: Option<i64>,
+        /// Re-apply even if the touched paths changed since the undo
+        #[arg(long)]
+        force: bool,
+        /// Print the plan without changing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Diff an action's pre-state against the current filesystem
     Diff,
     /// Store and session health summary
@@ -40,6 +62,9 @@ enum Command {
     #[command(subcommand)]
     Hook(HookCommand),
 }
+
+/// Exit code for a refused undo/redo due to conflicts (see CLAUDE.md).
+const EXIT_CONFLICT: i32 = 3;
 
 #[derive(Subcommand)]
 enum HookCommand {
@@ -56,11 +81,20 @@ fn main() {
             run_hook_fail_open(kind);
             return;
         }
+        Command::Undo { id, force, dry_run } => {
+            run_undo_redo(Verb::Undo, id, force, dry_run);
+            return;
+        }
+        Command::Redo { id, force, dry_run } => {
+            run_undo_redo(Verb::Redo, id, force, dry_run);
+            return;
+        }
+        Command::Log { limit } => {
+            run_log(limit);
+            return;
+        }
         Command::Init => ("init", 7),
-        Command::Log => ("log", 6),
         Command::Show => ("show", 6),
-        Command::Undo => ("undo", 6),
-        Command::Redo => ("redo", 6),
         Command::Diff => ("diff", 6),
         Command::Status => ("status", 7),
         Command::Gc => ("gc", 7),
@@ -70,6 +104,110 @@ fn main() {
         "doover {name}: not implemented yet (arrives in build step {step}; see doover-implementation-plan.md)"
     );
     std::process::exit(EXIT_NOT_IMPLEMENTED);
+}
+
+enum Verb {
+    Undo,
+    Redo,
+}
+
+/// Open the journal, creating DOOVER_HOME first so a fresh install reads as an
+/// empty history (friendly messages) rather than an open error.
+fn open_journal_or_exit(cfg: &doover_core::hooks::HookConfig) -> doover_core::journal::Journal {
+    if let Err(e) = std::fs::create_dir_all(&cfg.doover_home) {
+        eprintln!("doover: cannot create {}: {e}", cfg.doover_home.display());
+        std::process::exit(1);
+    }
+    match doover_core::journal::Journal::open(&cfg.doover_home.join("journal.db")) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("doover: cannot open journal: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_undo_redo(verb: Verb, id: Option<i64>, force: bool, dry_run: bool) {
+    use doover_core::undo::{Selector, UndoEngine, UndoError};
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    let journal = open_journal_or_exit(&cfg);
+    let store = match doover_core::snapshot::Store::open(cfg.doover_home.join("store")) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("doover: cannot open store: {e}");
+            std::process::exit(1);
+        }
+    };
+    let engine = UndoEngine::new(&journal, &store);
+    let sel = id.map(Selector::Action).unwrap_or(Selector::Latest);
+    let (verb_str, result) = match verb {
+        Verb::Undo => ("undo", engine.undo(sel, force, dry_run)),
+        Verb::Redo => ("redo", engine.redo(sel, force, dry_run)),
+    };
+    match result {
+        Ok(report) => {
+            if report.dry_run {
+                println!("would {verb_str} action #{}:", report.target_action);
+            } else {
+                println!(
+                    "{verb_str} of action #{} complete — {} path(s) restored{}",
+                    report.target_action,
+                    report.paths_restored,
+                    if report.forced { " (forced)" } else { "" }
+                );
+            }
+            for line in &report.plan {
+                println!("  {line}");
+            }
+            for w in &report.warnings {
+                eprintln!("doover: warning: {w}");
+            }
+        }
+        Err(e @ UndoError::Conflicts(_)) => {
+            eprintln!("doover: {e}");
+            std::process::exit(EXIT_CONFLICT);
+        }
+        Err(e) => {
+            eprintln!("doover: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_log(limit: i64) {
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    let journal = open_journal_or_exit(&cfg);
+    let actions = match journal.recent_actions(limit) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("doover: {e}");
+            std::process::exit(1);
+        }
+    };
+    if actions.is_empty() {
+        println!("no journaled actions yet");
+        return;
+    }
+    for a in &actions {
+        use doover_core::journal::ActionStatus;
+        let status = match a.status {
+            ActionStatus::Pending => "pending  ",
+            ActionStatus::Completed => "completed",
+            ActionStatus::Abandoned => "abandoned",
+            ActionStatus::Undone => "undone   ",
+        };
+        let mut cmd = a.raw_command.replace('\n', " ");
+        if cmd.chars().count() > 60 {
+            cmd = format!("{}…", cmd.chars().take(59).collect::<String>());
+        }
+        let flags = match (a.has_unknown, a.note.is_some()) {
+            (true, true) => " [unknown, notes]",
+            (true, false) => " [unknown]",
+            (false, true) => " [notes]",
+            (false, false) => "",
+        };
+        println!("#{:<5} {status}  {:<13} {cmd}{flags}", a.id, a.effect);
+    }
 }
 
 /// PRIME DIRECTIVE OF THE HOOK PATH: never block the agent. Any failure —

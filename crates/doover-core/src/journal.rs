@@ -18,8 +18,25 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Which side of an action a manifest captures: state before the command
+/// (restored by undo) or after (restored by redo, and the conflict oracle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestRole {
+    Pre,
+    Post,
+}
+
+impl ManifestRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pre => "pre",
+            Self::Post => "post",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -146,12 +163,14 @@ impl Journal {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(JournalError::SchemaTooNew { found: version });
         }
-        if version < SCHEMA_VERSION {
-            conn.execute_batch(&format!(
+        // stepwise migrations: each block moves exactly one version forward,
+        // so any past journal upgrades along the same audited path
+        if version == 0 {
+            conn.execute_batch(
                 "BEGIN;
                  CREATE TABLE IF NOT EXISTS sessions(
                     id TEXT PRIMARY KEY,
@@ -191,9 +210,21 @@ impl Journal {
                     truncated INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS idx_manifests_action ON manifests(action_id);
-                 PRAGMA user_version = {SCHEMA_VERSION};
-                 COMMIT;"
-            ))?;
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+            version = 1;
+        }
+        if version == 1 {
+            // v2: manifests gain a role — pre (undo restores it) or post
+            // (redo restores it; conflict oracle). Existing rows are all pre.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE manifests ADD COLUMN role TEXT NOT NULL DEFAULT 'pre'
+                    CHECK(role IN ('pre','post'));
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
         }
         Ok(Self { conn })
     }
@@ -301,6 +332,7 @@ impl Journal {
         &self,
         action: ActionId,
         manifest: &Manifest,
+        role: ManifestRole,
     ) -> Result<(), JournalError> {
         let json = serde_json::to_string(manifest)?;
         let hashes: Vec<&str> = manifest
@@ -312,23 +344,51 @@ impl Journal {
             })
             .collect();
         self.conn.execute(
-            "INSERT INTO manifests(action_id, path, manifest_json, hashes, truncated)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO manifests(action_id, path, manifest_json, hashes, truncated, role)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 action,
                 manifest.path.to_string_lossy(),
                 json,
                 serde_json::to_string(&hashes)?,
                 manifest.truncated,
+                role.as_str(),
             ],
         )?;
         Ok(())
     }
 
+    /// All manifests of an action, regardless of role.
     pub fn manifests(&self, action: ActionId) -> Result<Vec<Manifest>, JournalError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT manifest_json FROM manifests WHERE action_id = ?1 ORDER BY id")?;
+        self.manifests_query(
+            "SELECT manifest_json FROM manifests WHERE action_id = ?1 ORDER BY id",
+            action,
+        )
+    }
+
+    /// Manifests of an action filtered by role (pre = undo side, post = redo
+    /// side / conflict oracle).
+    pub fn manifests_by_role(
+        &self,
+        action: ActionId,
+        role: ManifestRole,
+    ) -> Result<Vec<Manifest>, JournalError> {
+        match role {
+            ManifestRole::Pre => self.manifests_query(
+                "SELECT manifest_json FROM manifests
+                 WHERE action_id = ?1 AND role = 'pre' ORDER BY id",
+                action,
+            ),
+            ManifestRole::Post => self.manifests_query(
+                "SELECT manifest_json FROM manifests
+                 WHERE action_id = ?1 AND role = 'post' ORDER BY id",
+                action,
+            ),
+        }
+    }
+
+    fn manifests_query(&self, sql: &str, action: ActionId) -> Result<Vec<Manifest>, JournalError> {
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([action], |r| r.get::<_, String>(0))?;
         let mut out: Vec<Manifest> = Vec::new();
         for json in rows {
@@ -339,6 +399,39 @@ impl Journal {
             out.push(m);
         }
         Ok(out)
+    }
+
+    /// Newest command-kind action that is plausibly undoable: completed or
+    /// abandoned, with at least one pre-manifest. Searches across sessions.
+    pub fn latest_undoable(&self) -> Result<Option<ActionRecord>, JournalError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_ACTION} WHERE kind = 'command'
+               AND status IN ('completed','abandoned')
+               AND EXISTS (SELECT 1 FROM manifests m
+                           WHERE m.action_id = actions.id AND m.role = 'pre')
+             ORDER BY id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map([], row_to_action)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Most recent actions across all sessions, newest first (for `log`).
+    pub fn recent_actions(&self, limit: i64) -> Result<Vec<ActionRecord>, JournalError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("{SELECT_ACTION} ORDER BY id DESC LIMIT ?1"))?;
+        let rows = stmt.query_map([limit], row_to_action)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Newest live undo action (redo target): kind undo, still completed.
+    pub fn latest_redoable(&self) -> Result<Option<ActionRecord>, JournalError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "{SELECT_ACTION} WHERE kind = 'undo' AND status = 'completed'
+             ORDER BY id DESC LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map([], row_to_action)?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Record an undo of `target` as a new journaled action. The target flips

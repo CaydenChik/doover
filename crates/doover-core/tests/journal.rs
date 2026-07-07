@@ -7,7 +7,7 @@
 //!   when the next action starts or the session ends
 //! - `tool_use_id` correlates pre/post pairs
 
-use doover_core::journal::{ActionKind, ActionStatus, Journal, NewAction};
+use doover_core::journal::{ActionKind, ActionStatus, Journal, ManifestRole, NewAction};
 use doover_core::snapshot::{Store, StoreOptions};
 use std::io::BufRead;
 use std::path::Path;
@@ -92,6 +92,65 @@ fn a_future_schema_journal_refuses_to_open() {
         Ok(_) => panic!("a future-schema journal must refuse to open"),
         Err(e) => assert!(e.to_string().contains("newer"), "got: {e}"),
     }
+}
+
+#[test]
+fn a_v1_journal_migrates_to_v2_preserving_manifests_as_pre() {
+    // step 6 added manifest roles; v1 rows must surface as role='pre'
+    let (tmp, db) = mem_paths();
+    // build a genuine v1 database by hand
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions(id TEXT PRIMARY KEY, harness TEXT NOT NULL,
+                cwd TEXT NOT NULL, started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER);
+             CREATE TABLE actions(id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                seq INTEGER NOT NULL, kind TEXT NOT NULL, tool_use_id TEXT,
+                raw_command TEXT NOT NULL, effect TEXT NOT NULL, rule_id TEXT,
+                has_unknown INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+                target_action_id INTEGER, target_prior_status TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0, started_at_ms INTEGER NOT NULL,
+                duration_ms INTEGER, note TEXT, UNIQUE(session_id, seq));
+             CREATE TABLE manifests(id INTEGER PRIMARY KEY, action_id INTEGER NOT NULL,
+                path TEXT NOT NULL, manifest_json TEXT NOT NULL, hashes TEXT NOT NULL,
+                truncated INTEGER NOT NULL);
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        // one v1 action with one v1 manifest
+        conn.execute(
+            "INSERT INTO sessions(id, harness, cwd, started_at_ms) VALUES ('s1','claude-code','/p',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO actions(session_id, seq, kind, raw_command, effect, status, started_at_ms)
+             VALUES ('s1', 1, 'command', 'rm x', 'destructive', 'completed', 1)",
+            [],
+        )
+        .unwrap();
+        let m = manifest_with_content(tmp.path(), "legacy.txt", "v1 era bytes");
+        conn.execute(
+            "INSERT INTO manifests(action_id, path, manifest_json, hashes, truncated)
+             VALUES (1, ?1, ?2, '[]', 0)",
+            rusqlite::params![m.path.to_string_lossy(), serde_json::to_string(&m).unwrap()],
+        )
+        .unwrap();
+    }
+
+    let j = Journal::open(&db).unwrap(); // migrates 1 -> 2
+    let pre = j.manifests_by_role(1, ManifestRole::Pre).unwrap();
+    assert_eq!(pre.len(), 1, "legacy manifests default to role=pre");
+    assert!(
+        j.manifests_by_role(1, ManifestRole::Post)
+            .unwrap()
+            .is_empty()
+    );
+    let v: i64 = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, 2);
 }
 
 #[test]
@@ -241,7 +300,7 @@ fn manifest_round_trips_exactly() {
         .start_action(&new_action("s1", "rm фото.jpg", Some("t1")))
         .unwrap();
     let m = manifest_with_content(tmp.path(), "фото 📸.jpg", "precious bytes");
-    j.attach_manifest(a, &m).unwrap();
+    j.attach_manifest(a, &m, ManifestRole::Pre).unwrap();
 
     let stored = j.manifests(a).unwrap();
     assert_eq!(stored.len(), 1);
@@ -259,7 +318,7 @@ fn manifest_from_a_newer_doover_is_refused_loudly() {
         .start_action(&new_action("s1", "rm x", Some("t1")))
         .unwrap();
     let m = manifest_with_content(tmp.path(), "f.txt", "bytes");
-    j.attach_manifest(a, &m).unwrap();
+    j.attach_manifest(a, &m, ManifestRole::Pre).unwrap();
 
     // simulate a future doover having written this manifest
     let conn = rusqlite::Connection::open(&db).unwrap();
@@ -287,7 +346,7 @@ fn legacy_manifest_json_without_schema_field_still_reads() {
         .start_action(&new_action("s1", "rm x", Some("t1")))
         .unwrap();
     let m = manifest_with_content(tmp.path(), "f.txt", "bytes");
-    j.attach_manifest(a, &m).unwrap();
+    j.attach_manifest(a, &m, ManifestRole::Pre).unwrap();
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute(
@@ -678,11 +737,13 @@ fn live_hashes_honor_pins_and_recency() {
 
     let old_unpinned = j.start_action(&new_action("s1", "a", Some("t1"))).unwrap();
     let m1 = mk("f1", "content one");
-    j.attach_manifest(old_unpinned, &m1).unwrap();
+    j.attach_manifest(old_unpinned, &m1, ManifestRole::Pre)
+        .unwrap();
 
     let old_pinned = j.start_action(&new_action("s1", "b", Some("t2"))).unwrap();
     let m2 = mk("f2", "content two");
-    j.attach_manifest(old_pinned, &m2).unwrap();
+    j.attach_manifest(old_pinned, &m2, ManifestRole::Pre)
+        .unwrap();
     j.set_pinned(old_pinned, true).unwrap();
 
     let cutoff = doover_core::journal::now_ms() + 1;
@@ -690,7 +751,7 @@ fn live_hashes_honor_pins_and_recency() {
 
     let recent = j.start_action(&new_action("s1", "c", Some("t3"))).unwrap();
     let m3 = mk("f3", "content three");
-    j.attach_manifest(recent, &m3).unwrap();
+    j.attach_manifest(recent, &m3, ManifestRole::Pre).unwrap();
 
     let live = j.live_hashes(cutoff).unwrap();
     assert!(!live.contains(&h(&m1)), "old + unpinned is collectable");

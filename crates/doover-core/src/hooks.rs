@@ -11,7 +11,7 @@
 //! journal notes instead of errors, so partial protection is recorded rather
 //! than discarded.
 
-use crate::journal::{ActionId, Journal, JournalError, NewAction};
+use crate::journal::{ActionId, Journal, JournalError, ManifestRole, NewAction};
 use crate::registry::Registry;
 use crate::resolver::{Ctx, Severity, resolve};
 use crate::snapshot::{Limits, SnapshotError, Store};
@@ -258,7 +258,7 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
                             ),
                         )?;
                     }
-                    journal.attach_manifest(action, &manifest)?;
+                    journal.attach_manifest(action, &manifest, ManifestRole::Pre)?;
                     attached += 1;
                 }
                 Err(e) => {
@@ -281,5 +281,27 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
 
 pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookError> {
     let journal = open_journal(cfg)?;
-    Ok(journal.complete_by_tool_use(&ev.session_id, &ev.tool_use_id, ev.duration_ms)?)
+    let action = journal.complete_by_tool_use(&ev.session_id, &ev.tool_use_id, ev.duration_ms)?;
+
+    // capture POST state for every path we pre-snapshotted: it is what redo
+    // restores, and the conflict oracle for undo ("is the world still as the
+    // action left it?"). Failures degrade to journal notes — undo still works
+    // from the pre-manifests, just without conflict verification.
+    let pre = journal.manifests_by_role(action, ManifestRole::Pre)?;
+    if !pre.is_empty() {
+        let store = Store::open(cfg.doover_home.join("store"))?;
+        for m in &pre {
+            match store.snapshot(&m.path, Some(&cfg.limits)) {
+                Ok(post) => journal.attach_manifest(action, &post, ManifestRole::Post)?,
+                Err(e) => journal.add_note(
+                    action,
+                    &format!(
+                        "post-state snapshot of {} failed: {e} (redo/conflict checks unavailable)",
+                        m.path.display()
+                    ),
+                )?,
+            }
+        }
+    }
+    Ok(action)
 }

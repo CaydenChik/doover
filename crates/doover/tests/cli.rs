@@ -28,7 +28,7 @@ fn help_lists_all_planned_subcommands() {
 
 #[test]
 fn unimplemented_subcommands_fail_honestly_with_exit_64() {
-    for sub in ["undo", "log", "doctor"] {
+    for sub in ["show", "diff", "doctor"] {
         Command::cargo_bin("doover")
             .unwrap()
             .arg(sub)
@@ -36,6 +36,30 @@ fn unimplemented_subcommands_fail_honestly_with_exit_64() {
             .code(64)
             .stderr(predicate::str::contains("not implemented"));
     }
+}
+
+#[test]
+fn undo_with_no_history_is_a_clear_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("undo")
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("nothing to undo"));
+}
+
+#[test]
+fn log_with_no_history_prints_a_friendly_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("log")
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no journaled actions yet"));
 }
 
 #[test]
@@ -111,12 +135,25 @@ fn hook_pre_then_post_journals_and_completes_through_the_real_binary() {
         .assert()
         .success();
 
+    use doover_core::journal::ManifestRole;
     let j = Journal::open(&dh.join("journal.db")).unwrap();
     let actions = j.session_actions("cli-s1").unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].status, ActionStatus::Completed);
     assert_eq!(actions[0].duration_ms, Some(7));
-    assert_eq!(j.manifests(actions[0].id).unwrap().len(), 1);
+    // pre (before rm) + post (after rm) captured by the real engine
+    assert_eq!(
+        j.manifests_by_role(actions[0].id, ManifestRole::Pre)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        j.manifests_by_role(actions[0].id, ManifestRole::Post)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

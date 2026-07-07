@@ -539,6 +539,62 @@ impl Store {
         ))
     }
 
+    /// Does the CURRENT filesystem state at `manifest.path` match the
+    /// manifest? Content-level comparison: file hashes (with a length
+    /// fast-path), directory presence, symlink targets, fifo presence. Mode
+    /// and mtime are deliberately ignored — metadata-only drift is not a
+    /// conflict. Extra entries under the root or missing entries are
+    /// mismatches, except under a truncated manifest, which compares only
+    /// what it captured (weaker evidence — callers should warn).
+    pub fn state_matches(&self, manifest: &Manifest) -> Result<bool, SnapshotError> {
+        use std::collections::BTreeMap;
+        let root = &manifest.path;
+        if manifest.root == Root::Absent {
+            return Ok(fs::symlink_metadata(root).is_err());
+        }
+        if fs::symlink_metadata(root).is_err() {
+            return Ok(false);
+        }
+        let expected: BTreeMap<&Path, &EntryKind> = manifest
+            .entries
+            .iter()
+            .map(|e| (e.rel.as_path(), &e.kind))
+            .collect();
+        let mut seen = 0usize;
+        for item in walkdir::WalkDir::new(root).sort_by_file_name() {
+            let Ok(item) = item else { return Ok(false) };
+            let rel = item.path().strip_prefix(root).unwrap_or(item.path());
+            let Ok(meta) = fs::symlink_metadata(item.path()) else {
+                return Ok(false);
+            };
+            let Some(kind) = expected.get(rel) else {
+                if manifest.truncated {
+                    continue; // uncaptured region: can't judge
+                }
+                return Ok(false); // extra entry appeared
+            };
+            seen += 1;
+            let ft = meta.file_type();
+            let matches = match kind {
+                EntryKind::Dir { .. } => ft.is_dir() && !ft.is_symlink(),
+                EntryKind::Symlink { target } => {
+                    ft.is_symlink() && fs::read_link(item.path()).is_ok_and(|t| &t == target)
+                }
+                EntryKind::Fifo { .. } => std::os::unix::fs::FileTypeExt::is_fifo(&ft),
+                EntryKind::File { hash, len, .. } => {
+                    ft.is_file()
+                        && !ft.is_symlink()
+                        && meta.len() == *len
+                        && hash_file(item.path())? == *hash
+                }
+            };
+            if !matches {
+                return Ok(false);
+            }
+        }
+        Ok(seen == expected.len())
+    }
+
     /// Probe whether the store's filesystem supports copy-on-write clones.
     pub fn supports_reflink(&self) -> bool {
         let a = self.tmp_path();
