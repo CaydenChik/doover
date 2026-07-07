@@ -37,6 +37,10 @@ pub enum JournalError {
     #[error("cannot undo action {id}: status is {status:?} (must be completed or abandoned)")]
     NotUndoable { id: i64, status: ActionStatus },
     #[error(
+        "cannot undo action {id}: it reverses another undo; run undo on the original action {original} instead"
+    )]
+    UndoTooDeep { id: i64, original: i64 },
+    #[error(
         "manifest was written by a newer doover (schema {found}, this build understands {})",
         crate::snapshot::MANIFEST_SCHEMA
     )]
@@ -343,6 +347,13 @@ impl Journal {
     /// fabricating history. The status check runs INSIDE the transaction, so
     /// racing double-undos admit exactly one winner, and an already-undone
     /// target is refused (redo targets the undo action, not the original).
+    ///
+    /// Chains are bounded by design: undoable targets are command actions and
+    /// first-level undos (redo). Undoing a *redo* is refused with a pointer to
+    /// the original — the same capability with a trivially-consistent state
+    /// machine instead of recursive status cascades (audit round 4). The
+    /// exhaustive small-model test in T4 checks every sequence to depth 4
+    /// against a reference implementation of these rules.
     pub fn record_undo(
         &self,
         session_id: &str,
@@ -359,6 +370,29 @@ impl Journal {
                     id: target,
                     status: target_rec.status,
                 });
+            }
+            if target_rec.kind == ActionKind::Undo {
+                let inner = self.action(
+                    target_rec
+                        .target_action_id
+                        .ok_or(JournalError::ActionNotFound(target))?,
+                )?;
+                if inner.kind == ActionKind::Undo {
+                    // walk to the ultimate command action for the error message
+                    let mut original = inner;
+                    let mut hops = 0;
+                    while original.kind == ActionKind::Undo && hops < 64 {
+                        match original.target_action_id {
+                            Some(t) => original = self.action(t)?,
+                            None => break,
+                        }
+                        hops += 1;
+                    }
+                    return Err(JournalError::UndoTooDeep {
+                        id: target,
+                        original: original.id,
+                    });
+                }
             }
             let seq: i64 = self.conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM actions WHERE session_id = ?1",

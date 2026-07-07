@@ -56,10 +56,22 @@ fn all_fixtures_carry_the_contract_fields() {
             assert!(resp["stderr"].is_string(), "{name}");
             assert!(resp["interrupted"].is_boolean(), "{name}");
             assert!(v["duration_ms"].is_u64(), "{name}");
-            assert!(
-                resp.get("exit_code").is_none() && resp.get("exitCode").is_none(),
-                "{name}: an exit code appeared — the harness contract changed, revisit journal design"
-            );
+            for key in [
+                "exit_code",
+                "exitCode",
+                "exit_status",
+                "exitStatus",
+                "return_code",
+                "returncode",
+                "code",
+                "status",
+            ] {
+                assert!(
+                    resp.get(key).is_none(),
+                    "{name}: `{key}` appeared in tool_response — the harness contract \
+                     changed (exit codes now exist?); revisit the journal's missing-post design"
+                );
+            }
         }
     }
 }

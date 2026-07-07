@@ -62,3 +62,7 @@ confirm green → only then claim done. Build order and per-step test gates are 
   (`curl -H "Authorization: ..."`). Step 7's `gc` needs a journal-row
   retention policy (age-based pruning of old sessions), not just store-hash
   GC. Consider redaction patterns for known secret-bearing flags.
+- **GC retention must not trust the wall clock** (step 7): a backward NTP
+  jump makes recent snapshots look old and collectable — the dangerous
+  direction. Compute the cutoff relative to MAX(started_at_ms) in the
+  journal, not `now()`, or apply generous slack.

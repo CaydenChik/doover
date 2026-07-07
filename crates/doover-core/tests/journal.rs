@@ -431,6 +431,198 @@ fn undoing_a_pending_action_is_refused() {
     );
 }
 
+#[test]
+fn undo_of_a_redo_is_refused_with_pointer_to_the_original() {
+    // audit round 4: cascading status through undo-of-redo chains is where
+    // round 3's fix broke down; the design answer is to bound the chain —
+    // command actions and first-level undos (redo) are undoable, deeper is
+    // refused with guidance
+    let (_tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "rm x", Some("t1")))
+        .unwrap();
+    j.complete_by_tool_use("s1", "t1", 1).unwrap();
+    let u1 = j.record_undo("s1", a).unwrap();
+    let r1 = j.record_undo("s1", u1).unwrap(); // redo — allowed
+
+    let err = j.record_undo("s1", r1).unwrap_err();
+    assert!(
+        err.to_string().contains(&format!("original action {a}")),
+        "refusal must point at the original, got: {err}"
+    );
+    // refusal must not perturb any status
+    assert_eq!(j.action(a).unwrap().status, ActionStatus::Completed);
+    assert_eq!(j.action(u1).unwrap().status, ActionStatus::Undone);
+    assert_eq!(j.action(r1).unwrap().status, ActionStatus::Completed);
+
+    // the sanctioned path still works: undo the original again
+    let u2 = j.record_undo("s1", a).unwrap();
+    assert_eq!(j.action(a).unwrap().status, ActionStatus::Undone);
+    assert_eq!(j.action(u2).unwrap().status, ActionStatus::Completed);
+}
+
+// --- exhaustive small-model check (audit round 4) ---------------------------------
+//
+// Four audit rounds in a row found bugs one step past the hand-picked test
+// paths. For a state machine the structural fix is exhaustive small-model
+// testing: a trivially-correct reference model in the test, every sequence of
+// undo attempts to depth 4, journal behavior compared against the model after
+// every step.
+
+mod small_model {
+    use super::*;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum MStatus {
+        Pending,
+        Completed,
+        Abandoned,
+        Undone,
+    }
+
+    #[derive(Clone)]
+    struct MAction {
+        is_undo: bool,
+        status: MStatus,
+        target: Option<usize>,
+        prior: Option<MStatus>,
+    }
+
+    /// Reference semantics: succeed iff target is completed/abandoned AND is a
+    /// command or a first-level undo; on success append the undo, flip the
+    /// target, and (for redo) restore the original's recorded prior status.
+    fn model_apply(model: &mut Vec<MAction>, t: usize) -> bool {
+        let tr = model[t].clone();
+        if !matches!(tr.status, MStatus::Completed | MStatus::Abandoned) {
+            return false;
+        }
+        if tr.is_undo && model[tr.target.unwrap()].is_undo {
+            return false; // undo of a redo: bounded chain
+        }
+        model.push(MAction {
+            is_undo: true,
+            status: MStatus::Completed,
+            target: Some(t),
+            prior: Some(tr.status),
+        });
+        model[t].status = MStatus::Undone;
+        if tr.is_undo {
+            let original = tr.target.unwrap();
+            model[original].status = tr.prior.unwrap();
+        }
+        true
+    }
+
+    fn to_model_status(s: ActionStatus) -> MStatus {
+        match s {
+            ActionStatus::Pending => MStatus::Pending,
+            ActionStatus::Completed => MStatus::Completed,
+            ActionStatus::Abandoned => MStatus::Abandoned,
+            ActionStatus::Undone => MStatus::Undone,
+        }
+    }
+
+    /// One journal per sequence: a completed, b abandoned, c pending.
+    fn fresh() -> (tempfile::TempDir, Journal, Vec<i64>, Vec<MAction>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = Journal::open(&tmp.path().join("j.db")).unwrap();
+        j.begin_session("s1", "claude-code", "/p").unwrap();
+        let a = j.start_action(&new_action("s1", "a", Some("ta"))).unwrap();
+        j.complete_by_tool_use("s1", "ta", 1).unwrap();
+        let b = j.start_action(&new_action("s1", "b", Some("tb"))).unwrap();
+        let c = j.start_action(&new_action("s1", "c", Some("tc"))).unwrap(); // abandons b
+        let ids = vec![a, b, c];
+        let model = vec![
+            MAction {
+                is_undo: false,
+                status: MStatus::Completed,
+                target: None,
+                prior: None,
+            },
+            MAction {
+                is_undo: false,
+                status: MStatus::Abandoned,
+                target: None,
+                prior: None,
+            },
+            MAction {
+                is_undo: false,
+                status: MStatus::Pending,
+                target: None,
+                prior: None,
+            },
+        ];
+        (tmp, j, ids, model)
+    }
+
+    fn run_sequence(seq: &[usize]) -> Result<(), String> {
+        let (_tmp, j, mut ids, mut model) = fresh();
+        for (step, &t) in seq.iter().enumerate() {
+            if t >= model.len() {
+                return Ok(()); // target doesn't exist yet in this sequence; skip
+            }
+            let expect_ok = model_apply(&mut model, t);
+            let got = j.record_undo("s1", ids[t]);
+            if expect_ok != got.is_ok() {
+                return Err(format!(
+                    "seq {seq:?} step {step}: model says ok={expect_ok}, journal says {got:?}"
+                ));
+            }
+            if let Ok(id) = got {
+                ids.push(id);
+            }
+            for (i, m) in model.iter().enumerate() {
+                let actual = to_model_status(j.action(ids[i]).unwrap().status);
+                if actual != m.status {
+                    return Err(format!(
+                        "seq {seq:?} step {step}: action #{i} model={:?} journal={actual:?}",
+                        m.status
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_undo_sequence_to_depth_4_matches_the_reference_model() {
+        // targets can reference actions created mid-sequence: enumerate over a
+        // generous index space and skip not-yet-existing targets
+        const DEPTH: usize = 4;
+        const MAX_IDX: usize = 7; // 3 initial + up to 4 created
+        let mut failures = Vec::new();
+        let mut checked = 0usize;
+
+        let mut seq = vec![0usize; DEPTH];
+        'outer: loop {
+            if let Err(msg) = run_sequence(&seq) {
+                failures.push(msg);
+                if failures.len() > 5 {
+                    break;
+                }
+            }
+            checked += 1;
+            // odometer increment
+            for d in (0..DEPTH).rev() {
+                seq[d] += 1;
+                if seq[d] < MAX_IDX {
+                    continue 'outer;
+                }
+                seq[d] = 0;
+            }
+            break;
+        }
+        assert!(
+            failures.is_empty(),
+            "journal diverges from the reference model:\n{}",
+            failures.join("\n")
+        );
+        assert!(checked >= 2000, "enumeration shrank: {checked}");
+    }
+}
+
 // --- GC support ------------------------------------------------------------------
 
 #[test]
