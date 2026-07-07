@@ -439,6 +439,19 @@ impl Journal {
         result
     }
 
+    /// Append a note line to an action (used for loud protection-gap records:
+    /// truncated snapshots, per-path failures).
+    pub fn add_note(&self, action: ActionId, note: &str) -> Result<(), JournalError> {
+        let n = self.conn.execute(
+            "UPDATE actions SET note = COALESCE(note || char(10), '') || ?2 WHERE id = ?1",
+            rusqlite::params![action, note],
+        )?;
+        if n == 0 {
+            return Err(JournalError::ActionNotFound(action));
+        }
+        Ok(())
+    }
+
     pub fn set_pinned(&self, action: ActionId, pinned: bool) -> Result<(), JournalError> {
         let n = self.conn.execute(
             "UPDATE actions SET pinned = ?2 WHERE id = ?1",

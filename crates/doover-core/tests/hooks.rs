@@ -1,0 +1,300 @@
+//! T6 — hook engine (doover-implementation-plan.md §3). Written before the
+//! hooks module exists; drives its design.
+//!
+//! The engine is the composition point: parse harness JSON → resolve scope →
+//! snapshot (ALWAYS under limits — carried-forward requirement) → journal.
+//! Fail-open lives in the binary; the library surfaces honest errors.
+
+use doover_core::hooks::{self, HookConfig, UnknownPolicy};
+use doover_core::journal::{ActionStatus, Journal};
+use doover_core::snapshot::Limits;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+struct Rig {
+    _tmp: tempfile::TempDir,
+    cfg: HookConfig,
+    cwd: PathBuf,
+}
+
+fn rig() -> Rig {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let cfg = HookConfig {
+        doover_home: tmp.path().join(".doover"),
+        home,
+        limits: Limits {
+            max_files: 100_000,
+            max_bytes: 5 * 1024 * 1024 * 1024,
+        },
+        unknown_policy: UnknownPolicy::SnapshotCwd,
+    };
+    Rig {
+        _tmp: tmp,
+        cfg,
+        cwd,
+    }
+}
+
+fn pre_json(session: &str, tool_use: &str, cwd: &Path, command: &str) -> String {
+    serde_json::json!({
+        "session_id": session,
+        "transcript_path": "/tmp/t.jsonl",
+        "cwd": cwd.to_string_lossy(),
+        "permission_mode": "default",
+        "hook_event_name": "PreToolUse",
+        "prompt_id": "p-1",
+        "tool_name": "Bash",
+        "tool_use_id": tool_use,
+        "tool_input": { "command": command }
+    })
+    .to_string()
+}
+
+fn post_json(session: &str, tool_use: &str, cwd: &Path, command: &str) -> String {
+    serde_json::json!({
+        "session_id": session,
+        "transcript_path": "/tmp/t.jsonl",
+        "cwd": cwd.to_string_lossy(),
+        "permission_mode": "default",
+        "hook_event_name": "PostToolUse",
+        "prompt_id": "p-1",
+        "tool_name": "Bash",
+        "tool_use_id": tool_use,
+        "duration_ms": 42,
+        "tool_input": { "command": command },
+        "tool_response": { "stdout": "", "stderr": "", "interrupted": false }
+    })
+    .to_string()
+}
+
+fn journal(cfg: &HookConfig) -> Journal {
+    Journal::open(&cfg.doover_home.join("journal.db")).unwrap()
+}
+
+// --- golden fixtures parse through the real event parser -------------------------
+
+#[test]
+fn all_golden_fixtures_parse() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/hook-events");
+    let mut pre = 0;
+    let mut post = 0;
+    for entry in fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let text = fs::read_to_string(entry.path()).unwrap();
+        if name.starts_with("pre_") {
+            let e = hooks::parse_pre_event(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(!e.command.is_empty(), "{name}");
+            assert!(e.cwd.is_absolute(), "{name}");
+            pre += 1;
+        } else {
+            let e = hooks::parse_post_event(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(e.duration_ms > 0, "{name}");
+            post += 1;
+        }
+    }
+    assert!(
+        pre >= 5 && post >= 3,
+        "fixture set shrank: {pre} pre / {post} post"
+    );
+}
+
+// --- pre: journal + snapshot behavior --------------------------------------------
+
+#[test]
+fn destructive_pre_snapshots_under_limits_and_journals() {
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("build")).unwrap();
+    fs::write(r.cwd.join("build/a.txt"), "A").unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf build")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let j = journal(&r.cfg);
+    let actions = j.session_actions("s1").unwrap();
+    assert_eq!(actions.len(), 1);
+    let a = &actions[0];
+    assert_eq!(a.status, ActionStatus::Pending);
+    assert_eq!(a.effect, "destructive");
+    assert_eq!(a.rule_id.as_deref(), Some("coreutils.rm"));
+    assert!(!a.has_unknown);
+
+    let manifests = j.manifests(a.id).unwrap();
+    assert_eq!(manifests.len(), 1, "one scoped path, one manifest");
+    assert!(manifests[0].entries.len() >= 2, "dir + file captured");
+}
+
+#[test]
+fn safe_pre_journals_without_snapshotting() {
+    let r = rig();
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "ls -la")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    assert_eq!(a.effect, "safe");
+    assert!(
+        j.manifests(a.id).unwrap().is_empty(),
+        "safe actions snapshot nothing"
+    );
+}
+
+#[test]
+fn unknown_pre_snapshots_cwd_bounded() {
+    let r = rig();
+    fs::write(r.cwd.join("work.txt"), "state").unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "eval \"$CLEANUP\"")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    assert!(a.has_unknown);
+    let manifests = j.manifests(a.id).unwrap();
+    assert_eq!(manifests.len(), 1, "unknown policy snapshots the cwd");
+    assert_eq!(manifests[0].path, r.cwd);
+}
+
+#[test]
+fn unknown_passthrough_policy_skips_the_cwd_snapshot() {
+    let mut r = rig();
+    r.cfg.unknown_policy = UnknownPolicy::Passthrough;
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "eval \"$CLEANUP\"")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    assert!(a.has_unknown, "the gap is still journaled loudly");
+    assert!(j.manifests(a.id).unwrap().is_empty());
+}
+
+/// Carried-forward requirement: limits apply to KNOWN-destructive scopes, not
+/// just the unknown policy — and truncation is a loud, journaled gap.
+#[test]
+fn limits_bound_known_destructive_scopes_and_note_the_gap() {
+    let mut r = rig();
+    r.cfg.limits = Limits {
+        max_files: 3,
+        max_bytes: u64::MAX,
+    };
+    fs::create_dir_all(r.cwd.join("big")).unwrap();
+    for i in 0..10 {
+        fs::write(r.cwd.join(format!("big/f{i}.txt")), "x").unwrap();
+    }
+
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf big")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    let manifests = j.manifests(a.id).unwrap();
+    assert!(manifests[0].truncated, "limits must bound the snapshot");
+    assert!(
+        a.note.as_deref().is_some_and(|n| n.contains("truncated")),
+        "truncation must be a loud journaled gap, note: {:?}",
+        a.note
+    );
+}
+
+#[test]
+fn user_registry_overlay_is_honored() {
+    let r = rig();
+    let overlay = r.cfg.doover_home.join("registry.d");
+    fs::create_dir_all(&overlay).unwrap();
+    fs::write(
+        overlay.join("custom.yaml"),
+        "rules:\n  - id: my.nuke\n    match: { command: nuke }\n    effect: destructive\n    scope: { paths: positional }\n    undo: snapshot-restore\n",
+    )
+    .unwrap();
+    fs::write(r.cwd.join("data.txt"), "x").unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "nuke data.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    assert_eq!(a.rule_id.as_deref(), Some("my.nuke"));
+    assert_eq!(j.manifests(a.id).unwrap().len(), 1);
+}
+
+// --- post ------------------------------------------------------------------------
+
+#[test]
+fn post_completes_the_pending_action_by_tool_use_id() {
+    let r = rig();
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t9", &r.cwd, "ls")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let post = hooks::parse_post_event(&post_json("s1", "t9", &r.cwd, "ls")).unwrap();
+    hooks::handle_post(&r.cfg, &post).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    assert_eq!(a.status, ActionStatus::Completed);
+    assert_eq!(a.duration_ms, Some(42));
+}
+
+#[test]
+fn post_without_matching_pre_is_an_error_for_the_bin_to_fail_open() {
+    let r = rig();
+    let post = hooks::parse_post_event(&post_json("s1", "ghost", &r.cwd, "ls")).unwrap();
+    assert!(hooks::handle_post(&r.cfg, &post).is_err());
+}
+
+// --- parsing robustness ------------------------------------------------------------
+
+#[test]
+fn malformed_and_foreign_events_error_cleanly() {
+    assert!(hooks::parse_pre_event("{ not json").is_err());
+    assert!(hooks::parse_pre_event("{}").is_err());
+    // a non-Bash tool event must be recognized as not-ours, not misparsed
+    let foreign = serde_json::json!({
+        "session_id": "s", "cwd": "/tmp", "hook_event_name": "PreToolUse",
+        "tool_name": "Edit", "tool_use_id": "t",
+        "tool_input": { "file_path": "/tmp/x" }
+    })
+    .to_string();
+    let parsed = hooks::parse_pre_event(&foreign);
+    assert!(
+        parsed.is_err() || parsed.is_ok_and(|e| e.tool_name != "Bash"),
+        "foreign tools must be distinguishable"
+    );
+}
+
+/// The end-to-end promise, driven through the REAL engine: pre → the actual
+/// rm runs → restore from the journaled manifests brings the data back.
+#[test]
+fn engine_snapshots_are_sufficient_to_undo_the_real_command() {
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("photos")).unwrap();
+    fs::write(r.cwd.join("photos/one.jpg"), "memories").unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf photos")).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    let st = std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-c", "rm -rf photos"])
+        .current_dir(&r.cwd)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(!r.cwd.join("photos/one.jpg").exists());
+
+    // restore straight from what the engine journaled
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    let store = doover_core::snapshot::Store::open(r.cfg.doover_home.join("store")).unwrap();
+    for m in j.manifests(a.id).unwrap() {
+        store.restore(&m).unwrap();
+    }
+    assert_eq!(
+        fs::read_to_string(r.cwd.join("photos/one.jpg")).unwrap(),
+        "memories"
+    );
+}

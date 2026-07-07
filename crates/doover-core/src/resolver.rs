@@ -48,6 +48,19 @@ pub enum Severity {
     Irreversible,
 }
 
+impl Severity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Safe => "safe",
+            Severity::Mutating => "mutating",
+            Severity::Externalizing => "externalizing",
+            Severity::Unknown => "unknown",
+            Severity::Destructive => "destructive",
+            Severity::Irreversible => "irreversible",
+        }
+    }
+}
+
 impl From<Effect> for Severity {
     fn from(e: Effect) -> Self {
         match e {

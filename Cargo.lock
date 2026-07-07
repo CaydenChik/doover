@@ -437,7 +437,10 @@ version = "0.0.1"
 dependencies = [
  "assert_cmd",
  "clap",
+ "doover-core",
  "predicates",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
