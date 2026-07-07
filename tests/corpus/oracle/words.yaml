@@ -51,3 +51,7 @@ words:
   - { word: "*", cwd_fixture: [".hidden", "visible.txt", "also.txt"] }
   - { word: ".*", cwd_fixture: [".hidden", ".config", "visible.txt"] }
   - { word: ".h*", cwd_fixture: [".hidden", ".hxyz", "other.txt"] }
+  # middle-component leading-dot rule (audit round 6): a `*` in any position
+  # excludes hidden components, not just the last
+  - { word: "*/f.txt", cwd_fixture: ["vis/f.txt", ".hid/f.txt"] }
+  - { word: "*/*", cwd_fixture: ["vis/a.txt", ".hid/b.txt"] }

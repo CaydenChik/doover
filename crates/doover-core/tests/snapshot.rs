@@ -402,6 +402,33 @@ fn unreadable_subdir_warns_instead_of_failing_snapshot() {
     );
 }
 
+// --- limits (audit round 6: max_bytes was never exercised) -----------------------
+
+#[test]
+fn max_bytes_limit_truncates() {
+    let j = jail();
+    let d = j.world.join("big");
+    for i in 0..10 {
+        write(&d.join(format!("f{i}.bin")), &"x".repeat(1000));
+    }
+    let limits = Limits {
+        max_files: u64::MAX,
+        max_bytes: 2500,
+    };
+    let m = j.store.snapshot(&d, Some(&limits)).unwrap();
+    assert!(m.truncated, "byte budget exceeded must set truncated");
+    assert!(m.skipped > 0);
+    let bytes: u64 = m
+        .entries
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntryKind::File { len, .. } => Some(*len),
+            _ => None,
+        })
+        .sum();
+    assert!(bytes <= 2500, "captured {bytes} bytes over a 2500 budget");
+}
+
 // --- round-2 audit regressions ---------------------------------------------------
 
 #[test]

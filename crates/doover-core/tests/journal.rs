@@ -79,6 +79,22 @@ fn resumed_session_updates_cwd() {
 }
 
 #[test]
+fn a_future_schema_journal_refuses_to_open() {
+    // journals outlive binaries: a DB written by a newer doover must refuse,
+    // not silently operate on a schema it doesn't understand (audit round 6)
+    let (_tmp, db) = mem_paths();
+    drop(Journal::open(&db).unwrap());
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .pragma_update(None, "user_version", 999)
+        .unwrap();
+    match Journal::open(&db) {
+        Ok(_) => panic!("a future-schema journal must refuse to open"),
+        Err(e) => assert!(e.to_string().contains("newer"), "got: {e}"),
+    }
+}
+
+#[test]
 fn garbage_file_is_a_clear_error_not_a_panic() {
     let (_tmp, db) = mem_paths();
     std::fs::write(&db, "this is not a sqlite database, honest").unwrap();

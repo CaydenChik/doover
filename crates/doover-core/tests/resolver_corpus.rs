@@ -39,6 +39,14 @@ fn corpus_dir() -> PathBuf {
 
 fn build_fixture(jail: &Path, entries: &[String]) {
     for entry in entries {
+        // symlink syntax: "@link-name -> target"
+        if let Some(rest) = entry.strip_prefix('@') {
+            let (name, target) = rest.split_once(" -> ").expect("bad @symlink syntax");
+            let link = jail.join(name.trim());
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target.trim(), &link).unwrap();
+            continue;
+        }
         let path = jail.join(entry);
         if entry.ends_with('/') {
             std::fs::create_dir_all(&path).unwrap();

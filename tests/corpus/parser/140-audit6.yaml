@@ -1,0 +1,24 @@
+# T1 corpus — round-6 audit (2026-07-07).
+
+cases:
+  # Trailing slash on a symlink-to-directory dereferences: `rm -rf link/`
+  # deletes the TARGET's contents, which doover cannot statically scope from
+  # the lexical path. Fail safe → unknown (the cwd-snapshot fallback covers it)
+  # rather than snapshot only the link and claim coverage (silent data loss).
+  - name: trailing-slash-symlink-is-unknown
+    cmd: "rm -rf link/"
+    cwd_fixture: ["real-dir/", "@link -> real-dir"]
+    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.rm }
+
+  # A plain trailing slash on a real directory is fine — no dereference.
+  - name: trailing-slash-real-dir-is-scoped
+    cmd: "rm -rf builddir/"
+    cwd_fixture: ["builddir/"]
+    expect: { effect: destructive, paths: ["builddir"], rule: coreutils.rm }
+
+  # Middle-component glob must not match hidden directories (bash parity):
+  # `*/f.txt` matches vis/f.txt but not .hid/f.txt.
+  - name: middle-component-glob-excludes-hidden-dir
+    cmd: "rm -- */f.txt"
+    cwd_fixture: ["vis/f.txt", ".hid/f.txt"]
+    expect: { effect: destructive, paths: ["vis/f.txt"], rule: coreutils.rm }

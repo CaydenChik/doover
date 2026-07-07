@@ -577,6 +577,14 @@ impl Walker<'_> {
 
         let active_glob = rem.iter().any(|(c, exp)| *exp && GLOB_CHARS.contains(c));
         if !(globs && active_glob) {
+            // a trailing slash on a symlink dereferences it: `rm -rf link/`
+            // deletes the target's *contents*, which we cannot statically
+            // scope from the lexical path — fail safe to unknown rather than
+            // snapshot only the link and claim coverage (audit round 6)
+            if rem_text.ends_with('/') && literal.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
+                self.out.mark_unknown();
+                return 0;
+            }
             self.out.paths.insert(literal);
             return 1;
         }
@@ -595,34 +603,27 @@ impl Walker<'_> {
                 pattern.push(*c);
             }
         }
-        // bash parity for leading dots (audit round 5): a glob component
-        // matches a hidden entry only when the pattern's own last component
-        // literally begins with `.`. The glob crate's
-        // require_literal_leading_dot is unreliable (misses `.h*`), so we glob
-        // permissively and filter by bash's rule ourselves.
-        let last_component_is_dotted = rem_text
-            .rsplit('/')
-            .next()
-            .is_some_and(|c| c.starts_with('.'));
+        // bash parity for leading dots (audit rounds 5 & 6): a `*`/`?`/`[`
+        // matches a hidden component only when the *corresponding pattern
+        // component* literally begins with `.` — and this holds for EVERY
+        // component, not just the last (`*/f.txt` must not descend `.hidden/`).
+        // The glob crate's require_literal_leading_dot is unreliable (misses
+        // `.h*`), so we glob permissively and filter per-component ourselves.
+        let base_prefix = base.as_ref().map(|b| format!("{}/", b.to_string_lossy()));
+        let pat_components: Vec<&str> = rem_text.trim_matches('/').split('/').collect();
         match glob::glob(&pattern) {
             Ok(matches) => {
                 let mut n = 0usize;
                 for m in matches.take(10_000).flatten() {
-                    // use the RAW trailing component: Path::file_name()
-                    // normalizes `.`/`..` away, which would let them through
-                    let raw = m.to_string_lossy();
-                    let base = raw.rsplit('/').next().unwrap_or(&raw);
-                    // `.*` yields readdir's `.` and `..`, resolving to the
-                    // directory itself and its PARENT — rm cannot act on them
-                    // and capturing `..` would scope an entire parent tree
-                    if base == "." || base == ".." {
-                        continue;
+                    let m_str = m.to_string_lossy();
+                    let relative = match &base_prefix {
+                        Some(p) => m_str.strip_prefix(p.as_str()).unwrap_or(&m_str),
+                        None => m_str.trim_start_matches('/'),
+                    };
+                    if glob_match_allowed(relative, &pat_components) {
+                        self.out.paths.insert(normalize_lexical(&m));
+                        n += 1;
                     }
-                    if base.starts_with('.') && !last_component_is_dotted {
-                        continue; // bare `*` doesn't match hidden entries
-                    }
-                    self.out.paths.insert(normalize_lexical(&m));
-                    n += 1;
                 }
                 n
             }
@@ -979,6 +980,25 @@ fn parse_range(inner: &str, limit: usize) -> Option<Option<Vec<String>>> {
         }));
     }
     None
+}
+
+/// Bash leading-dot rule per component: a matched path component that begins
+/// with `.` is allowed only when the aligned pattern component also begins
+/// with a literal `.`. `.` and `..` pseudo-entries are always rejected (rm
+/// can't act on them; `..` would scope a parent tree).
+fn glob_match_allowed(relative: &str, pat_components: &[&str]) -> bool {
+    for (i, comp) in relative.split('/').enumerate() {
+        if comp == "." || comp == ".." {
+            return false;
+        }
+        if comp.starts_with('.') {
+            let pat_dotted = pat_components.get(i).is_some_and(|p| p.starts_with('.'));
+            if !pat_dotted {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
