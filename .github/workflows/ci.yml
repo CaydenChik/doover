@@ -50,8 +50,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # Only doover-core is checked: it embeds the registry via include_str!, so
+      # a moved/renamed data file breaks packaging silently — the regression
+      # this gate exists to catch. The `doover` binary depends on the still-
+      # unpublished doover-core, so cargo cannot resolve/package it until
+      # doover-core ships to crates.io; re-add its dry-run at that point.
       - run: cargo publish --dry-run -p doover-core
-      - run: cargo publish --dry-run -p doover --allow-dirty
 
   # Non-gating coverage visibility: "comprehensive" claims should be
   # inspectable, not asserted. Prints a per-file summary; never fails the build
