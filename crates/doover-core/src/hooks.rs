@@ -162,10 +162,16 @@ pub struct PreOutcome {
 }
 
 impl PreOutcome {
-    /// True when the binary should emit a loud (but non-blocking) warning: a
-    /// destructive-or-worse action whose protection is incomplete.
+    /// True when the binary should emit a loud (but non-blocking) warning: any
+    /// protection gap at all. `gaps` is only ever populated when a snapshot was
+    /// ATTEMPTED (a destructive scope, or the defensive cwd snapshot for an
+    /// unknown command) and it failed or truncated — so a non-empty `gaps`
+    /// always means "we tried to protect you and couldn't fully." Gating this
+    /// on `severity >= Destructive` (as the first cut did) wrongly silenced the
+    /// unknown path, which is exactly where we defend BECAUSE the command might
+    /// be destructive. Safe/mutating commands never snapshot, so never warn.
     pub fn needs_warning(&self) -> bool {
-        self.severity >= Severity::Destructive && !self.gaps.is_empty()
+        !self.gaps.is_empty()
     }
 }
 

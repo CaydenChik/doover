@@ -297,6 +297,33 @@ fn truncated_snapshot_of_a_destructive_action_is_a_gap() {
     );
 }
 
+#[test]
+fn unknown_command_with_a_truncated_defensive_snapshot_warns() {
+    // the dual of the round-9 fix: an UNKNOWN command snapshots the cwd
+    // defensively BECAUSE it might be destructive. If that snapshot is
+    // incomplete, the warning must fire even though severity < Destructive.
+    let mut r = rig();
+    r.cfg.limits = Limits {
+        max_files: 2,
+        max_bytes: u64::MAX,
+    };
+    for i in 0..10 {
+        fs::write(r.cwd.join(format!("f{i}.txt")), "x").unwrap();
+    }
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "eval \"$CLEANUP\"")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+
+    assert_eq!(outcome.severity, doover_core::resolver::Severity::Unknown);
+    assert!(
+        !outcome.gaps.is_empty(),
+        "truncated defensive snapshot is a gap"
+    );
+    assert!(
+        outcome.needs_warning(),
+        "an unknown command's incomplete defensive snapshot MUST warn (severity < Destructive)"
+    );
+}
+
 // --- post ------------------------------------------------------------------------
 
 #[test]
