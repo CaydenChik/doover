@@ -440,7 +440,9 @@ impl Walker<'_> {
         let mut contributed = self.extract_scope(rule, &positionals, cur);
         if let Some(scope) = &rule.scope {
             for pv in &flag_paths {
-                contributed += self.add_path(pv, scope.globs, cur);
+                // path-flag values (e.g. `sort -o out`) are write targets:
+                // a symlink there is written through
+                contributed += self.add_path(pv, scope.globs, cur, true);
             }
         }
         if sev >= Severity::Destructive && contributed == 0 {
@@ -491,17 +493,17 @@ impl Walker<'_> {
         match scope.paths {
             PathSource::Positional => {
                 for word in path_args {
-                    contributed += self.add_path(word, scope.globs, cur);
+                    contributed += self.add_path(word, scope.globs, cur, false);
                 }
             }
             PathSource::PositionalLast => {
                 if let Some(word) = path_args.last() {
-                    contributed += self.add_path(word, scope.globs, cur);
+                    contributed += self.add_path(word, scope.globs, cur, false);
                 }
             }
             PathSource::Repo => {
                 if let Some(root) = cur.as_deref().and_then(find_repo_root) {
-                    self.insert_scoped(root);
+                    self.insert_scoped(root, false);
                     contributed += 1;
                 }
             }
@@ -513,7 +515,17 @@ impl Walker<'_> {
     /// Resolve one path word, applying bash expansion order — brace, then
     /// tilde/normalize, then glob — each step honoring the quote mask.
     /// Returns how many paths were added.
-    fn add_path(&mut self, word: &Word, globs: bool, cur: &Option<PathBuf>) -> usize {
+    /// `write_target` marks a value that will be WRITTEN through (redirect and
+    /// path-flag targets), so a symlink there is always dereferenced. For
+    /// ordinary positional args, dereferencing is decided per variant by a
+    /// trailing `/` or `/.` (see [`Self::add_single`]).
+    fn add_path(
+        &mut self,
+        word: &Word,
+        globs: bool,
+        cur: &Option<PathBuf>,
+        write_target: bool,
+    ) -> usize {
         if word.segs.is_empty() && !word.tilde_home {
             return 0;
         }
@@ -532,7 +544,7 @@ impl Walker<'_> {
         };
         let mut total = 0;
         for variant in expanded {
-            total += self.add_single(&variant, word.tilde_home, globs, cur);
+            total += self.add_single(&variant, word.tilde_home, globs, cur, write_target);
         }
         total
     }
@@ -545,9 +557,16 @@ impl Walker<'_> {
         tilde_home: bool,
         globs: bool,
         cur: &Option<PathBuf>,
+        write_target: bool,
     ) -> usize {
         let text: String = chars.iter().map(|(c, _)| c).collect();
         if text.is_empty() && !tilde_home {
+            return 0;
+        }
+        // `link/..` addresses the target's PARENT (deref then up): unbounded
+        // scope we can't safely enumerate — fail to unknown
+        if text.ends_with("/..") {
+            self.out.mark_unknown();
             return 0;
         }
 
@@ -577,7 +596,11 @@ impl Walker<'_> {
 
         let active_glob = rem.iter().any(|(c, exp)| *exp && GLOB_CHARS.contains(c));
         if !(globs && active_glob) {
-            self.insert_scoped(literal);
+            // dereference a symlink only when the usage actually goes through
+            // it: a write target, or a trailing `/` or `/.` (operates on the
+            // target dir). A bare `rm link` scopes only the link (round 8).
+            let derefs = write_target || rem_text.ends_with('/') || rem_text.ends_with("/.");
+            self.insert_scoped(literal, derefs);
             return 1;
         }
 
@@ -613,32 +636,34 @@ impl Walker<'_> {
                         None => m_str.trim_start_matches('/'),
                     };
                     if glob_match_allowed(relative, &pat_components) {
-                        self.insert_scoped(normalize_lexical(&m));
+                        // a glob match is a concrete entry; rm removes the link
+                        // itself, not its target — no deref
+                        self.insert_scoped(normalize_lexical(&m), false);
                         n += 1;
                     }
                 }
                 n
             }
             Err(_) => {
-                self.insert_scoped(literal);
+                self.insert_scoped(literal, false);
                 1
             }
         }
     }
 
-    /// Record a scoped path — and, when it is a symlink, its resolved
-    /// target(s) too (audit round 7). Operations act THROUGH links more often
-    /// than on them: `> linkfile` clobbers the target's content, `rm -rf
-    /// link/` (or `link/.`) deletes the target directory. Scoping both sides
-    /// keeps those certain and recoverable; for a plain `rm link` the extra
-    /// target scope is harmless over-capture. `read_link` (not canonicalize)
-    /// so dangling links scope their would-be-created target as an
-    /// absent-marker. Chain hops are capped; loops simply stop contributing.
-    fn insert_scoped(&mut self, path: PathBuf) {
+    /// Record a scoped path. When `deref` and the path is a symlink, also scope
+    /// its resolved target chain — operations that go THROUGH a link act on the
+    /// target: `> linkfile` clobbers the target's content, `rm -rf link/` (or
+    /// `link/.`) deletes the target directory. `deref` is false for a bare
+    /// `rm link`, which touches only the link (round 8: unconditional deref
+    /// pulled whole target trees into the store). `read_link` (not
+    /// canonicalize) so dangling links scope their would-be-created target as
+    /// an absent-marker. Chain hops are capped; loops simply stop contributing.
+    fn insert_scoped(&mut self, path: PathBuf, deref: bool) {
         let mut hops = 0;
         let mut cur = path;
         loop {
-            let is_link = cur.symlink_metadata().is_ok_and(|m| m.is_symlink());
+            let is_link = deref && cur.symlink_metadata().is_ok_and(|m| m.is_symlink());
             self.out.paths.insert(cur.clone());
             if !is_link || hops >= 8 {
                 return;
@@ -770,9 +795,9 @@ impl Walker<'_> {
         };
         self.out.contribute(Severity::from(rule.effect), &rule.id);
         if let Some(p) = self.resolve_literal(&word, cur) {
-            // redirects WRITE THROUGH symlinks: insert_scoped adds the
-            // resolved target so its clobbered content is snapshotted
-            self.insert_scoped(p);
+            // redirects WRITE THROUGH symlinks: deref so the clobbered target
+            // content is snapshotted
+            self.insert_scoped(p, true);
         }
     }
 

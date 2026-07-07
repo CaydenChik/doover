@@ -25,10 +25,14 @@ cases:
     cwd_fixture: ["real-dir/data.txt", "@link -> real-dir"]
     expect: { effect: destructive, paths: ["link", "real-dir"], rule: coreutils.rm }
 
-  - name: plain-symlink-rm-overcaptures-target-harmlessly
+  # Round 8 correction: plain `rm link` removes ONLY the link — it must NOT
+  # deref (round 7 over-captured the whole target tree, a scope explosion for
+  # links to huge/sensitive dirs). Deref is now conditional on the usage
+  # actually dereferencing (trailing slash/dot, or a write-through).
+  - name: plain-symlink-rm-scopes-only-the-link
     cmd: "rm link"
     cwd_fixture: ["real-dir/data.txt", "@link -> real-dir"]
-    expect: { effect: destructive, paths: ["link", "real-dir"], rule: coreutils.rm }
+    expect: { effect: destructive, paths: ["link"], rule: coreutils.rm }
 
   - name: dangling-symlink-write-scopes-future-target
     # writing through a dangling link CREATES the target: scoping it records

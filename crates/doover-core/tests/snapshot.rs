@@ -402,6 +402,40 @@ fn unreadable_subdir_warns_instead_of_failing_snapshot() {
     );
 }
 
+// --- hardlink preservation (audit round 8) ---------------------------------------
+
+#[test]
+fn restore_of_hardlinked_file_preserves_the_inode() {
+    use std::os::unix::fs::MetadataExt;
+    let j = jail();
+    let f = j.world.join("original.txt");
+    write(&f, "shared content");
+    let alias = j.world.join("alias.txt");
+    fs::hard_link(&f, &alias).unwrap();
+    let inode_before = fs::metadata(&f).unwrap().ino();
+
+    let m = snap(&j.store, &f, None);
+    // truncate through the shared inode (as `> alias` would)
+    fs::write(&alias, "clobbered via sibling").unwrap();
+    assert_eq!(fs::read_to_string(&f).unwrap(), "clobbered via sibling");
+
+    j.store.restore(&m).unwrap();
+
+    // both names recovered AND still the same inode (link intact)
+    assert_eq!(fs::read_to_string(&f).unwrap(), "shared content");
+    assert_eq!(fs::read_to_string(&alias).unwrap(), "shared content");
+    assert_eq!(
+        fs::metadata(&f).unwrap().ino(),
+        inode_before,
+        "inode must be preserved"
+    );
+    assert_eq!(
+        fs::metadata(&f).unwrap().nlink(),
+        2,
+        "hardlink must survive restore"
+    );
+}
+
 // --- limits (audit round 6: max_bytes was never exercised) -----------------------
 
 #[test]

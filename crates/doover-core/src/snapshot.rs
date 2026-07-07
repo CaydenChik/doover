@@ -12,8 +12,12 @@
 //!
 //! File metadata (mode, mtime, xattrs) lives in the [`Manifest`], not in the
 //! object store — objects are pure content, which is what makes deduplication
-//! sound. Hardlink identity is not preserved: links restore as independent
-//! files with identical content.
+//! sound. Hardlink identity WITHIN a snapshotted directory tree is not
+//! preserved (linked files restore as independent copies with identical
+//! content — harmless, since both names are captured). But a single-file
+//! restore whose current target still has nlink>1 rewrites content in place to
+//! preserve the shared inode, so a truncating write through one name
+//! (`> alias`) recovers every hardlinked sibling (audit round 8).
 
 use std::fs;
 use std::io;
@@ -350,6 +354,34 @@ impl Store {
             return Ok(report);
         }
 
+        // Hardlink preservation: if the manifest is a single regular file and
+        // the current target is still a regular file with more than one link,
+        // stage-then-swap would rebuild a FRESH inode and orphan the sibling
+        // names (which a truncating write like `> alias` clobbered through the
+        // shared inode). Rewrite the content IN PLACE so every hardlinked name
+        // recovers. Restore of a recovery is acceptable to do non-atomically —
+        // the pre-restore state is already the clobbered content.
+        if let [entry] = manifest.entries.as_slice() {
+            if entry.rel.as_os_str().is_empty() {
+                if let EntryKind::File {
+                    hash, mode, mtime, ..
+                } = &entry.kind
+                {
+                    if fs::symlink_metadata(target_root)
+                        .ok()
+                        .filter(|m| m.file_type().is_file())
+                        .map(|m| std::os::unix::fs::MetadataExt::nlink(&m))
+                        .is_some_and(|n| n > 1)
+                    {
+                        let object = self.object_path(hash);
+                        self.write_in_place(target_root, &object, *mode, *mtime)?;
+                        report.files_restored += 1;
+                        return Ok(report);
+                    }
+                }
+            }
+        }
+
         let parent = target_root
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -465,6 +497,37 @@ impl Store {
             fs::set_permissions(&dir, fs::Permissions::from_mode(mode))
                 .map_err(|e| io_err(&dir, e))?;
         }
+        Ok(())
+    }
+
+    /// Truncate-and-rewrite an existing file's content without replacing its
+    /// inode, so hardlinked siblings recover too. Only used on the nlink>1
+    /// path; the object bytes are read from the (already hash-verified) store.
+    fn write_in_place(
+        &self,
+        dest: &Path,
+        object: &Path,
+        mode: u32,
+        mtime: SystemTime,
+    ) -> Result<(), SnapshotError> {
+        // ensure we can open for writing regardless of the clobbered mode
+        fs::set_permissions(dest, fs::Permissions::from_mode(0o600))
+            .map_err(|e| io_err(dest, e))?;
+        let bytes = fs::read(object).map_err(|e| io_err(object, e))?;
+        let fh = fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(dest)
+            .map_err(|e| io_err(dest, e))?;
+        {
+            use std::io::Write;
+            let mut w = &fh;
+            w.write_all(&bytes).map_err(|e| io_err(dest, e))?;
+        }
+        fh.set_times(fs::FileTimes::new().set_modified(mtime))
+            .map_err(|e| io_err(dest, e))?;
+        drop(fh);
+        fs::set_permissions(dest, fs::Permissions::from_mode(mode)).map_err(|e| io_err(dest, e))?;
         Ok(())
     }
 

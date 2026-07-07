@@ -29,6 +29,10 @@ impl World {
         normalize_lexical(self.tmp.path())
     }
 
+    fn store_object_count(&self) -> u64 {
+        self.store.object_count().unwrap()
+    }
+
     /// Resolve, snapshot the scoped paths, run the command for real in cwd,
     /// then restore. Returns whether the resolver claimed certainty.
     fn run_and_undo(&self, command: &str) -> bool {
@@ -142,6 +146,58 @@ fn write_through_file_symlink_is_certain_and_recoverable() {
         read(&cwd.join("target.txt")).as_deref(),
         Some("precious original"),
         "the clobbered target content must be restored"
+    );
+}
+
+/// Round-8 finding 1 (data loss): a truncating write through a HARDLINK hits
+/// the shared inode, so every name sees the clobber. Restore must recover the
+/// sibling name too, not just the one doover snapshotted.
+#[test]
+fn write_through_hardlink_recovers_all_names() {
+    let w = world();
+    let cwd = w.cwd();
+    fs::write(cwd.join("original.txt"), "precious shared inode").unwrap();
+    fs::hard_link(cwd.join("original.txt"), cwd.join("alias.txt")).unwrap();
+
+    let certain = w.run_and_undo("echo clobbered > alias.txt");
+    assert!(certain);
+    assert_eq!(
+        read(&cwd.join("alias.txt")).as_deref(),
+        Some("precious shared inode")
+    );
+    assert_eq!(
+        read(&cwd.join("original.txt")).as_deref(),
+        Some("precious shared inode"),
+        "the hardlinked sibling shares the inode and must also be restored"
+    );
+}
+
+/// Round-8 finding 2: a plain `rm link` deletes only the link. The target
+/// tree — possibly huge or sensitive — must NOT be copied into the store.
+#[test]
+fn plain_symlink_delete_does_not_snapshot_the_target() {
+    let w = world();
+    let cwd = w.cwd();
+    fs::create_dir_all(cwd.join("real")).unwrap();
+    fs::write(cwd.join("real/secret.key"), "sensitive").unwrap();
+    std::os::unix::fs::symlink("real", cwd.join("link")).unwrap();
+
+    let before = w.store_object_count();
+    let certain = w.run_and_undo("rm link");
+    let after = w.store_object_count();
+    assert!(certain);
+    // a symlink carries no file content: snapshotting only the link adds ZERO
+    // objects. Any growth means the target tree was pulled into the store.
+    assert_eq!(
+        after,
+        before,
+        "plain rm of a symlink pulled target content into the store ({} new objects)",
+        after - before
+    );
+    assert_eq!(
+        read(&cwd.join("real/secret.key")).as_deref(),
+        Some("sensitive"),
+        "target untouched"
     );
 }
 
