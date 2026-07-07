@@ -501,7 +501,7 @@ impl Walker<'_> {
             }
             PathSource::Repo => {
                 if let Some(root) = cur.as_deref().and_then(find_repo_root) {
-                    self.out.paths.insert(root);
+                    self.insert_scoped(root);
                     contributed += 1;
                 }
             }
@@ -577,15 +577,7 @@ impl Walker<'_> {
 
         let active_glob = rem.iter().any(|(c, exp)| *exp && GLOB_CHARS.contains(c));
         if !(globs && active_glob) {
-            // a trailing slash on a symlink dereferences it: `rm -rf link/`
-            // deletes the target's *contents*, which we cannot statically
-            // scope from the lexical path — fail safe to unknown rather than
-            // snapshot only the link and claim coverage (audit round 6)
-            if rem_text.ends_with('/') && literal.symlink_metadata().is_ok_and(|m| m.is_symlink()) {
-                self.out.mark_unknown();
-                return 0;
-            }
-            self.out.paths.insert(literal);
+            self.insert_scoped(literal);
             return 1;
         }
 
@@ -621,16 +613,52 @@ impl Walker<'_> {
                         None => m_str.trim_start_matches('/'),
                     };
                     if glob_match_allowed(relative, &pat_components) {
-                        self.out.paths.insert(normalize_lexical(&m));
+                        self.insert_scoped(normalize_lexical(&m));
                         n += 1;
                     }
                 }
                 n
             }
             Err(_) => {
-                self.out.paths.insert(literal);
+                self.insert_scoped(literal);
                 1
             }
+        }
+    }
+
+    /// Record a scoped path — and, when it is a symlink, its resolved
+    /// target(s) too (audit round 7). Operations act THROUGH links more often
+    /// than on them: `> linkfile` clobbers the target's content, `rm -rf
+    /// link/` (or `link/.`) deletes the target directory. Scoping both sides
+    /// keeps those certain and recoverable; for a plain `rm link` the extra
+    /// target scope is harmless over-capture. `read_link` (not canonicalize)
+    /// so dangling links scope their would-be-created target as an
+    /// absent-marker. Chain hops are capped; loops simply stop contributing.
+    fn insert_scoped(&mut self, path: PathBuf) {
+        let mut hops = 0;
+        let mut cur = path;
+        loop {
+            let is_link = cur.symlink_metadata().is_ok_and(|m| m.is_symlink());
+            self.out.paths.insert(cur.clone());
+            if !is_link || hops >= 8 {
+                return;
+            }
+            let Ok(target) = std::fs::read_link(&cur) else {
+                return;
+            };
+            let resolved = if target.is_absolute() {
+                normalize_lexical(&target)
+            } else {
+                match cur.parent() {
+                    Some(parent) => normalize_lexical(&parent.join(target)),
+                    None => return,
+                }
+            };
+            if self.out.paths.contains(&resolved) {
+                return; // loop or already scoped
+            }
+            cur = resolved;
+            hops += 1;
         }
     }
 
@@ -742,7 +770,9 @@ impl Walker<'_> {
         };
         self.out.contribute(Severity::from(rule.effect), &rule.id);
         if let Some(p) = self.resolve_literal(&word, cur) {
-            self.out.paths.insert(p);
+            // redirects WRITE THROUGH symlinks: insert_scoped adds the
+            // resolved target so its clobbered content is snapshotted
+            self.insert_scoped(p);
         }
     }
 
@@ -987,12 +1017,19 @@ fn parse_range(inner: &str, limit: usize) -> Option<Option<Vec<String>>> {
 /// with a literal `.`. `.` and `..` pseudo-entries are always rejected (rm
 /// can't act on them; `..` would scope a parent tree).
 fn glob_match_allowed(relative: &str, pat_components: &[&str]) -> bool {
-    for (i, comp) in relative.split('/').enumerate() {
+    // empty components (from `//` in pattern or path) carry no matching
+    // meaning and would misalign the index comparison
+    let pats: Vec<&str> = pat_components
+        .iter()
+        .copied()
+        .filter(|p| !p.is_empty())
+        .collect();
+    for (i, comp) in relative.split('/').filter(|c| !c.is_empty()).enumerate() {
         if comp == "." || comp == ".." {
             return false;
         }
         if comp.starts_with('.') {
-            let pat_dotted = pat_components.get(i).is_some_and(|p| p.starts_with('.'));
+            let pat_dotted = pats.get(i).is_some_and(|p| p.starts_with('.'));
             if !pat_dotted {
                 return false;
             }

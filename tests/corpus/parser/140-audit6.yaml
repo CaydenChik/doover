@@ -1,15 +1,9 @@
 # T1 corpus — round-6 audit (2026-07-07).
+# (The trailing-slash-symlink case moved to 150-audit7.yaml: round 7's
+# unified symlink-deref scoping made it certain-and-covered instead of the
+# round-6 unknown fallback.)
 
 cases:
-  # Trailing slash on a symlink-to-directory dereferences: `rm -rf link/`
-  # deletes the TARGET's contents, which doover cannot statically scope from
-  # the lexical path. Fail safe → unknown (the cwd-snapshot fallback covers it)
-  # rather than snapshot only the link and claim coverage (silent data loss).
-  - name: trailing-slash-symlink-is-unknown
-    cmd: "rm -rf link/"
-    cwd_fixture: ["real-dir/", "@link -> real-dir"]
-    expect: { effect: destructive, paths: [], unknown: true, rule: coreutils.rm }
-
   # A plain trailing slash on a real directory is fine — no dereference.
   - name: trailing-slash-real-dir-is-scoped
     cmd: "rm -rf builddir/"

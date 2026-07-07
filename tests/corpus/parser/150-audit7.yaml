@@ -1,0 +1,49 @@
+# T1 corpus — round-7 audit (2026-07-07): symlink dereference coverage.
+# Unified rule: any scoped path that is a symlink ALSO scopes its resolved
+# target. Writes through links (`> linkfile`) clobber the target's content;
+# deletes with trailing `/` or `/.` act on the target directory. Scoping both
+# sides keeps these CERTAIN and recoverable (round 6 had fallen back to
+# unknown for the trailing-slash case; this supersedes it). For a plain
+# `rm link` the extra target scope is harmless over-capture.
+
+cases:
+  - name: write-through-file-symlink-scopes-target
+    cmd: "echo clobbered > linkfile"
+    cwd_fixture: ["target.txt", "@linkfile -> target.txt"]
+    expect:
+      effect: destructive
+      paths: ["linkfile", "target.txt"]
+      rule: shell.redirect-truncate
+
+  - name: trailing-slash-symlink-scopes-target-dir
+    cmd: "rm -rf link/"
+    cwd_fixture: ["real-dir/data.txt", "@link -> real-dir"]
+    expect: { effect: destructive, paths: ["link", "real-dir"], rule: coreutils.rm }
+
+  - name: trailing-dot-symlink-scopes-target-dir
+    cmd: "rm -rf link/."
+    cwd_fixture: ["real-dir/data.txt", "@link -> real-dir"]
+    expect: { effect: destructive, paths: ["link", "real-dir"], rule: coreutils.rm }
+
+  - name: plain-symlink-rm-overcaptures-target-harmlessly
+    cmd: "rm link"
+    cwd_fixture: ["real-dir/data.txt", "@link -> real-dir"]
+    expect: { effect: destructive, paths: ["link", "real-dir"], rule: coreutils.rm }
+
+  - name: dangling-symlink-write-scopes-future-target
+    # writing through a dangling link CREATES the target: scoping it records
+    # an absent-marker so undo deletes the created file
+    cmd: "echo new > dangler"
+    cwd_fixture: ["@dangler -> ghost.txt"]
+    expect:
+      effect: destructive
+      paths: ["dangler", "ghost.txt"]
+      rule: shell.redirect-truncate
+
+  # empty components (`//`) must not misalign the leading-dot filter; if the
+  # glob engine itself declines the degenerate pattern, the zero-path fallback
+  # keeps it unknown rather than silently unprotected
+  - name: double-slash-dot-glob
+    cmd: "rm -- sub//.f*"
+    cwd_fixture: ["sub/.f1", "sub/g.txt"]
+    expect: { effect: destructive, paths: ["sub/.f1"], rule: coreutils.rm }

@@ -106,13 +106,13 @@ fn glob_delete_is_recoverable() {
     assert_eq!(read(&cwd.join("b.bak")).as_deref(), Some("b.bak"));
 }
 
-/// The load-bearing safety property (audit round 6): a delete THROUGH a
-/// directory symlink destroys data outside the lexical scope. The resolver
-/// must classify it unknown — and this test proves that either the data comes
-/// back OR the resolver admitted uncertainty. It must never be "certain but
-/// unrecoverable".
+/// The load-bearing safety property (audit rounds 6+7): operations THROUGH a
+/// symlink affect data outside the lexical scope. Round 7's unified rule
+/// scopes the resolved target alongside every symlink, so these are now
+/// CERTAIN and fully recoverable — strictly stronger than round 6's
+/// unknown-fallback. "Certain but unrecoverable" remains the forbidden state.
 #[test]
-fn through_symlink_delete_is_never_certain_and_lossy() {
+fn through_symlink_delete_is_certain_and_recoverable() {
     let w = world();
     let cwd = w.cwd();
     fs::create_dir_all(cwd.join("real")).unwrap();
@@ -120,16 +120,28 @@ fn through_symlink_delete_is_never_certain_and_lossy() {
     std::os::unix::fs::symlink("real", cwd.join("link")).unwrap();
 
     let certain = w.run_and_undo("rm -rf link/");
-    let recovered = read(&cwd.join("real/precious.txt")).as_deref() == Some("irreplaceable");
-    assert!(
-        recovered || !certain,
-        "through-symlink delete was reported as a certain scope but the data is gone"
+    assert!(certain, "link + target scoping keeps this a certain scope");
+    assert_eq!(
+        read(&cwd.join("real/precious.txt")).as_deref(),
+        Some("irreplaceable"),
+        "the through-symlink deletion must be fully undone"
     );
-    // our chosen resolution is to fail safe to unknown (so the future hook
-    // engine snapshots the cwd instead); assert that explicitly
-    assert!(
-        !certain,
-        "trailing-slash symlink must be classified unknown"
+}
+
+/// Round-7 twin: WRITES through a file symlink clobber the target's content.
+#[test]
+fn write_through_file_symlink_is_certain_and_recoverable() {
+    let w = world();
+    let cwd = w.cwd();
+    fs::write(cwd.join("target.txt"), "precious original").unwrap();
+    std::os::unix::fs::symlink("target.txt", cwd.join("linkfile")).unwrap();
+
+    let certain = w.run_and_undo("echo clobbered > linkfile");
+    assert!(certain, "redirect to a symlink is a certain scope");
+    assert_eq!(
+        read(&cwd.join("target.txt")).as_deref(),
+        Some("precious original"),
+        "the clobbered target content must be restored"
     );
 }
 
