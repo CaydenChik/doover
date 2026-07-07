@@ -58,3 +58,7 @@ confirm green → only then claim done. Build order and per-step test gates are 
   plainly rather than imply total coverage.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
+- **Journal rows are never GC'd and `raw_command` may embed secrets**
+  (`curl -H "Authorization: ..."`). Step 7's `gc` needs a journal-row
+  retention policy (age-based pruning of old sessions), not just store-hash
+  GC. Consider redaction patterns for known secret-bearing flags.

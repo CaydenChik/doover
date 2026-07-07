@@ -29,15 +29,18 @@ pub enum JournalError {
     Serde(#[from] serde_json::Error),
     #[error("action {0} not found")]
     ActionNotFound(i64),
-    #[error("no pending action with tool_use_id {tool_use_id} in session {session_id}")]
+    #[error("no completable action with tool_use_id {tool_use_id} in session {session_id}")]
     NoPendingForToolUse {
         session_id: String,
         tool_use_id: String,
     },
-    #[error(
-        "cannot undo action {id}: status is {status:?} (must be completed, abandoned, or undone)"
-    )]
+    #[error("cannot undo action {id}: status is {status:?} (must be completed or abandoned)")]
     NotUndoable { id: i64, status: ActionStatus },
+    #[error(
+        "manifest was written by a newer doover (schema {found}, this build understands {})",
+        crate::snapshot::MANIFEST_SCHEMA
+    )]
+    ManifestTooNew { found: u32 },
     #[error(
         "journal schema version {found} is newer than this doover understands ({SCHEMA_VERSION})"
     )]
@@ -70,6 +73,14 @@ impl ActionKind {
 }
 
 impl ActionStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Completed => "completed",
+            Self::Abandoned => "abandoned",
+            Self::Undone => "undone",
+        }
+    }
     fn parse(s: &str) -> Self {
         match s {
             "completed" => Self::Completed,
@@ -103,6 +114,9 @@ pub struct ActionRecord {
     pub has_unknown: bool,
     pub status: ActionStatus,
     pub target_action_id: Option<ActionId>,
+    /// For undo actions: the target's status before it was flipped to
+    /// `undone` — what redo must restore (never a fabricated `completed`).
+    pub target_prior_status: Option<ActionStatus>,
     pub pinned: bool,
     pub started_at_ms: i64,
     pub duration_ms: Option<i64>,
@@ -155,6 +169,7 @@ impl Journal {
                     status TEXT NOT NULL
                         CHECK(status IN ('pending','completed','abandoned','undone')),
                     target_action_id INTEGER REFERENCES actions(id),
+                    target_prior_status TEXT,
                     pinned INTEGER NOT NULL DEFAULT 0,
                     started_at_ms INTEGER NOT NULL,
                     duration_ms INTEGER,
@@ -182,7 +197,7 @@ impl Journal {
     pub fn begin_session(&self, id: &str, harness: &str, cwd: &str) -> Result<(), JournalError> {
         self.conn.execute(
             "INSERT INTO sessions(id, harness, cwd, started_at_ms) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO NOTHING",
+             ON CONFLICT(id) DO UPDATE SET cwd = excluded.cwd",
             rusqlite::params![id, harness, cwd, now_ms()],
         )?;
         Ok(())
@@ -242,9 +257,13 @@ impl Journal {
         let updated: Option<i64> = self
             .conn
             .query_row(
+                // newest matching row only: a duplicated correlation id (e.g.
+                // session replay) must never complete multiple actions
                 "UPDATE actions SET status = 'completed', duration_ms = ?3
-                 WHERE session_id = ?1 AND tool_use_id = ?2
-                   AND status IN ('pending', 'abandoned')
+                 WHERE id = (SELECT id FROM actions
+                             WHERE session_id = ?1 AND tool_use_id = ?2
+                               AND status IN ('pending', 'abandoned')
+                             ORDER BY seq DESC LIMIT 1)
                  RETURNING id",
                 rusqlite::params![session_id, tool_use_id, duration_ms],
                 |r| r.get(0),
@@ -307,30 +326,40 @@ impl Journal {
             .conn
             .prepare("SELECT manifest_json FROM manifests WHERE action_id = ?1 ORDER BY id")?;
         let rows = stmt.query_map([action], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
+        let mut out: Vec<Manifest> = Vec::new();
         for json in rows {
-            out.push(serde_json::from_str(&json?)?);
+            let m: Manifest = serde_json::from_str(&json?)?;
+            if m.schema > crate::snapshot::MANIFEST_SCHEMA {
+                return Err(JournalError::ManifestTooNew { found: m.schema });
+            }
+            out.push(m);
         }
         Ok(out)
     }
 
     /// Record an undo of `target` as a new journaled action. The target flips
-    /// to `undone`; undoing an *undo* additionally flips that undo's own
-    /// target back to `completed` — that is redo, with no history rewritten.
+    /// to `undone`, remembering its prior status on the undo row; undoing an
+    /// *undo* restores that recorded status to the original — redo without
+    /// fabricating history. The status check runs INSIDE the transaction, so
+    /// racing double-undos admit exactly one winner, and an already-undone
+    /// target is refused (redo targets the undo action, not the original).
     pub fn record_undo(
         &self,
         session_id: &str,
         target: ActionId,
     ) -> Result<ActionId, JournalError> {
-        let target_rec = self.action(target)?;
-        if matches!(target_rec.status, ActionStatus::Pending) {
-            return Err(JournalError::NotUndoable {
-                id: target,
-                status: target_rec.status,
-            });
-        }
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<ActionId, JournalError> {
+            let target_rec = self.action(target)?;
+            if matches!(
+                target_rec.status,
+                ActionStatus::Pending | ActionStatus::Undone
+            ) {
+                return Err(JournalError::NotUndoable {
+                    id: target,
+                    status: target_rec.status,
+                });
+            }
             let seq: i64 = self.conn.query_row(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM actions WHERE session_id = ?1",
                 [session_id],
@@ -338,13 +367,14 @@ impl Journal {
             )?;
             self.conn.execute(
                 "INSERT INTO actions(session_id, seq, kind, raw_command, effect,
-                                     status, target_action_id, started_at_ms)
-                 VALUES (?1, ?2, 'undo', ?3, 'destructive', 'completed', ?4, ?5)",
+                                     status, target_action_id, target_prior_status, started_at_ms)
+                 VALUES (?1, ?2, 'undo', ?3, 'destructive', 'completed', ?4, ?5, ?6)",
                 rusqlite::params![
                     session_id,
                     seq,
                     format!("undo of action {target}"),
                     target,
+                    target_rec.status.as_str(),
                     now_ms(),
                 ],
             )?;
@@ -353,12 +383,16 @@ impl Journal {
                 "UPDATE actions SET status = 'undone' WHERE id = ?1",
                 [target],
             )?;
-            // redo semantics: undoing an undo restores ITS target
+            // redo semantics: undoing an undo restores ITS target to the
+            // status the undo recorded — completed stays completed, abandoned
+            // stays abandoned
             if target_rec.kind == ActionKind::Undo {
-                if let Some(original) = target_rec.target_action_id {
+                if let (Some(original), Some(prior)) =
+                    (target_rec.target_action_id, target_rec.target_prior_status)
+                {
                     self.conn.execute(
-                        "UPDATE actions SET status = 'completed' WHERE id = ?1",
-                        [original],
+                        "UPDATE actions SET status = ?2 WHERE id = ?1",
+                        rusqlite::params![original, prior.as_str()],
                     )?;
                 }
             }
@@ -429,7 +463,8 @@ impl Journal {
 }
 
 const SELECT_ACTION: &str = "SELECT id, session_id, seq, kind, tool_use_id, raw_command, effect,
-        rule_id, has_unknown, status, target_action_id, pinned, started_at_ms, duration_ms, note
+        rule_id, has_unknown, status, target_action_id, target_prior_status, pinned,
+        started_at_ms, duration_ms, note
  FROM actions";
 
 fn row_to_action(r: &rusqlite::Row) -> Result<ActionRecord, rusqlite::Error> {
@@ -445,9 +480,12 @@ fn row_to_action(r: &rusqlite::Row) -> Result<ActionRecord, rusqlite::Error> {
         has_unknown: r.get(8)?,
         status: ActionStatus::parse(&r.get::<_, String>(9)?),
         target_action_id: r.get(10)?,
-        pinned: r.get(11)?,
-        started_at_ms: r.get(12)?,
-        duration_ms: r.get(13)?,
-        note: r.get(14)?,
+        target_prior_status: r
+            .get::<_, Option<String>>(11)?
+            .map(|s| ActionStatus::parse(&s)),
+        pinned: r.get(12)?,
+        started_at_ms: r.get(13)?,
+        duration_ms: r.get(14)?,
+        note: r.get(15)?,
     })
 }

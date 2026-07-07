@@ -94,8 +94,16 @@ pub struct Entry {
     pub kind: EntryKind,
 }
 
+/// Version stamped into every newly-written [`Manifest`]. Bump when the
+/// serialized shape changes incompatibly; readers refuse anything newer than
+/// they understand. Legacy JSON without the field deserializes as 0.
+pub const MANIFEST_SCHEMA: u32 = 1;
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Manifest {
+    /// Serialization schema version (see [`MANIFEST_SCHEMA`]).
+    #[serde(default)]
+    pub schema: u32,
     /// Absolute path this snapshot captured.
     pub path: PathBuf,
     pub root: Root,
@@ -153,6 +161,7 @@ impl Store {
         limits: Option<&Limits>,
     ) -> Result<Manifest, SnapshotError> {
         let mut manifest = Manifest {
+            schema: MANIFEST_SCHEMA,
             path: path.to_path_buf(),
             root: Root::Present,
             entries: Vec::new(),

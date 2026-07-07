@@ -48,11 +48,34 @@ fn open_creates_wal_schema_and_reopen_preserves() {
         j.start_action(&new_action("s1", "rm -rf ./x", Some("toolu_1")))
             .unwrap();
     }
+    // the name says WAL: assert it (audit round 3 — a claim without an assertion)
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode.to_lowercase(), "wal");
+
     let j = Journal::open(&db).unwrap(); // reopen
     let actions = j.session_actions("s1").unwrap();
     assert_eq!(actions.len(), 1);
     assert_eq!(actions[0].raw_command, "rm -rf ./x");
     assert_eq!(actions[0].seq, 1);
+}
+
+#[test]
+fn resumed_session_updates_cwd() {
+    let (_tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/old/place").unwrap();
+    j.begin_session("s1", "claude-code", "/new/place").unwrap();
+    let cwd: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT cwd FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        cwd, "/new/place",
+        "a resumed session's cwd must not go stale"
+    );
 }
 
 #[test]
@@ -209,6 +232,59 @@ fn manifest_round_trips_exactly() {
     assert_eq!(stored[0], m, "serde round-trip must be lossless");
 }
 
+#[test]
+fn manifest_from_a_newer_doover_is_refused_loudly() {
+    // journals outlive binaries: a manifest written by a future schema must
+    // refuse, not misparse
+    let (tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "rm x", Some("t1")))
+        .unwrap();
+    let m = manifest_with_content(tmp.path(), "f.txt", "bytes");
+    j.attach_manifest(a, &m).unwrap();
+
+    // simulate a future doover having written this manifest
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE manifests SET manifest_json =
+            json_set(manifest_json, '$.schema', 999)",
+        [],
+    )
+    .unwrap();
+
+    let err = j.manifests(a).unwrap_err();
+    assert!(
+        err.to_string().contains("newer"),
+        "must explain the version problem, got: {err}"
+    );
+}
+
+#[test]
+fn legacy_manifest_json_without_schema_field_still_reads() {
+    // pre-versioning JSON deserializes with schema=0 rather than erroring
+    let (tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "rm x", Some("t1")))
+        .unwrap();
+    let m = manifest_with_content(tmp.path(), "f.txt", "bytes");
+    j.attach_manifest(a, &m).unwrap();
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE manifests SET manifest_json = json_remove(manifest_json, '$.schema')",
+        [],
+    )
+    .unwrap();
+
+    let stored = j.manifests(a).unwrap();
+    assert_eq!(stored[0].schema, 0, "missing field defaults to 0 (legacy)");
+    assert_eq!(stored[0].entries, m.entries, "content unaffected");
+}
+
 // --- undo chains -----------------------------------------------------------------
 
 #[test]
@@ -242,6 +318,105 @@ fn undo_is_an_action_and_undo_of_undo_is_redo() {
         "undo-of-undo restores the original's status"
     );
     assert_eq!(j.action(r).unwrap().kind, ActionKind::Undo);
+}
+
+#[test]
+fn double_undo_is_refused() {
+    // audit round 3: undoing an already-undone target appended duplicate rows
+    let (_tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "rm x", Some("t1")))
+        .unwrap();
+    j.complete_by_tool_use("s1", "t1", 1).unwrap();
+    j.record_undo("s1", a).unwrap();
+    assert!(
+        j.record_undo("s1", a).is_err(),
+        "undoing an undone action must be refused (redo targets the undo, not the original)"
+    );
+}
+
+#[test]
+fn concurrent_double_undo_admits_exactly_one() {
+    // audit round 3: the status check lived outside the transaction (TOCTOU)
+    let (_tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "rm x", Some("t1")))
+        .unwrap();
+    j.complete_by_tool_use("s1", "t1", 1).unwrap();
+
+    let db2 = db.clone();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let b2 = barrier.clone();
+    let h = std::thread::spawn(move || {
+        let j2 = Journal::open(&db2).unwrap();
+        b2.wait();
+        j2.record_undo("s1", a).is_ok()
+    });
+    barrier.wait();
+    let r1 = j.record_undo("s1", a).is_ok();
+    let r2 = h.join().unwrap();
+    assert!(r1 ^ r2, "exactly one racer may win, got r1={r1} r2={r2}");
+    let undo_rows = j
+        .session_actions("s1")
+        .unwrap()
+        .iter()
+        .filter(|r| r.target_action_id == Some(a))
+        .count();
+    assert_eq!(undo_rows, 1, "one target, one undo row");
+}
+
+#[test]
+fn redo_restores_prior_status_not_a_fabricated_completed() {
+    // audit round 3: redo hardcoded 'completed' even for abandoned targets
+    let (_tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "false", Some("t1")))
+        .unwrap();
+    j.end_session("s1").unwrap(); // a -> abandoned (no post ever came)
+
+    let u = j.record_undo("s1", a).unwrap();
+    assert_eq!(j.action(a).unwrap().status, ActionStatus::Undone);
+    assert_eq!(
+        j.action(u).unwrap().target_prior_status,
+        Some(ActionStatus::Abandoned),
+        "the undo row must remember what it undid"
+    );
+
+    j.record_undo("s1", u).unwrap(); // redo
+    assert_eq!(
+        j.action(a).unwrap().status,
+        ActionStatus::Abandoned,
+        "redo must restore the TRUE prior status, never invent 'completed'"
+    );
+}
+
+#[test]
+fn duplicate_tool_use_id_completes_only_the_newest() {
+    // audit round 3: an unbounded UPDATE completed every matching row
+    let (_tmp, db) = mem_paths();
+    let j = Journal::open(&db).unwrap();
+    j.begin_session("s1", "claude-code", "/p").unwrap();
+    let a = j
+        .start_action(&new_action("s1", "cmd-one", Some("dup")))
+        .unwrap();
+    let b = j
+        .start_action(&new_action("s1", "cmd-two", Some("dup")))
+        .unwrap();
+
+    let completed = j.complete_by_tool_use("s1", "dup", 7).unwrap();
+    assert_eq!(completed, b, "the newest matching action wins");
+    assert_eq!(j.action(b).unwrap().status, ActionStatus::Completed);
+    assert_eq!(
+        j.action(a).unwrap().status,
+        ActionStatus::Abandoned,
+        "the older duplicate keeps its abandoned status"
+    );
 }
 
 #[test]
