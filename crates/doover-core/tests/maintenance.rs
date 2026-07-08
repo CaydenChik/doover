@@ -336,3 +336,77 @@ fn prune_keeps_a_just_begun_empty_session_but_collects_old_ones() {
     // the in-flight session still has a (pending) action → still alive
     assert!(after >= 1);
 }
+
+/// Audit round 12 (reporting honesty): the `--dry-run` session estimate uses
+/// a different SQL query than the real deletion path. They MUST agree, or the
+/// dry-run tells the user a different number than gc will actually do. Mixed
+/// journal: a cleanly-empty-old session, a session whose only action is an
+/// old command referenced by an old undo (kept this pass — benign lag), and a
+/// session with a pending action (kept). Estimate must equal reality exactly.
+#[test]
+fn dry_run_session_estimate_equals_real_deletion_exactly() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let old = now - 100 * DAY_MS;
+    // rig() already opened an empty "s1" at real wall-clock time — within a
+    // millisecond of `now`. Pin it comfortably in the future so this test's
+    // outcome doesn't hinge on sub-millisecond scheduling (it is neither
+    // in-flight nor old for our purposes here).
+    r.journal
+        .set_session_started_at_for_test("s1", now + DAY_MS)
+        .unwrap();
+
+    // session A: cleanly empty + old -> should be pruned
+    r.journal.begin_session("A", "claude-code", "/p").unwrap();
+    r.journal.set_session_started_at_for_test("A", old).unwrap();
+
+    // session B: old command referenced by an old undo -> command kept this
+    // pass (referenced), undo pruned; session survives (benign lag)
+    r.journal.begin_session("B", "claude-code", "/p").unwrap();
+    r.journal.set_session_started_at_for_test("B", old).unwrap();
+    let cmd = r
+        .journal
+        .start_action(&NewAction {
+            session_id: "B",
+            tool_use_id: Some("b-cmd"),
+            raw_command: "rm f",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .unwrap();
+    r.journal.complete_by_tool_use("B", "b-cmd", 1).unwrap();
+    r.journal.set_started_at_for_test(cmd, old).unwrap();
+    let undo = r.journal.record_undo("B", cmd).unwrap();
+    r.journal.set_started_at_for_test(undo, old).unwrap();
+
+    // session C: a pending (in-flight) action -> kept
+    r.journal.begin_session("C", "claude-code", "/p").unwrap();
+    r.journal.set_session_started_at_for_test("C", old).unwrap();
+    r.journal
+        .start_action(&NewAction {
+            session_id: "C",
+            tool_use_id: Some("c-live"),
+            raw_command: "rm g",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .unwrap();
+
+    let cutoff = now; // everything above is older than the cutoff
+    let (a_est, s_est) = r.journal.prune_before(cutoff, true).unwrap();
+    let sessions_before = r.journal.stats().unwrap().0;
+    let (a_real, s_real) = r.journal.prune_before(cutoff, false).unwrap();
+    let sessions_after = r.journal.stats().unwrap().0;
+
+    assert_eq!(s_est, s_real, "dry-run session estimate must equal reality");
+    assert_eq!(a_est, a_real, "dry-run action estimate must equal reality");
+    assert_eq!(
+        sessions_before - sessions_after,
+        s_real,
+        "reported session count must match the actual table change"
+    );
+    // only session A is collectable this pass
+    assert_eq!(s_real, 1, "exactly the cleanly-empty-old session");
+}

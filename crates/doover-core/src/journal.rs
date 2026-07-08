@@ -686,6 +686,20 @@ impl Journal {
         Ok(())
     }
 
+    /// Test support: backdate a session's start so retention tests can build
+    /// explicit timelines. Not part of the product surface.
+    pub fn set_session_started_at_for_test(
+        &self,
+        session_id: &str,
+        at_ms: i64,
+    ) -> Result<(), JournalError> {
+        self.conn.execute(
+            "UPDATE sessions SET started_at_ms = ?2 WHERE id = ?1",
+            rusqlite::params![session_id, at_ms],
+        )?;
+        Ok(())
+    }
+
     /// (sessions, per-status action counts) for `status`/`doctor`.
     pub fn stats(&self) -> Result<(u64, Vec<(String, u64)>), JournalError> {
         let sessions: i64 = self
