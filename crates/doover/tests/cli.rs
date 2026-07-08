@@ -28,7 +28,7 @@ fn help_lists_all_planned_subcommands() {
 
 #[test]
 fn unimplemented_subcommands_fail_honestly_with_exit_64() {
-    for sub in ["show", "diff", "doctor"] {
+    for sub in ["show", "diff"] {
         Command::cargo_bin("doover")
             .unwrap()
             .arg(sub)
@@ -36,6 +36,106 @@ fn unimplemented_subcommands_fail_honestly_with_exit_64() {
             .code(64)
             .stderr(predicate::str::contains("not implemented"));
     }
+}
+
+// --- step 7: init / gc / status / doctor -----------------------------------------
+
+#[test]
+fn init_project_creates_hooks_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    // --project writes into ./.claude/settings.json (cwd of the child)
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("installed"));
+
+    let settings = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+    assert!(settings.contains("doover hook pre"));
+    assert!(settings.contains("doover hook post"));
+    assert!(settings.contains("PreToolUse") && settings.contains("PostToolUse"));
+
+    // second run: no duplication
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already installed"));
+    let again = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+    assert_eq!(
+        again.matches("doover hook pre").count(),
+        1,
+        "no duplicate hook"
+    );
+}
+
+#[test]
+fn init_merges_with_existing_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    std::fs::write(
+        tmp.path().join(".claude/settings.json"),
+        r#"{"model":"opus","hooks":{"PreToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"my-linter"}]}]}}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+
+    let s = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+    assert!(s.contains("\"model\""), "existing keys preserved");
+    assert!(s.contains("my-linter"), "existing hooks preserved");
+    assert!(s.contains("doover hook pre"), "our hook added alongside");
+}
+
+#[test]
+fn init_refuses_to_clobber_malformed_settings() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    std::fs::write(tmp.path().join(".claude/settings.json"), "{ not valid json").unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not valid JSON"));
+}
+
+#[test]
+fn status_and_gc_and_doctor_run_on_empty_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    for (args, needle) in [
+        (vec!["status"], "store objects"),
+        (vec!["gc", "--dry-run"], "object(s)"),
+    ] {
+        Command::cargo_bin("doover")
+            .unwrap()
+            .args(&args)
+            .env("DOOVER_HOME", &dh)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(needle));
+    }
+    // doctor on a fresh (no hooks) home reports the missing-hooks warning but
+    // still exits 0 (writable home, healthy empty journal)
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .env("DOOVER_HOME", &dh)
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok]"));
 }
 
 #[test]

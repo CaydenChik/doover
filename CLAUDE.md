@@ -58,14 +58,19 @@ confirm green → only then claim done. Build order and per-step test gates are 
   plainly rather than imply total coverage.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
-- **Journal rows are never GC'd and `raw_command` may embed secrets**
-  (`curl -H "Authorization: ..."`). Step 7's `gc` needs a journal-row
-  retention policy (age-based pruning of old sessions), not just store-hash
-  GC. Consider redaction patterns for known secret-bearing flags.
-- **GC retention must not trust the wall clock** (step 7): a backward NTP
-  jump makes recent snapshots look old and collectable — the dangerous
-  direction. Compute the cutoff relative to MAX(started_at_ms) in the
-  journal, not `now()`, or apply generous slack.
+- **DONE (step 7): journal-row pruning + journal-relative retention.** `gc`
+  prunes old unpinned/unreferenced rows (secret-bearing `raw_command`) and
+  computes the cutoff from MAX(started_at_ms), never the wall clock. Known
+  BENIGN asymmetry (intended, do not "fix" by keeping fewer rows): a row kept
+  only because an OLD undo still references it can outlive its store objects
+  by one gc pass — it is past retention, not user-undoable, and is pruned on
+  the next pass. The bias is deliberately toward keeping rows. Undo of such a
+  stranded old row must error cleanly (NothingToRestore / missing object),
+  never panic or partially restore — the round-6/10 zero-manifest and
+  fail-closed-restore guards already cover this.
+- **Redaction of secret-bearing `raw_command` is still open**: pruning bounds
+  exposure by time, but a `log`/`show` of a recent `curl -H "Authorization:"`
+  still prints it. A future pass should redact known secret flags at display.
 - **A completed action can legitimately have zero manifests** (step 6): a
   crash between `start_action` and `attach_manifest`, or a safe/mutating
   action that snapshotted nothing. The undo engine must treat "no manifests"

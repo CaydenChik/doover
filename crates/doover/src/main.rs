@@ -18,8 +18,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Set up the snapshot store and install harness hooks
-    Init,
+    /// Install the Claude Code Bash hooks and create the store
+    Init {
+        /// Write into the project's .claude/settings.json instead of the
+        /// user-global ~/.claude/settings.json
+        #[arg(long)]
+        project: bool,
+        /// Print what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List recent journaled agent actions
     Log {
         /// How many actions to show
@@ -54,8 +62,15 @@ enum Command {
     Diff,
     /// Store and session health summary
     Status,
-    /// Apply the retention policy to the snapshot store
-    Gc,
+    /// Prune old snapshots and journal rows (journal-relative retention)
+    Gc {
+        /// Keep everything newer than this many days before the newest action
+        #[arg(long, default_value_t = 7)]
+        keep_days: i64,
+        /// Show what would be removed without deleting
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Check hooks, store, and platform capabilities
     Doctor,
     /// Harness-facing hook entrypoints (stdin JSON)
@@ -93,12 +108,20 @@ fn main() {
             run_log(limit);
             return;
         }
-        Command::Init => ("init", 7),
+        Command::Init { project, dry_run } => {
+            std::process::exit(run_init(project, dry_run));
+        }
+        Command::Gc { keep_days, dry_run } => {
+            std::process::exit(run_gc(keep_days, dry_run));
+        }
+        Command::Status => {
+            std::process::exit(run_status());
+        }
+        Command::Doctor => {
+            std::process::exit(run_doctor());
+        }
         Command::Show => ("show", 6),
         Command::Diff => ("diff", 6),
-        Command::Status => ("status", 7),
-        Command::Gc => ("gc", 7),
-        Command::Doctor => ("doctor", 7),
     };
     eprintln!(
         "doover {name}: not implemented yet (arrives in build step {step}; see doover-implementation-plan.md)"
@@ -207,6 +230,271 @@ fn run_log(limit: i64) {
             (false, false) => "",
         };
         println!("#{:<5} {status}  {:<13} {cmd}{flags}", a.id, a.effect);
+    }
+}
+
+/// Install the two Bash hooks into a Claude Code settings.json, MERGING with
+/// any existing hooks rather than clobbering them. Idempotent: re-running does
+/// not duplicate doover's entries. Returns a process exit code.
+fn run_init(project: bool, dry_run: bool) -> i32 {
+    let settings_path = if project {
+        std::path::PathBuf::from(".claude/settings.json")
+    } else {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        match home {
+            Some(h) => h.join(".claude/settings.json"),
+            None => {
+                eprintln!("doover: HOME is not set; use --project or set HOME");
+                return 1;
+            }
+        }
+    };
+
+    let existing = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    let mut root: serde_json::Value = if existing.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(&existing) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "doover: {} is not valid JSON ({e}); refusing to overwrite it",
+                    settings_path.display()
+                );
+                return 1;
+            }
+        }
+    };
+    if !root.is_object() {
+        eprintln!("doover: {} is not a JSON object", settings_path.display());
+        return 1;
+    }
+
+    let added = install_bash_hooks(&mut root);
+    if !added {
+        println!(
+            "doover hooks already installed in {}",
+            settings_path.display()
+        );
+        return 0;
+    }
+    let rendered = serde_json::to_string_pretty(&root).unwrap_or_default();
+    if dry_run {
+        println!("would write {} :\n{rendered}", settings_path.display());
+        return 0;
+    }
+    if let Some(parent) = settings_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("doover: cannot create {}: {e}", parent.display());
+            return 1;
+        }
+    }
+    if let Err(e) = std::fs::write(&settings_path, rendered + "\n") {
+        eprintln!("doover: cannot write {}: {e}", settings_path.display());
+        return 1;
+    }
+    println!(
+        "installed doover Bash hooks into {}\nrun `doover doctor` to verify",
+        settings_path.display()
+    );
+    0
+}
+
+/// Merge doover's PreToolUse/PostToolUse Bash hooks into a settings object.
+/// Returns true if anything was added (false = already present).
+fn install_bash_hooks(root: &mut serde_json::Value) -> bool {
+    use serde_json::{Value, json};
+    let obj = root.as_object_mut().expect("checked object");
+    let hooks = obj
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    let Some(hooks) = hooks else { return false };
+
+    let mut changed = false;
+    for (event, cmd) in [
+        ("PreToolUse", "doover hook pre"),
+        ("PostToolUse", "doover hook post"),
+    ] {
+        let arr = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut();
+        let Some(arr) = arr else { continue };
+        // already present? look for our command anywhere in a Bash matcher
+        let present = arr.iter().any(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hs| {
+                    hs.iter()
+                        .any(|h| h.get("command").and_then(Value::as_str) == Some(cmd))
+                })
+        });
+        if !present {
+            arr.push(json!({
+                "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }]
+            }));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn cfg_journal_store() -> Option<(
+    doover_core::journal::Journal,
+    doover_core::snapshot::Store,
+    std::path::PathBuf,
+)> {
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    if std::fs::create_dir_all(&cfg.doover_home).is_err() {
+        return None;
+    }
+    let j = doover_core::journal::Journal::open(&cfg.doover_home.join("journal.db")).ok()?;
+    let s = doover_core::snapshot::Store::open(cfg.doover_home.join("store")).ok()?;
+    Some((j, s, cfg.doover_home))
+}
+
+fn run_gc(keep_days: i64, dry_run: bool) -> i32 {
+    let Some((journal, store, dh)) = cfg_journal_store() else {
+        eprintln!("doover: cannot open journal/store");
+        return 1;
+    };
+    match doover_core::maintenance::gc(
+        &journal,
+        &store,
+        &dh,
+        &doover_core::maintenance::GcOptions { keep_days, dry_run },
+    ) {
+        Ok(r) => {
+            let verb = if r.dry_run { "would free" } else { "freed" };
+            println!(
+                "{verb} {} object(s), {} KiB; pruned {} action(s), {} session(s); {} tmp",
+                r.objects_removed,
+                r.bytes_freed / 1024,
+                r.actions_pruned,
+                r.sessions_pruned,
+                r.tmp_removed,
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("doover: gc failed: {e}");
+            1
+        }
+    }
+}
+
+fn run_status() -> i32 {
+    let Some((journal, store, dh)) = cfg_journal_store() else {
+        eprintln!("doover: cannot open journal/store");
+        return 1;
+    };
+    let (sessions, per_status) = match journal.stats() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("doover: {e}");
+            return 1;
+        }
+    };
+    let objects = store.object_count().unwrap_or(0);
+    println!("doover home:  {}", dh.display());
+    println!("sessions:     {sessions}");
+    print!("actions:      ");
+    if per_status.is_empty() {
+        println!("none");
+    } else {
+        println!(
+            "{}",
+            per_status
+                .iter()
+                .map(|(s, n)| format!("{n} {s}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    println!("store objects: {objects}");
+    0
+}
+
+fn run_doctor() -> i32 {
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    let mut problems = 0;
+    println!("doover doctor");
+
+    // 1. doover home writable
+    match std::fs::create_dir_all(&cfg.doover_home) {
+        Ok(_) => println!(
+            "  [ok]   doover home writable: {}",
+            cfg.doover_home.display()
+        ),
+        Err(e) => {
+            println!("  [FAIL] doover home {}: {e}", cfg.doover_home.display());
+            problems += 1;
+        }
+    }
+
+    // 2. journal opens / integrity
+    match doover_core::journal::Journal::open(&cfg.doover_home.join("journal.db")) {
+        Ok(j) => match j.integrity_check() {
+            Ok(true) => println!("  [ok]   journal integrity"),
+            Ok(false) => {
+                println!("  [FAIL] journal integrity check reported problems");
+                problems += 1;
+            }
+            Err(e) => {
+                println!("  [FAIL] journal integrity: {e}");
+                problems += 1;
+            }
+        },
+        Err(e) => {
+            println!("  [FAIL] cannot open journal: {e}");
+            problems += 1;
+        }
+    }
+
+    // 3. store + copy-on-write capability
+    match doover_core::snapshot::Store::open(cfg.doover_home.join("store")) {
+        Ok(s) => {
+            if s.supports_reflink() {
+                println!("  [ok]   store supports copy-on-write (fast snapshots)");
+            } else {
+                println!("  [warn] store filesystem has no reflink; snapshots use full copies");
+            }
+            // orphaned staging from an interrupted restore
+            match doover_core::snapshot::orphaned_staging(&cfg.doover_home.join("store")) {
+                Ok(orphans) if !orphans.is_empty() => {
+                    println!(
+                        "  [warn] {} orphaned restore-staging dir(s) found",
+                        orphans.len()
+                    );
+                }
+                _ => {}
+            }
+        }
+        Err(e) => {
+            println!("  [FAIL] cannot open store: {e}");
+            problems += 1;
+        }
+    }
+
+    // 4. hooks installed?
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let settings = home.map(|h| h.join(".claude/settings.json"));
+    match settings.as_ref().map(std::fs::read_to_string) {
+        Some(Ok(text)) if text.contains("doover hook pre") => {
+            println!("  [ok]   Claude Code hooks installed");
+        }
+        _ => println!("  [warn] Claude Code hooks not found — run `doover init`"),
+    }
+
+    if problems == 0 {
+        println!("all good");
+        0
+    } else {
+        println!("{problems} problem(s) found");
+        1
     }
 }
 

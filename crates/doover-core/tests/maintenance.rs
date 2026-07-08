@@ -1,0 +1,293 @@
+//! T8 — maintenance/gc (step 7). Written before the module exists.
+//!
+//! Carried-forward constraints under test (CLAUDE.md):
+//! - retention cutoffs derive from MAX(started_at_ms) in the journal, never
+//!   the wall clock (a backward NTP jump must not make recent snapshots
+//!   collectable);
+//! - journal rows are pruned too (old raw_command lines may embed secrets),
+//!   without ever breaking undo-chain references or pinned actions.
+
+use doover_core::journal::{Journal, ManifestRole, NewAction};
+use doover_core::maintenance::{self, GcOptions};
+use doover_core::snapshot::{EntryKind, Store, StoreOptions};
+use std::fs;
+use std::path::Path;
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+struct Rig {
+    _tmp: tempfile::TempDir,
+    journal: Journal,
+    store: Store,
+    world: std::path::PathBuf,
+    dh: std::path::PathBuf,
+}
+
+fn rig() -> Rig {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join(".doover");
+    fs::create_dir_all(&dh).unwrap();
+    let journal = Journal::open(&dh.join("journal.db")).unwrap();
+    let store = Store::open_with(dh.join("store"), StoreOptions::default()).unwrap();
+    let world = tmp.path().join("world");
+    fs::create_dir_all(&world).unwrap();
+    journal.begin_session("s1", "claude-code", "/p").unwrap();
+    Rig {
+        _tmp: tmp,
+        journal,
+        store,
+        world,
+        dh,
+    }
+}
+
+impl Rig {
+    /// Insert an action at an explicit timestamp with a real snapshotted file.
+    fn action_at(&self, name: &str, content: &str, at_ms: i64, tool: &str) -> (i64, String) {
+        let id = self
+            .journal
+            .start_action(&NewAction {
+                session_id: "s1",
+                tool_use_id: Some(tool),
+                raw_command: &format!("rm {name}"),
+                effect: "destructive",
+                rule_id: Some("coreutils.rm"),
+                has_unknown: false,
+            })
+            .unwrap();
+        self.journal.complete_by_tool_use("s1", tool, 1).unwrap();
+        self.journal.set_started_at_for_test(id, at_ms).unwrap();
+        let f = self.world.join(name);
+        fs::write(&f, content).unwrap();
+        let m = self.store.snapshot(&f, None).unwrap();
+        let hash = m
+            .entries
+            .iter()
+            .find_map(|e| match &e.kind {
+                EntryKind::File { hash, .. } => Some(hash.clone()),
+                _ => None,
+            })
+            .unwrap();
+        self.journal
+            .attach_manifest(id, &m, ManifestRole::Pre)
+            .unwrap();
+        (id, hash)
+    }
+
+    fn object_exists(&self, hash: &str) -> bool {
+        self.store
+            .object_paths()
+            .unwrap()
+            .iter()
+            .any(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == *hash))
+    }
+}
+
+#[test]
+fn gc_collects_old_unpinned_and_keeps_recent_and_pinned() {
+    let r = rig();
+    let base = 1_000_000_000_000; // arbitrary epoch, wall clock must not matter
+    let (_old, h_old) = r.action_at("old.txt", "old content", base, "t1");
+    let (pinned, h_pin) = r.action_at("pin.txt", "pinned content", base + DAY_MS, "t2");
+    let (_recent, h_new) = r.action_at("new.txt", "recent content", base + 10 * DAY_MS, "t3");
+    r.journal.set_pinned(pinned, true).unwrap();
+
+    let report = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+
+    assert!(!r.object_exists(&h_old), "old+unpinned object collected");
+    assert!(r.object_exists(&h_pin), "pinned survives regardless of age");
+    assert!(r.object_exists(&h_new), "recent survives");
+    assert!(report.objects_removed >= 1);
+    assert!(report.bytes_freed > 0);
+}
+
+/// THE clock-skew rule: cutoff derives from MAX(started_at_ms), not now().
+/// All actions are far in the wall-clock past; the newest must still count as
+/// "recent" relative to the journal's own timeline.
+#[test]
+fn gc_cutoff_is_journal_relative_not_wall_clock() {
+    let r = rig();
+    let base = 1_000_000; // ~1970 — decades before the wall clock
+    let (_a, h_a) = r.action_at("a.txt", "content a", base, "t1");
+    let (_b, h_b) = r.action_at("b.txt", "content b", base + 10 * DAY_MS, "t2");
+
+    maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !r.object_exists(&h_a),
+        "10 days older than the journal's newest -> collected"
+    );
+    assert!(
+        r.object_exists(&h_b),
+        "the journal's newest action is ALWAYS recent, no matter the wall clock"
+    );
+}
+
+#[test]
+fn gc_dry_run_removes_nothing_but_reports() {
+    let r = rig();
+    let base = 1_000_000_000_000;
+    let (_old, h_old) = r.action_at("old.txt", "old", base, "t1");
+    r.action_at("new.txt", "new", base + 10 * DAY_MS, "t2");
+
+    let report = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: true,
+        },
+    )
+    .unwrap();
+    assert!(report.dry_run);
+    assert!(report.objects_removed >= 1, "reports what WOULD be removed");
+    assert!(r.object_exists(&h_old), "dry-run must not delete");
+}
+
+#[test]
+fn gc_prunes_old_journal_rows_but_never_referenced_or_pinned_ones() {
+    let r = rig();
+    let base = 1_000_000_000_000;
+    let (old_plain, _) = r.action_at("old.txt", "x", base, "t1");
+    let (old_pinned, _) = r.action_at("pin.txt", "y", base, "t2");
+    r.journal.set_pinned(old_pinned, true).unwrap();
+    // an old action that a (recent) undo references must survive pruning
+    let (old_undone, _) = r.action_at("undone.txt", "z", base, "t3");
+    let undo_id = r.journal.record_undo("s1", old_undone).unwrap();
+    // the undo row itself is recent
+    r.journal
+        .set_started_at_for_test(undo_id, base + 10 * DAY_MS)
+        .unwrap();
+    let (_recent, _) = r.action_at("new.txt", "w", base + 10 * DAY_MS, "t4");
+
+    maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        r.journal.action(old_plain).is_err(),
+        "old, unpinned, unreferenced row pruned (raw_command may embed secrets)"
+    );
+    assert!(r.journal.action(old_pinned).is_ok(), "pinned row survives");
+    assert!(
+        r.journal.action(old_undone).is_ok(),
+        "a row referenced by an undo action survives (chain integrity)"
+    );
+}
+
+#[test]
+fn gc_after_prune_leaves_undo_of_recent_actions_working() {
+    // the whole point of retention: undo must still work after gc
+    let r = rig();
+    let base = 1_000_000_000_000;
+    r.action_at("old.txt", "old", base, "t1");
+    let (recent, _) = r.action_at("keep.txt", "precious", base + 10 * DAY_MS, "t2");
+
+    maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+
+    // delete the file, then undo the recent action through the real engine
+    fs::remove_file(r.world.join("keep.txt")).unwrap();
+    let engine = doover_core::undo::UndoEngine::new(&r.journal, &r.store);
+    engine
+        .undo(doover_core::undo::Selector::Action(recent), true, false)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(r.world.join("keep.txt")).unwrap(),
+        "precious",
+        "gc must never break undo of retained actions"
+    );
+}
+
+#[test]
+fn gc_cleans_stale_store_tmp_entries() {
+    let r = rig();
+    let base = 1_000_000_000_000;
+    r.action_at("a.txt", "x", base + 10 * DAY_MS, "t1");
+    // a leftover tmp file from a crashed ingestion — backdate its mtime past
+    // the age gate (fresh tmp files belong to in-flight ingests and are kept)
+    let tmp_dir = r.dh.join("store/tmp");
+    fs::write(tmp_dir.join("999-42"), "crash leftover").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(tmp_dir.join("999-42"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    let report = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert!(report.tmp_removed >= 1);
+    assert!(
+        !tmp_dir.join("999-42").exists(),
+        "stale tmp entries are crash leftovers, always safe to remove"
+    );
+}
+
+#[test]
+fn gc_on_an_empty_journal_is_a_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join(".doover");
+    fs::create_dir_all(&dh).unwrap();
+    let journal = Journal::open(&dh.join("journal.db")).unwrap();
+    let store = Store::open_with(dh.join("store"), StoreOptions::default()).unwrap();
+    let report = maintenance::gc(
+        &journal,
+        &store,
+        &dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(report.objects_removed, 0);
+    assert_eq!(report.actions_pruned, 0);
+}
+
+/// Path helper used by other suites lives here to keep it near its tests.
+#[allow(dead_code)]
+fn unused(_p: &Path) {}

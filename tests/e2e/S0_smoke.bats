@@ -24,7 +24,7 @@ teardown() {
 }
 
 @test "S0: unimplemented subcommand exits 64 and says so" {
-  run "$DOOVER_BIN" doctor
+  run "$DOOVER_BIN" show
   [ "$status" -eq 64 ]
   [[ "$output" == *"not implemented"* ]]
 }

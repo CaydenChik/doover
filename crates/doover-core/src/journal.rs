@@ -556,13 +556,18 @@ impl Journal {
         Ok(())
     }
 
-    /// Store hashes that GC must keep: referenced by a pinned action, or by
-    /// any action started at/after `retain_after_ms`.
+    /// Store hashes that GC must keep: referenced by a pinned action, by any
+    /// action started at/after `retain_after_ms`, or by an action that a live
+    /// (pinned/recent) undo targets — a kept chain row must keep its objects,
+    /// or redo would fail on a journal entry that still exists.
     pub fn live_hashes(&self, retain_after_ms: i64) -> Result<BTreeSet<String>, JournalError> {
         let mut stmt = self.conn.prepare(
             "SELECT m.hashes FROM manifests m
              JOIN actions a ON a.id = m.action_id
-             WHERE a.pinned = 1 OR a.started_at_ms >= ?1",
+             WHERE a.pinned = 1 OR a.started_at_ms >= ?1
+                OR EXISTS (SELECT 1 FROM actions r
+                           WHERE r.target_action_id = a.id
+                             AND (r.pinned = 1 OR r.started_at_ms >= ?1))",
         )?;
         let rows = stmt.query_map([retain_after_ms], |r| r.get::<_, String>(0))?;
         let mut out = BTreeSet::new();
@@ -592,6 +597,88 @@ impl Journal {
         ))?;
         let rows = stmt.query_map([session_id], row_to_action)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Newest action timestamp in the journal — the reference point for
+    /// retention cutoffs. NEVER use the wall clock for that (CLAUDE.md: a
+    /// backward NTP jump would make recent snapshots look collectable).
+    pub fn max_started_at(&self) -> Result<Option<i64>, JournalError> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(started_at_ms) FROM actions", [], |r| r.get(0))?)
+    }
+
+    /// Prune journal rows older than `cutoff_ms`. Never touches pinned rows,
+    /// pending rows, or rows referenced as an undo target by a surviving row
+    /// (chain integrity; the referencing row's own pruning frees them for the
+    /// NEXT pass — eventual cleanup). Old `raw_command` strings may embed
+    /// secrets, which is why pruning rows (not just store objects) matters.
+    /// Returns (actions_pruned, sessions_pruned); `dry_run` only counts.
+    pub fn prune_before(&self, cutoff_ms: i64, dry_run: bool) -> Result<(u64, u64), JournalError> {
+        const CANDIDATES: &str = "FROM actions a
+             WHERE a.started_at_ms < ?1 AND a.pinned = 0 AND a.status != 'pending'
+               AND NOT EXISTS (SELECT 1 FROM actions r WHERE r.target_action_id = a.id)";
+        if dry_run {
+            let n: i64 = self.conn.query_row(
+                &format!("SELECT COUNT(*) {CANDIDATES}"),
+                [cutoff_ms],
+                |r| r.get(0),
+            )?;
+            return Ok((n as u64, 0));
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE;")?;
+        let result = (|| -> Result<(u64, u64), JournalError> {
+            self.conn.execute(
+                &format!("DELETE FROM manifests WHERE action_id IN (SELECT a.id {CANDIDATES})"),
+                [cutoff_ms],
+            )?;
+            let actions = self.conn.execute(
+                &format!("DELETE FROM actions WHERE id IN (SELECT a.id {CANDIDATES})"),
+                [cutoff_ms],
+            )? as u64;
+            let sessions = self.conn.execute(
+                "DELETE FROM sessions
+                 WHERE id NOT IN (SELECT DISTINCT session_id FROM actions)",
+                [],
+            )? as u64;
+            Ok((actions, sessions))
+        })();
+        match &result {
+            Ok(_) => self.conn.execute_batch("COMMIT;")?,
+            Err(_) => self.conn.execute_batch("ROLLBACK;").unwrap_or(()),
+        }
+        result
+    }
+
+    /// Test support: rewrite an action's timestamp so retention tests can
+    /// construct explicit timelines. Not part of the product surface.
+    pub fn set_started_at_for_test(
+        &self,
+        action: ActionId,
+        at_ms: i64,
+    ) -> Result<(), JournalError> {
+        let n = self.conn.execute(
+            "UPDATE actions SET started_at_ms = ?2 WHERE id = ?1",
+            rusqlite::params![action, at_ms],
+        )?;
+        if n == 0 {
+            return Err(JournalError::ActionNotFound(action));
+        }
+        Ok(())
+    }
+
+    /// (sessions, per-status action counts) for `status`/`doctor`.
+    pub fn stats(&self) -> Result<(u64, Vec<(String, u64)>), JournalError> {
+        let sessions: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT status, COUNT(*) FROM actions GROUP BY status ORDER BY status")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        Ok((sessions as u64, rows.collect::<Result<Vec<_>, _>>()?))
     }
 
     pub fn integrity_check(&self) -> Result<bool, JournalError> {

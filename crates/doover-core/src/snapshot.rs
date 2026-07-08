@@ -605,6 +605,62 @@ impl Store {
         ok
     }
 
+    /// Remove every object whose hash is NOT in `live`. Returns
+    /// (objects_removed, bytes_freed); `dry_run` only counts. Objects are
+    /// immutable and content-addressed, so removal is always safe for
+    /// anything outside the live set — the live set is the whole contract.
+    pub fn prune(
+        &self,
+        live: &std::collections::BTreeSet<String>,
+        dry_run: bool,
+    ) -> Result<(u64, u64), SnapshotError> {
+        let mut removed = 0u64;
+        let mut bytes = 0u64;
+        for path in self.object_paths()? {
+            let Some(hash) = path.file_name().map(|f| f.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if live.contains(&hash) {
+                continue;
+            }
+            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if !dry_run {
+                fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
+                // best-effort: drop the prefix dir if now empty
+                if let Some(parent) = path.parent() {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+            removed += 1;
+            bytes += len;
+        }
+        Ok((removed, bytes))
+    }
+
+    /// Remove tmp entries older than `max_age_ms` — crash leftovers from
+    /// interrupted ingestions. Age-gated so a concurrently-running hook's
+    /// in-flight tmp file is never yanked out from under it.
+    pub fn clean_tmp(&self, max_age_ms: u64, dry_run: bool) -> Result<u64, SnapshotError> {
+        let now = SystemTime::now();
+        let mut removed = 0u64;
+        for entry in fs::read_dir(&self.tmp).map_err(|e| io_err(&self.tmp, e))? {
+            let entry = entry.map_err(|e| io_err(&self.tmp, e))?;
+            let path = entry.path();
+            let old_enough = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age.as_millis() as u64 >= max_age_ms);
+            if old_enough {
+                if !dry_run {
+                    let _ = fs::remove_file(&path);
+                }
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn object_count(&self) -> Result<u64, SnapshotError> {
         Ok(self.object_paths()?.len() as u64)
     }

@@ -10,6 +10,7 @@
 
 pub mod hooks;
 pub mod journal;
+pub mod maintenance;
 pub mod registry;
 pub mod resolver;
 pub mod snapshot;

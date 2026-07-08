@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 clap.workspace = true
 doover-core.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"
