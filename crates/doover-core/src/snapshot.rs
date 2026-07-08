@@ -811,7 +811,7 @@ fn remove_any(path: &Path) -> Result<(), SnapshotError> {
 
 const MMAP_THRESHOLD: u64 = 1024 * 1024;
 
-fn hash_file(path: &Path) -> Result<String, SnapshotError> {
+pub(crate) fn hash_file(path: &Path) -> Result<String, SnapshotError> {
     let len = fs::metadata(path).map_err(|e| io_err(path, e))?.len();
     let mut hasher = blake3::Hasher::new();
     if len >= MMAP_THRESHOLD {

@@ -23,10 +23,13 @@ teardown() {
   [[ "$output" == *"0.0.1"* ]]
 }
 
-@test "S0: unimplemented subcommand exits 64 and says so" {
-  run "$DOOVER_BIN" show
-  [ "$status" -eq 64 ]
-  [[ "$output" == *"not implemented"* ]]
+# Step 8 removed the last stubs: every subcommand is implemented, so the old
+# exit-64 contract is retired. Inspecting a nonexistent action must be a
+# clean, specific error — not a crash, not a silent success.
+@test "S0: show on an empty journal is a clear error" {
+  run "$DOOVER_BIN" show 1
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"not found"* ]]
 }
 
 @test "S0: running doover leaves no droppings in HOME or cwd" {

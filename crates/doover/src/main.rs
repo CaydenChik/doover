@@ -1,11 +1,6 @@
 use clap::{Parser, Subcommand};
 use std::io::Read;
 
-/// Exit code for commands that exist in the CLI surface but are not yet
-/// implemented. Distinct from 1 (runtime error) and 2 (hook block decision)
-/// so tests and scripts can tell "not built yet" from "failed".
-const EXIT_NOT_IMPLEMENTED: i32 = 64;
-
 /// Hook stdin is harness-controlled JSON; cap reads defensively.
 const MAX_EVENT_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -34,8 +29,11 @@ enum Command {
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: i64,
     },
-    /// Show one action's snapshot manifest and diff
-    Show,
+    /// Show one action's details and snapshot manifests
+    Show {
+        /// Journal action id (see `doover log`)
+        id: i64,
+    },
     /// Restore the state from before an action (latest undoable by default)
     Undo {
         /// Journal action id (defaults to the latest undoable action)
@@ -59,7 +57,10 @@ enum Command {
         dry_run: bool,
     },
     /// Diff an action's pre-state against the current filesystem
-    Diff,
+    Diff {
+        /// Journal action id (see `doover log`)
+        id: i64,
+    },
     /// Store and session health summary
     Status,
     /// Prune old snapshots and journal rows (journal-relative retention)
@@ -91,42 +92,18 @@ enum HookCommand {
 
 fn main() {
     let cli = Cli::parse();
-    let (name, step) = match cli.command {
-        Command::Hook(kind) => {
-            run_hook_fail_open(kind);
-            return;
-        }
-        Command::Undo { id, force, dry_run } => {
-            run_undo_redo(Verb::Undo, id, force, dry_run);
-            return;
-        }
-        Command::Redo { id, force, dry_run } => {
-            run_undo_redo(Verb::Redo, id, force, dry_run);
-            return;
-        }
-        Command::Log { limit } => {
-            run_log(limit);
-            return;
-        }
-        Command::Init { project, dry_run } => {
-            std::process::exit(run_init(project, dry_run));
-        }
-        Command::Gc { keep_days, dry_run } => {
-            std::process::exit(run_gc(keep_days, dry_run));
-        }
-        Command::Status => {
-            std::process::exit(run_status());
-        }
-        Command::Doctor => {
-            std::process::exit(run_doctor());
-        }
-        Command::Show => ("show", 6),
-        Command::Diff => ("diff", 6),
-    };
-    eprintln!(
-        "doover {name}: not implemented yet (arrives in build step {step}; see doover-implementation-plan.md)"
-    );
-    std::process::exit(EXIT_NOT_IMPLEMENTED);
+    match cli.command {
+        Command::Hook(kind) => run_hook_fail_open(kind),
+        Command::Undo { id, force, dry_run } => run_undo_redo(Verb::Undo, id, force, dry_run),
+        Command::Redo { id, force, dry_run } => run_undo_redo(Verb::Redo, id, force, dry_run),
+        Command::Log { limit } => run_log(limit),
+        Command::Init { project, dry_run } => std::process::exit(run_init(project, dry_run)),
+        Command::Gc { keep_days, dry_run } => std::process::exit(run_gc(keep_days, dry_run)),
+        Command::Status => std::process::exit(run_status()),
+        Command::Doctor => std::process::exit(run_doctor()),
+        Command::Show { id } => std::process::exit(run_show(id)),
+        Command::Diff { id } => std::process::exit(run_diff(id)),
+    }
 }
 
 enum Verb {
@@ -219,7 +196,7 @@ fn run_log(limit: i64) {
             ActionStatus::Abandoned => "abandoned",
             ActionStatus::Undone => "undone   ",
         };
-        let mut cmd = a.raw_command.replace('\n', " ");
+        let mut cmd = doover_core::redact::redact(&a.raw_command).replace('\n', " ");
         if cmd.chars().count() > 60 {
             cmd = format!("{}…", cmd.chars().take(59).collect::<String>());
         }
@@ -395,6 +372,150 @@ fn install_bash_hooks(root: &mut serde_json::Value) -> Result<bool, String> {
         }
     }
     Ok(changed)
+}
+
+/// Fetch action `id` or exit 1 with a "not found" message.
+fn action_or_exit(
+    journal: &doover_core::journal::Journal,
+    id: i64,
+) -> doover_core::journal::ActionRecord {
+    match journal.action(id) {
+        Ok(a) => a,
+        Err(doover_core::journal::JournalError::ActionNotFound(_)) => {
+            eprintln!("doover: action #{id} not found (see `doover log`)");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("doover: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_show(id: i64) -> i32 {
+    use doover_core::journal::ManifestRole;
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    let journal = open_journal_or_exit(&cfg);
+    let a = action_or_exit(&journal, id);
+
+    let status = format!("{:?}", a.status).to_lowercase();
+    println!("action #{}: {status}", a.id);
+    println!("  session:  {} (seq {})", a.session_id, a.seq);
+    // display-time redaction: the journal keeps raw_command verbatim for the
+    // audit trail; credentials must never reach a terminal
+    println!(
+        "  command:  {}",
+        doover_core::redact::redact(&a.raw_command)
+    );
+    print!("  effect:   {}", a.effect);
+    match &a.rule_id {
+        Some(r) => println!(" [{r}]"),
+        None => println!(),
+    }
+    if let Some(t) = a.target_action_id {
+        println!("  undoes:   action #{t}");
+    }
+    if a.pinned {
+        println!("  pinned:   yes (gc keeps it)");
+    }
+
+    for (role, label) in [(ManifestRole::Pre, "pre"), (ManifestRole::Post, "post")] {
+        let manifests = match journal.manifests_by_role(a.id, role) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("doover: cannot read manifests: {e}");
+                return 1;
+            }
+        };
+        for m in &manifests {
+            println!(
+                "  {label} snapshot: {} ({} entr{}{}{})",
+                m.path.display(),
+                m.entries.len(),
+                if m.entries.len() == 1 { "y" } else { "ies" },
+                if m.root == doover_core::snapshot::Root::Absent {
+                    ", did not exist"
+                } else {
+                    ""
+                },
+                if m.truncated { ", TRUNCATED" } else { "" },
+            );
+            for w in &m.warnings {
+                println!("    warning: {w}");
+            }
+            for e in m.entries.iter().take(20) {
+                let kind = match &e.kind {
+                    doover_core::snapshot::EntryKind::File { len, .. } => {
+                        format!("file {len} B")
+                    }
+                    doover_core::snapshot::EntryKind::Dir { .. } => "dir".into(),
+                    doover_core::snapshot::EntryKind::Symlink { target } => {
+                        format!("symlink -> {}", target.display())
+                    }
+                    doover_core::snapshot::EntryKind::Fifo { .. } => "fifo".into(),
+                };
+                let rel = if e.rel.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    e.rel.display().to_string()
+                };
+                println!("    {rel}  ({kind})");
+            }
+            if m.entries.len() > 20 {
+                println!(
+                    "    … {} more (see `doover diff {id}`)",
+                    m.entries.len() - 20
+                );
+            }
+        }
+    }
+    0
+}
+
+fn run_diff(id: i64) -> i32 {
+    use doover_core::journal::ManifestRole;
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    let journal = open_journal_or_exit(&cfg);
+    let a = action_or_exit(&journal, id);
+
+    let manifests = match journal.manifests_by_role(a.id, ManifestRole::Pre) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("doover: cannot read manifests: {e}");
+            return 1;
+        }
+    };
+    if manifests.is_empty() {
+        println!("action #{id} recorded no pre-state (nothing to compare)");
+        return 0;
+    }
+    let mut changed = 0u64;
+    let mut total = 0u64;
+    for m in &manifests {
+        let lines = match doover_core::inspect::diff_manifest(m) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("doover: diff failed for {}: {e}", m.path.display());
+                return 1;
+            }
+        };
+        for line in lines {
+            total += 1;
+            if line.status != doover_core::inspect::PathStatus::Unchanged {
+                changed += 1;
+            }
+            println!("  {:<12} {}", line.status.as_str(), line.path.display());
+        }
+    }
+    println!(
+        "{changed} of {total} path(s) differ from the pre-state of action #{id}{}",
+        if changed > 0 {
+            " (`doover undo` restores it)"
+        } else {
+            ""
+        }
+    );
+    0
 }
 
 fn cfg_journal_store() -> Option<(

@@ -454,6 +454,7 @@ dependencies = [
  "libc",
  "proptest",
  "reflink-copy",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

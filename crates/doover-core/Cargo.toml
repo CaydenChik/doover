@@ -17,6 +17,7 @@ glob.workspace = true
 reflink-copy.workspace = true
 blake3.workspace = true
 walkdir.workspace = true
+regex.workspace = true
 xattr.workspace = true
 libc.workspace = true
 rusqlite.workspace = true

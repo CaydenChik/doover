@@ -26,16 +26,107 @@ fn help_lists_all_planned_subcommands() {
     }
 }
 
-#[test]
-fn unimplemented_subcommands_fail_honestly_with_exit_64() {
-    for sub in ["show", "diff"] {
-        Command::cargo_bin("doover")
+// --- step 8: show / diff (last stubs gone) -----------------------------------
+
+/// Drive a pre+post hook pair through the real binary; returns (home, cwd).
+fn journal_one_action(cmd: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join("keep.txt"), "precious").unwrap();
+    for (event, extra) in [
+        ("PreToolUse", serde_json::json!({})),
+        (
+            "PostToolUse",
+            serde_json::json!({
+                "duration_ms": 5,
+                "tool_response": { "stdout": "", "stderr": "", "interrupted": false }
+            }),
+        ),
+    ] {
+        let mut ev = serde_json::json!({
+            "session_id": "s-show", "cwd": cwd.to_string_lossy(),
+            "hook_event_name": event, "tool_name": "Bash",
+            "tool_use_id": "t-show", "tool_input": { "command": cmd }
+        });
+        ev.as_object_mut()
             .unwrap()
-            .arg(sub)
+            .extend(extra.as_object().unwrap().clone());
+        let sub = if event == "PreToolUse" { "pre" } else { "post" };
+        hook_cmd(&dh, sub)
+            .write_stdin(ev.to_string())
             .assert()
-            .code(64)
-            .stderr(predicate::str::contains("not implemented"));
+            .success();
     }
+    let dh_owned = dh.clone();
+    (tmp, dh_owned)
+}
+
+#[test]
+fn show_prints_action_detail_with_manifest_summary() {
+    let (_tmp, dh) = journal_one_action("rm keep.txt");
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["show", "1"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("rm keep.txt")
+                .and(predicate::str::contains("completed"))
+                .and(predicate::str::contains("pre"))
+                .and(predicate::str::contains("keep.txt")),
+        );
+}
+
+#[test]
+fn show_and_log_redact_secrets_at_display_time_but_journal_keeps_raw() {
+    let secret = "sk-live-Sup3rSecret";
+    let (_tmp, dh) = journal_one_action(&format!(
+        "curl -H \"Authorization: Bearer {secret}\" -o out https://x"
+    ));
+    for args in [vec!["show", "1"], vec!["log"]] {
+        let assert = Command::cargo_bin("doover")
+            .unwrap()
+            .args(&args)
+            .env("DOOVER_HOME", &dh)
+            .assert()
+            .success();
+        let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        assert!(!out.contains(secret), "{args:?} leaked the secret: {out}");
+        assert!(out.contains("[redacted]"), "{args:?} shows the mask");
+    }
+    // the journal itself keeps the raw command (undo semantics unchanged;
+    // redaction is a display concern)
+    let j = doover_core::journal::Journal::open(&dh.join("journal.db")).unwrap();
+    assert!(j.action(1).unwrap().raw_command.contains(secret));
+}
+
+#[test]
+fn show_unknown_id_is_a_clear_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["show", "999"])
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not found"));
+}
+
+#[test]
+fn diff_reports_per_path_status_against_the_current_world() {
+    let (tmp, dh) = journal_one_action("rm keep.txt");
+    // mutate after the action: the pre-state should now read as modified
+    std::fs::write(tmp.path().join("proj/keep.txt"), "changed since").unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["diff", "1"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("keep.txt").and(predicate::str::contains("modified")));
 }
 
 // --- step 7: init / gc / status / doctor -----------------------------------------

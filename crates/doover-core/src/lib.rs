@@ -9,8 +9,10 @@
 //! - `undo` (step 6): restore engine with conflict detection
 
 pub mod hooks;
+pub mod inspect;
 pub mod journal;
 pub mod maintenance;
+pub mod redact;
 pub mod registry;
 pub mod resolver;
 pub mod snapshot;

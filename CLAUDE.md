@@ -43,8 +43,9 @@ confirm green → only then claim done. Build order and per-step test gates are 
   copy code from. Clean-room only.
 - Unknown/opaque shell constructs must never classify as `safe` — `unknown` or
   stricter. This is a load-bearing safety invariant with property tests behind it.
-- Exit codes: 0 ok, 1 runtime error, 2 hook block decision, 3 undo conflict,
-  64 not-implemented.
+- Exit codes: 0 ok, 1 runtime error, 2 hook block decision, 3 undo conflict.
+  (64 not-implemented is retired — every subcommand is implemented as of
+  step 8.)
 
 ## Carried-forward design risks (address at the step noted; do not forget)
 
@@ -68,9 +69,13 @@ confirm green → only then claim done. Build order and per-step test gates are 
   stranded old row must error cleanly (NothingToRestore / missing object),
   never panic or partially restore — the round-6/10 zero-manifest and
   fail-closed-restore guards already cover this.
-- **Redaction of secret-bearing `raw_command` is still open**: pruning bounds
-  exposure by time, but a `log`/`show` of a recent `curl -H "Authorization:"`
-  still prints it. A future pass should redact known secret flags at display.
+- **DONE (step 8): display-time secret redaction.** `log` and `show` pass
+  `raw_command` through `redact::redact()` (auth headers, bearer tokens,
+  secret-bearing flags, credential-named env assignments). The journal keeps
+  the raw string — undo semantics and audit ground truth are unchanged.
+  Pattern-based hygiene, NOT a DLP guarantee: exotic secret shapes get
+  through; user docs must say so. Any future user-facing display of
+  `raw_command` MUST go through `redact()` too.
 - **A completed action can legitimately have zero manifests** (step 6): a
   crash between `start_action` and `attach_manifest`, or a safe/mutating
   action that snapshotted nothing. The undo engine must treat "no manifests"
