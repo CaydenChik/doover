@@ -59,6 +59,18 @@ confirm green → only then claim done. Build order and per-step test gates are 
   plainly rather than imply total coverage.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
+- **DONE (round 14): GC-vs-writer race.** Hooks are separate processes that
+  promote a content object into `objects/` and only THEN journal the manifest
+  referencing it. A `doover gc` racing that window saw an object no journal
+  row vouched for yet and deleted it — stranding the about-to-be-written
+  manifest, silent undo breakage. `Store::prune` now takes a `grace_ms` and
+  keeps any unreferenced object younger than the window (same guard
+  `clean_tmp` gives tmp files); gc passes `TMP_MAX_AGE_MS` (1h). Aged orphans
+  (crash leftovers) still collect on a later pass. Fail-safe: an object whose
+  mtime is unreadable is kept. This makes gc safe to run WHILE an agent works.
+  NOTE for test authors: a backdated "old" action must also backdate its
+  object's mtime (the rig's `action_at` does) — an old row with a fresh object
+  is a temporal impossibility the grace window will (correctly) shield.
 - **DONE (step 7): journal-row pruning + journal-relative retention.** `gc`
   prunes old unpinned/unreferenced rows (secret-bearing `raw_command`) and
   computes the cutoff from MAX(started_at_ms), never the wall clock. Known

@@ -66,9 +66,11 @@ pub fn gc(
     let cutoff = newest - opts.keep_days.max(0) * DAY_MS;
     report.cutoff_ms = Some(cutoff);
 
-    // store objects: everything the journal still vouches for stays
+    // store objects: everything the journal still vouches for stays. The
+    // grace window keeps just-promoted objects a concurrent hook has not yet
+    // journaled (GC-vs-writer race), so gc is safe to run while an agent works
     let live = journal.live_hashes(cutoff)?;
-    let (objects_removed, bytes_freed) = store.prune(&live, opts.dry_run)?;
+    let (objects_removed, bytes_freed) = store.prune(&live, TMP_MAX_AGE_MS, opts.dry_run)?;
     report.objects_removed = objects_removed;
     report.bytes_freed = bytes_freed;
 

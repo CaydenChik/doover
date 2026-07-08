@@ -11,6 +11,7 @@ use doover_core::journal::{Journal, ManifestRole, NewAction};
 use doover_core::maintenance::{self, GcOptions};
 use doover_core::snapshot::{EntryKind, Store, StoreOptions};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
@@ -71,15 +72,40 @@ impl Rig {
         self.journal
             .attach_manifest(id, &m, ManifestRole::Pre)
             .unwrap();
+        // faithful fixture: an object promoted for an action at time T has
+        // mtime ~T. Backdating the object too (not just the journal row) keeps
+        // old actions' objects genuinely old, so gc's grace window (which
+        // protects just-promoted, possibly-in-flight objects) does not falsely
+        // shield an object that is actually past retention.
+        self.backdate_object(&hash, at_ms);
         (id, hash)
     }
 
-    fn object_exists(&self, hash: &str) -> bool {
+    fn object_path(&self, hash: &str) -> Option<std::path::PathBuf> {
         self.store
             .object_paths()
             .unwrap()
-            .iter()
-            .any(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == *hash))
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == *hash))
+    }
+
+    fn backdate_object(&self, hash: &str, at_ms: i64) {
+        let Some(p) = self.object_path(hash) else {
+            return;
+        };
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(at_ms.max(0) as u64);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(when))
+            .unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o444)).unwrap();
+    }
+
+    fn object_exists(&self, hash: &str) -> bool {
+        self.object_path(hash).is_some()
     }
 }
 
@@ -409,4 +435,81 @@ fn dry_run_session_estimate_equals_real_deletion_exactly() {
     );
     // only session A is collectable this pass
     assert_eq!(s_real, 1, "exactly the cleanly-empty-old session");
+}
+
+/// Audit round 14 (GC-vs-writer race): a hook promotes an object to the
+/// content-addressed store and THEN journals the manifest that references it.
+/// A `doover gc` racing that window sees an object no journal row vouches for
+/// yet — deleting it strands the about-to-be-written manifest and silently
+/// breaks undo. Young unreferenced objects must be treated as possibly
+/// in-flight and kept; only objects aged past the grace window are reaped.
+#[test]
+fn gc_keeps_a_young_unreferenced_object_but_reaps_aged_orphans() {
+    let r = rig();
+    let base = doover_core::journal::now_ms();
+    // a normal referenced action so gc runs its full pass (non-empty journal)
+    r.action_at("keep.txt", "precious", base, "t1");
+
+    // the race window: object promoted to objects/, manifest NOT yet attached
+    let inflight = r.world.join("inflight.bin");
+    fs::write(&inflight, "just promoted, not yet journaled").unwrap();
+    let m = r.store.snapshot(&inflight, None).unwrap();
+    let hash = m
+        .entries
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntryKind::File { hash, .. } => Some(hash.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        r.object_exists(&hash),
+        "rig sanity: orphan object is in the store"
+    );
+
+    // gc while the object is young — it MUST survive
+    maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert!(
+        r.object_exists(&hash),
+        "young unreferenced object collected -> races a concurrent hook into data loss"
+    );
+
+    // age it past the grace window: now a genuine crash leftover
+    let obj_path = r
+        .store
+        .object_paths()
+        .unwrap()
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|f| f.to_string_lossy() == hash))
+        .unwrap();
+    fs::set_permissions(&obj_path, fs::Permissions::from_mode(0o644)).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&obj_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    let report = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert!(!r.object_exists(&hash), "aged orphan must be reaped");
+    assert!(report.objects_removed >= 1, "aged orphan counted");
 }

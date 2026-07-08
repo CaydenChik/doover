@@ -609,11 +609,21 @@ impl Store {
     /// (objects_removed, bytes_freed); `dry_run` only counts. Objects are
     /// immutable and content-addressed, so removal is always safe for
     /// anything outside the live set — the live set is the whole contract.
+    /// Remove content objects not in `live`. `grace_ms` protects objects
+    /// younger than the window: a hook promotes an object into `objects/` and
+    /// only THEN journals the manifest that references it, so a gc racing that
+    /// window would see a just-promoted object no journal row vouches for yet.
+    /// Deleting it strands the about-to-be-written manifest — silent undo
+    /// breakage. Young unreferenced objects are therefore treated as
+    /// possibly-in-flight and kept (same guard `clean_tmp` gives tmp files);
+    /// only aged orphans (crash leftovers) are reaped.
     pub fn prune(
         &self,
         live: &std::collections::BTreeSet<String>,
+        grace_ms: u64,
         dry_run: bool,
     ) -> Result<(u64, u64), SnapshotError> {
+        let now = SystemTime::now();
         let mut removed = 0u64;
         let mut bytes = 0u64;
         for path in self.object_paths()? {
@@ -623,7 +633,19 @@ impl Store {
             if live.contains(&hash) {
                 continue;
             }
-            let len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let meta = fs::metadata(&path);
+            // fail safe: if we cannot read the age, assume it might be
+            // in-flight and keep it (a later pass reaps it once readable)
+            let young = meta
+                .as_ref()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_none_or(|age| (age.as_millis() as u64) < grace_ms);
+            if young {
+                continue;
+            }
+            let len = meta.map(|m| m.len()).unwrap_or(0);
             if !dry_run {
                 fs::remove_file(&path).map_err(|e| io_err(&path, e))?;
                 // best-effort: drop the prefix dir if now empty
