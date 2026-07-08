@@ -2,11 +2,16 @@
 source: crates/doover-core/tests/registry.rs
 expression: "lines.join(\"\\n\")"
 ---
+coreutils.bunzip2 → Destructive | SnapshotRestore
+coreutils.bzip2 → Destructive | SnapshotRestore
 coreutils.cat → Safe | None
 coreutils.chmod → Destructive | SnapshotRestore
 coreutils.chown → Destructive | SnapshotRestore
 coreutils.cp → Destructive | SnapshotRestore
 coreutils.dd → Destructive | SnapshotRestore
+coreutils.gunzip → Destructive | SnapshotRestore
+coreutils.gzip → Destructive | SnapshotRestore
+coreutils.install → Destructive | SnapshotRestore
 coreutils.ln → Destructive | SnapshotRestore
 coreutils.ls → Safe | None
 coreutils.mkdir → Mutating | None
@@ -18,6 +23,10 @@ coreutils.tee → Destructive | SnapshotRestore
 coreutils.touch → Mutating | None
 coreutils.truncate → Destructive | SnapshotRestore
 coreutils.unlink → Destructive | SnapshotRestore
+coreutils.unxz → Destructive | SnapshotRestore
+coreutils.unzstd → Destructive | SnapshotRestore
+coreutils.xz → Destructive | SnapshotRestore
+coreutils.zstd → Destructive | SnapshotRestore
 git.checkout → Destructive | SnapshotRestore
 git.clean → Destructive | SnapshotRestore
 git.diff → Safe | None

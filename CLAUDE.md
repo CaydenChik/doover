@@ -57,6 +57,20 @@ confirm green → only then claim done. Build order and per-step test gates are 
   absolute paths outside cwd (`eval`, function bodies) are only partially
   covered. This is inherent to static analysis — the README/docs must state it
   plainly rather than imply total coverage.
+- **DONE (round 16): precise rules for common destructive commands that were
+  falling to the cwd-only fallback.** A resolver probe (destructive commands
+  with OUT-OF-CWD targets, so a miss can't hide behind cwd coverage) found
+  `install` and the `gzip`/`gunzip`/`bzip2`/`bunzip2`/`xz`/`unxz`/`zstd`/
+  `unzstd` family had NO rule → Unknown → cwd fallback → an out-of-cwd target
+  was silently unprotected. Added precise rules (coreutils.yaml); the probe
+  is now the `resolver_coverage.rs` regression test. No guarantee-violating
+  bug existed (every destructive command either captured its target or set
+  has_unknown), but precise capture strictly beats the lossy fallback.
+  ACCEPTED LIMITATIONS (documented, not bugs): `dd of=…` stays `paths: none`
+  → cwd fallback (target is `of=`, needs richer flag parsing); `sed -i.bak`
+  (attached-suffix form) isn't matched by `flags_any: [-i]` → cwd fallback,
+  but GNU sed writes the `.bak` backup so the original survives anyway, and a
+  prefix-match fix risks breaking the common `sed -i 's//' file` form.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
 - **DONE (round 15): restore is fail-closed on unsafe manifest paths.** `undo`

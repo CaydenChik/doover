@@ -84,6 +84,66 @@ rules:
     undo: snapshot-restore
     notes: "-sf silently replaces the target."
 
+  - id: coreutils.install
+    match: { command: install }
+    effect: destructive
+    scope:
+      paths: positional
+      flag_args: ["-m", "--mode", "-o", "--owner", "-g", "--group", "-s", "--strip-program", "-b", "--suffix", "-S"]
+    undo: snapshot-restore
+    notes: >
+      Copies sources over a destination, replacing it. `paths: positional`
+      captures the dest (and, harmlessly, the sources); a separate-word
+      `-t DIR` target also falls through as a captured positional. flag_args
+      swallows the value options so their values are not mistaken for paths.
+      Precise capture beats the cwd-only fallback for an out-of-cwd target.
+      `install -d` only creates dirs (no data at risk).
+
+  # Compressors that REPLACE the original file in place (gzip file -> file.gz,
+  # removing file). Undo snapshots the positional so the original is
+  # recoverable. `-c/--stdout` writes to stdout instead (then the capture is
+  # harmless over-work, not wrong). `-k/--keep` keeps the original (likewise).
+  - id: coreutils.gzip
+    match: { command: gzip }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.gunzip
+    match: { command: gunzip }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.bzip2
+    match: { command: bzip2 }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.bunzip2
+    match: { command: bunzip2 }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.xz
+    match: { command: xz }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.unxz
+    match: { command: unxz }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.zstd
+    match: { command: zstd }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+  - id: coreutils.unzstd
+    match: { command: unzstd }
+    effect: destructive
+    scope: { paths: positional }
+    undo: snapshot-restore
+
   - id: coreutils.mkdir
     match: { command: mkdir }
     effect: mutating
