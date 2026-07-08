@@ -555,3 +555,31 @@ fn gc_dry_run_does_not_count_a_young_unreferenced_object() {
     );
     assert_eq!(real.objects_removed, 0, "nothing collectable this pass");
 }
+
+/// Audit round 15: a pathological `--keep-days` must not overflow the cutoff
+/// arithmetic (i64 multiply/subtract). Saturating math keeps everything (the
+/// safe direction) instead of panicking in debug or wrapping in release.
+#[test]
+fn gc_keep_days_extreme_value_does_not_overflow() {
+    let r = rig();
+    let base = 1_000_000_000_000;
+    let (_old, h) = r.action_at("old.txt", "x", base, "t1");
+    r.action_at("new.txt", "y", base + 10 * DAY_MS, "t2");
+
+    // i64::MAX days: keep_days * DAY_MS overflows i64 without saturation
+    let report = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: i64::MAX,
+            dry_run: false,
+        },
+    )
+    .expect("gc must not panic on an extreme keep_days");
+    assert_eq!(
+        report.objects_removed, 0,
+        "an infinite window keeps everything"
+    );
+    assert!(r.object_exists(&h), "even the oldest object is retained");
+}

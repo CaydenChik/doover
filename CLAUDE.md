@@ -59,6 +59,24 @@ confirm green → only then claim done. Build order and per-step test gates are 
   plainly rather than imply total coverage.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
+- **DONE (round 15): restore is fail-closed on unsafe manifest paths.** `undo`
+  is a WRITE primitive fed from on-disk manifests (journal JSON). Restore now
+  refuses any entry whose `rel` is non-relative or contains `..`
+  (`rel_is_safe`), before any mutation — a corrupt/tampered manifest can no
+  longer steer `base.join(rel)` outside the target tree. The hash side was
+  already fail-closed (a traversing hash fails content-verify); this closes
+  the `rel` twin. NOT claimed as a security boundary — an agent can write
+  directly — this is corruption robustness + defense-in-depth.
+  STILL OPEN (accepted): `manifest.path` itself (the absolute restore root)
+  is unvalidated; a tampered one could aim `remove_any`/rename elsewhere. No
+  natural scope exists at the Store layer to check it against, and deleting
+  `manifest.path` IS correct undo semantics for an Absent action — same
+  non-escalating threat. Revisit only if a scope reference reaches the store.
+- **DONE (round 15): gc cutoff arithmetic saturates.** `--keep-days i64::MAX`
+  overflowed `keep_days * DAY_MS` (panic in debug, wrap in release). Now
+  `saturating_sub`/`saturating_mul` → cutoff floors at i64::MIN (infinite
+  window, keeps everything: the safe direction). resolver.rs already
+  saturates; this was the only remaining overflow-prone site.
 - **DONE (round 14): GC-vs-writer race.** Hooks are separate processes that
   promote a content object into `objects/` and only THEN journal the manifest
   referencing it. A `doover gc` racing that window saw an object no journal

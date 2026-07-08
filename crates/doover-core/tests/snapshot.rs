@@ -697,3 +697,66 @@ fn large_tree_round_trip() {
     j.store.restore(&m).unwrap();
     assert_eq!(fingerprint(&d), before);
 }
+
+// --- audit round 15: restore must not write outside the target tree ----------
+
+/// A manifest whose `rel` escapes the root (`..`) must be REFUSED, not
+/// materialized outside the staging dir. `rel` comes from a stored manifest
+/// (journal JSON on disk); a corrupted or tampered one could otherwise turn
+/// `undo` — a write primitive — into an arbitrary-path write. The hash side is
+/// already fail-closed (a traversing hash fails content-verify); `rel` needs
+/// the same discipline. Defense-in-depth / corruption robustness.
+#[test]
+fn restore_refuses_a_manifest_whose_rel_escapes_the_root() {
+    let j = jail();
+    let d = j.world.join("proj");
+    write(&d.join("x.txt"), "legit");
+    let mut m = snap(&j.store, &d, None);
+
+    // repoint the child entry outside the root, keeping its (valid) object
+    let child = m
+        .entries
+        .iter_mut()
+        .find(|e| !e.rel.as_os_str().is_empty())
+        .expect("a child entry");
+    child.rel = PathBuf::from("../escape.txt");
+
+    let escapee = j.world.join("escape.txt");
+    let result = j.store.restore(&m);
+
+    assert!(
+        result.is_err(),
+        "restore of a traversing rel must be refused"
+    );
+    assert!(
+        !escapee.exists(),
+        "restore wrote OUTSIDE the target tree: {}",
+        escapee.display()
+    );
+}
+
+/// The absolute-path variant: an entry `rel` that is itself absolute would,
+/// under a naive `base.join(abs)`, discard `base` entirely and write at the
+/// absolute location. Must also be refused.
+#[test]
+fn restore_refuses_a_manifest_whose_rel_is_absolute() {
+    let j = jail();
+    let d = j.world.join("proj");
+    write(&d.join("x.txt"), "legit");
+    let mut m = snap(&j.store, &d, None);
+
+    let victim = j.world.join("victim.txt");
+    let child = m
+        .entries
+        .iter_mut()
+        .find(|e| !e.rel.as_os_str().is_empty())
+        .unwrap();
+    child.rel = victim.clone(); // absolute
+
+    let result = j.store.restore(&m);
+    assert!(result.is_err(), "absolute rel must be refused");
+    assert!(
+        !victim.exists(),
+        "restore wrote to an absolute path outside the tree"
+    );
+}

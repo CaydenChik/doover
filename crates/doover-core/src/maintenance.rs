@@ -63,7 +63,10 @@ pub fn gc(
     let Some(newest) = journal.max_started_at()? else {
         return Ok(report); // nothing journaled: nothing else to judge
     };
-    let cutoff = newest - opts.keep_days.max(0) * DAY_MS;
+    // saturating: a pathological --keep-days must not overflow the i64 window
+    // (panic in debug, wrap in release). Saturation lands at i64::MIN — an
+    // infinite retention window that keeps everything, the safe direction.
+    let cutoff = newest.saturating_sub(opts.keep_days.max(0).saturating_mul(DAY_MS));
     report.cutoff_ms = Some(cutoff);
 
     // store objects: everything the journal still vouches for stays. The

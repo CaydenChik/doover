@@ -38,6 +38,22 @@ pub enum SnapshotError {
     CorruptObject { hash: String },
     #[error("store object {hash} is missing; restore refused")]
     MissingObject { hash: String },
+    #[error(
+        "manifest entry path {0:?} is not a safe relative path (escapes the root); restore refused"
+    )]
+    UnsafeManifestPath(PathBuf),
+}
+
+/// A manifest `rel` must stay inside the restore root: relative, with only
+/// normal or `.` components — no `..`, no absolute/root prefix. `rel` is read
+/// from a stored manifest (journal JSON), so a corrupted or tampered one could
+/// otherwise steer `base.join(rel)` outside the staging tree and make `undo`
+/// write to an arbitrary path. Our own snapshot walk never produces such a
+/// path; this is fail-closed defense-in-depth, matching the hash-verify pass.
+fn rel_is_safe(rel: &Path) -> bool {
+    use std::path::Component;
+    rel.components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 fn io_err(path: &Path, source: io::Error) -> SnapshotError {
@@ -318,6 +334,16 @@ impl Store {
     pub fn restore(&self, manifest: &Manifest) -> Result<RestoreReport, SnapshotError> {
         let mut report = RestoreReport::default();
         let target_root = &manifest.path;
+
+        // fail-closed BEFORE any mutation: refuse a manifest whose entry paths
+        // would escape the restore root (`..`/absolute). undo is a write
+        // primitive fed from on-disk manifests; a corrupt one must never write
+        // outside the target tree.
+        for entry in &manifest.entries {
+            if !rel_is_safe(&entry.rel) {
+                return Err(SnapshotError::UnsafeManifestPath(entry.rel.clone()));
+            }
+        }
 
         if manifest.root == Root::Absent {
             remove_any(target_root)?;
