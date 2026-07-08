@@ -624,7 +624,21 @@ impl Journal {
                 [cutoff_ms],
                 |r| r.get(0),
             )?;
-            return Ok((n as u64, 0));
+            // honest estimate, not a hardcoded zero: old sessions that are
+            // already empty or whose every action is itself a candidate
+            let s: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM sessions s
+                 WHERE s.started_at_ms < ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM actions a WHERE a.session_id = s.id
+                       AND NOT (a.started_at_ms < ?1 AND a.pinned = 0
+                                AND a.status != 'pending'
+                                AND NOT EXISTS (SELECT 1 FROM actions r
+                                                WHERE r.target_action_id = a.id)))",
+                [cutoff_ms],
+                |r| r.get(0),
+            )?;
+            return Ok((n as u64, s as u64));
         }
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<(u64, u64), JournalError> {
@@ -636,10 +650,15 @@ impl Journal {
                 &format!("DELETE FROM actions WHERE id IN (SELECT a.id {CANDIDATES})"),
                 [cutoff_ms],
             )? as u64;
+            // empty AND old (journal-relative), never merely empty: a session
+            // between begin_session and its first start_action is empty but
+            // live — deleting it would break the in-flight hook's FK insert
+            // and silently drop that action's protection
             let sessions = self.conn.execute(
                 "DELETE FROM sessions
-                 WHERE id NOT IN (SELECT DISTINCT session_id FROM actions)",
-                [],
+                 WHERE started_at_ms < ?1
+                   AND id NOT IN (SELECT DISTINCT session_id FROM actions)",
+                [cutoff_ms],
             )? as u64;
             Ok((actions, sessions))
         })();

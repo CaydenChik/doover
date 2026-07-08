@@ -291,3 +291,48 @@ fn gc_on_an_empty_journal_is_a_noop() {
 /// Path helper used by other suites lives here to keep it near its tests.
 #[allow(dead_code)]
 fn unused(_p: &Path) {}
+
+/// Audit round 12: a session begun by an in-flight hook (begin_session
+/// committed, first start_action not yet — classify+snapshot can take
+/// seconds) must survive pruning, or the action insert hits a dead foreign
+/// key and the hook fails open, silently unprotected. Session deletion must
+/// be journal-relative like everything else: empty AND old.
+#[test]
+fn prune_keeps_a_just_begun_empty_session_but_collects_old_ones() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    r.journal
+        .begin_session("in-flight", "claude-code", "/p")
+        .unwrap();
+
+    // cutoff in the past: the fresh empty session survives …
+    let (a, s) = r.journal.prune_before(now - 10_000, false).unwrap();
+    assert_eq!((a, s), (0, 0), "nothing is old enough to prune");
+    // … and the invariant that matters: its first action can still land
+    r.journal
+        .start_action(&NewAction {
+            session_id: "in-flight",
+            tool_use_id: Some("t-live"),
+            raw_command: "rm x",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .expect("in-flight session must still accept its first action");
+
+    // a genuinely old empty session IS collected (cutoff after its start);
+    // dry-run must estimate it, not report a hardcoded zero
+    r.journal
+        .begin_session("stale-empty", "claude-code", "/p")
+        .unwrap();
+    let future = now + 10 * DAY_MS;
+    let (_, s_est) = r.journal.prune_before(future, true).unwrap();
+    assert!(s_est >= 1, "dry-run must estimate session pruning, got 0");
+    let before = r.journal.stats().unwrap().0;
+    let (_, s_real) = r.journal.prune_before(future, false).unwrap();
+    let after = r.journal.stats().unwrap().0;
+    assert!(s_real >= 1, "old empty session must be collected");
+    assert_eq!(before - after, s_real, "report must match reality");
+    // the in-flight session still has a (pending) action → still alive
+    assert!(after >= 1);
+}

@@ -97,6 +97,99 @@ fn init_merges_with_existing_settings() {
 }
 
 #[test]
+fn init_errors_on_unmergeable_hooks_shape_instead_of_lying() {
+    // audit round 12: valid JSON whose SHAPE we cannot merge into used to
+    // print "already installed" (a lie — nothing was installed) or silently
+    // install only one of the two hooks. Must be a loud error, file untouched.
+    for bad in [
+        r#"{"hooks": []}"#,
+        r#"{"hooks": "oops"}"#,
+        r#"{"hooks": {"PreToolUse": {}}}"#,
+        r#"{"hooks": {"PreToolUse": {}, "PostToolUse": []}}"#,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(tmp.path().join(".claude/settings.json"), bad).unwrap();
+        Command::cargo_bin("doover")
+            .unwrap()
+            .args(["init", "--project"])
+            .current_dir(tmp.path())
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("cannot merge"));
+        let after = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(after, bad, "unmergeable settings must not be modified");
+    }
+}
+
+#[test]
+fn init_recognizes_hand_edited_absolute_path_hooks() {
+    // a user who pinned the hook to an absolute binary path must not get a
+    // duplicate entry on re-init
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    std::fs::write(
+        tmp.path().join(".claude/settings.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/doover hook pre"}]}]}}"#,
+    )
+    .unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    let s = std::fs::read_to_string(tmp.path().join(".claude/settings.json")).unwrap();
+    assert_eq!(s.matches("hook pre").count(), 1, "no duplicate pre hook");
+    assert!(s.contains("doover hook post"), "post hook still added");
+}
+
+#[test]
+fn init_write_failure_is_a_clean_error_with_no_droppings() {
+    // atomic write: a failed install must not leave temp files or a torn
+    // settings.json behind
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot write"));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        std::fs::read_dir(&dir).unwrap().next().is_none(),
+        "no temp droppings after a failed write"
+    );
+}
+
+#[test]
+fn doctor_finds_project_level_hooks() {
+    // audit round 12: doctor only looked at ~/.claude — after `init
+    // --project` it told the user to run init again
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .current_dir(tmp.path())
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hooks installed"));
+}
+
+#[test]
 fn init_refuses_to_clobber_malformed_settings() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();

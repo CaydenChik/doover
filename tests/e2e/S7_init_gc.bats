@@ -37,7 +37,8 @@ teardown() { rm -rf "$JAIL"; }
     | "$DOOVER_BIN" hook pre
   run "$DOOVER_BIN" status
   [ "$status" -eq 0 ]
-  [[ "$output" == *"1 pending"* ]] || [[ "$output" == *"actions:"* ]]
+  # exactly the journaled action, in its real state — no tautological fallback
+  [[ "$output" == *"1 pending"* ]]
 }
 
 @test "S7: gc dry-run reports without deleting; real gc frees nothing recent" {

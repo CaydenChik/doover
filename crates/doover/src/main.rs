@@ -270,7 +270,18 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
         return 1;
     }
 
-    let added = install_bash_hooks(&mut root);
+    // shape errors are loud: "valid JSON we cannot merge into" must never
+    // read as success (audit round 12 — the dual of the malformed-JSON check)
+    let added = match install_bash_hooks(&mut root) {
+        Ok(a) => a,
+        Err(why) => {
+            eprintln!(
+                "doover: cannot merge hooks into {}: {why}; fix the file and re-run doover init",
+                settings_path.display()
+            );
+            return 1;
+        }
+    };
     if !added {
         println!(
             "doover hooks already installed in {}",
@@ -278,7 +289,13 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
         );
         return 0;
     }
-    let rendered = serde_json::to_string_pretty(&root).unwrap_or_default();
+    let rendered = match serde_json::to_string_pretty(&root) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("doover: cannot serialize settings: {e}");
+            return 1;
+        }
+    };
     if dry_run {
         println!("would write {} :\n{rendered}", settings_path.display());
         return 0;
@@ -289,7 +306,9 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
             return 1;
         }
     }
-    if let Err(e) = std::fs::write(&settings_path, rendered + "\n") {
+    // atomic replace: settings.json is the USER'S config — a crash mid-write
+    // must never leave it torn (write temp in the same dir, then rename)
+    if let Err(e) = write_atomic(&settings_path, &(rendered + "\n")) {
         eprintln!("doover: cannot write {}: {e}", settings_path.display());
         return 1;
     }
@@ -300,16 +319,48 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
     0
 }
 
+/// Write via temp-file-then-rename so the target is never observed torn.
+/// Cleans up the temp file if the rename fails.
+fn write_atomic(path: &std::path::Path, data: &str) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp = dir
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(format!(".doover-init.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, data)?;
+    let renamed = std::fs::rename(&tmp, path);
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    renamed
+}
+
 /// Merge doover's PreToolUse/PostToolUse Bash hooks into a settings object.
-/// Returns true if anything was added (false = already present).
-fn install_bash_hooks(root: &mut serde_json::Value) -> bool {
+/// Ok(true) = added, Ok(false) = both already present (idempotent re-run),
+/// Err = an existing value has a shape we refuse to guess at. All-or-
+/// nothing: a shape error anywhere means NOTHING was modified.
+fn install_bash_hooks(root: &mut serde_json::Value) -> Result<bool, String> {
     use serde_json::{Value, json};
     let obj = root.as_object_mut().expect("checked object");
+
+    // validate every shape we will touch BEFORE mutating anything
+    if let Some(h) = obj.get("hooks") {
+        if !h.is_object() {
+            return Err("the \"hooks\" key is not an object".into());
+        }
+        for event in ["PreToolUse", "PostToolUse"] {
+            if let Some(v) = h.get(event) {
+                if !v.is_array() {
+                    return Err(format!("hooks.{event} is not an array"));
+                }
+            }
+        }
+    }
+
     let hooks = obj
         .entry("hooks")
         .or_insert_with(|| json!({}))
-        .as_object_mut();
-    let Some(hooks) = hooks else { return false };
+        .as_object_mut()
+        .expect("validated above");
 
     let mut changed = false;
     for (event, cmd) in [
@@ -319,16 +370,20 @@ fn install_bash_hooks(root: &mut serde_json::Value) -> bool {
         let arr = hooks
             .entry(event)
             .or_insert_with(|| json!([]))
-            .as_array_mut();
-        let Some(arr) = arr else { continue };
-        // already present? look for our command anywhere in a Bash matcher
+            .as_array_mut()
+            .expect("validated above");
+        // already present? contains-match so a hand-edited absolute path
+        // ("/usr/local/bin/doover hook pre") is not duplicated
         let present = arr.iter().any(|entry| {
             entry
                 .get("hooks")
                 .and_then(Value::as_array)
                 .is_some_and(|hs| {
-                    hs.iter()
-                        .any(|h| h.get("command").and_then(Value::as_str) == Some(cmd))
+                    hs.iter().any(|h| {
+                        h.get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| c.contains(cmd))
+                    })
                 })
         });
         if !present {
@@ -339,7 +394,7 @@ fn install_bash_hooks(root: &mut serde_json::Value) -> bool {
             changed = true;
         }
     }
-    changed
+    Ok(changed)
 }
 
 fn cfg_journal_store() -> Option<(
@@ -398,7 +453,11 @@ fn run_status() -> i32 {
             return 1;
         }
     };
-    let objects = store.object_count().unwrap_or(0);
+    // never report an unreadable store as "0 objects" — say so
+    let objects = match store.object_count() {
+        Ok(n) => n.to_string(),
+        Err(e) => format!("unreadable ({e})"),
+    };
     println!("doover home:  {}", dh.display());
     println!("sessions:     {sessions}");
     print!("actions:      ");
@@ -479,14 +538,18 @@ fn run_doctor() -> i32 {
         }
     }
 
-    // 4. hooks installed?
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let settings = home.map(|h| h.join(".claude/settings.json"));
-    match settings.as_ref().map(std::fs::read_to_string) {
-        Some(Ok(text)) if text.contains("doover hook pre") => {
-            println!("  [ok]   Claude Code hooks installed");
-        }
-        _ => println!("  [warn] Claude Code hooks not found — run `doover init`"),
+    // 4. hooks installed? check the project settings AND the global ones —
+    // `init --project` is a first-class install (audit round 12)
+    let mut candidates = vec![std::path::PathBuf::from(".claude/settings.json")];
+    if let Some(h) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(h).join(".claude/settings.json"));
+    }
+    let installed_at = candidates
+        .iter()
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains("doover hook pre")));
+    match installed_at {
+        Some(p) => println!("  [ok]   Claude Code hooks installed ({})", p.display()),
+        None => println!("  [warn] Claude Code hooks not found — run `doover init`"),
     }
 
     if problems == 0 {
