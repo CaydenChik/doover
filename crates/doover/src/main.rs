@@ -491,21 +491,28 @@ fn run_diff(id: i64) -> i32 {
     }
     let mut changed = 0u64;
     let mut total = 0u64;
+    let mut partial = false;
     for m in &manifests {
-        let lines = match doover_core::inspect::diff_manifest(m) {
-            Ok(l) => l,
+        let report = match doover_core::inspect::diff_manifest(m) {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("doover: diff failed for {}: {e}", m.path.display());
                 return 1;
             }
         };
-        for line in lines {
+        partial |= report.partial;
+        for line in report.lines {
             total += 1;
             if line.status != doover_core::inspect::PathStatus::Unchanged {
                 changed += 1;
             }
             println!("  {:<12} {}", line.status.as_str(), line.path.display());
         }
+    }
+    if partial {
+        // the recorded snapshot was truncated at limits: this comparison is
+        // incomplete, and so is what undo could restore — say so plainly
+        println!("  note: the recorded snapshot was truncated; this diff is PARTIAL");
     }
     println!(
         "{changed} of {total} path(s) differ from the pre-state of action #{id}{}",

@@ -116,6 +116,41 @@ fn show_unknown_id_is_a_clear_error() {
 }
 
 #[test]
+fn diff_flags_a_truncated_snapshot_as_partial() {
+    // audit round 13: if the pre-snapshot was truncated at limits, the diff
+    // covers only part of the tree — and so does what undo could restore. The
+    // user must be told, not shown a clean-looking partial comparison.
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(cwd.join("d")).unwrap();
+    for i in 0..6 {
+        std::fs::write(cwd.join("d").join(format!("f{i}.txt")), "x").unwrap();
+    }
+    let ev = |event: &str| {
+        serde_json::json!({
+            "session_id": "s", "cwd": cwd.to_string_lossy(),
+            "hook_event_name": event, "tool_name": "Bash", "tool_use_id": "t",
+            "tool_input": { "command": "rm -rf d" }
+        })
+        .to_string()
+    };
+    hook_cmd(&dh, "pre")
+        .env("DOOVER_MAX_FILES", "2") // force truncation
+        .write_stdin(ev("PreToolUse"))
+        .assert()
+        .success();
+
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["diff", "1"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("PARTIAL"));
+}
+
+#[test]
 fn diff_reports_per_path_status_against_the_current_world() {
     let (tmp, dh) = journal_one_action("rm keep.txt");
     // mutate after the action: the pre-state should now read as modified

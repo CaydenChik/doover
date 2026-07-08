@@ -69,13 +69,26 @@ confirm green → only then claim done. Build order and per-step test gates are 
   stranded old row must error cleanly (NothingToRestore / missing object),
   never panic or partially restore — the round-6/10 zero-manifest and
   fail-closed-restore guards already cover this.
-- **DONE (step 8): display-time secret redaction.** `log` and `show` pass
-  `raw_command` through `redact::redact()` (auth headers, bearer tokens,
-  secret-bearing flags, credential-named env assignments). The journal keeps
-  the raw string — undo semantics and audit ground truth are unchanged.
-  Pattern-based hygiene, NOT a DLP guarantee: exotic secret shapes get
-  through; user docs must say so. Any future user-facing display of
-  `raw_command` MUST go through `redact()` too.
+- **DONE (step 8, hardened round 13): display-time secret redaction.** `log`
+  and `show` pass `raw_command` through `redact::redact()`: auth/API-key
+  headers, bearer tokens, secret-bearing flags, credential-named env
+  assignments, `-u user:pass` basic auth, and `scheme://user:pass@host` URL
+  userinfo. The journal keeps the raw string — undo semantics and audit
+  ground truth are unchanged. The MIRROR failure is over-redaction: `-u`
+  discriminates `user:pass` from `uid:gid` (docker) and port maps, verified
+  by test. Pattern-based hygiene, NOT DLP: exotic shapes get through; docs
+  must say so. Any future user-facing display of `raw_command` MUST go
+  through `redact()`. Verified: the hook protection-gap warnings carry paths,
+  not commands, so they are the only other command-adjacent output and do not
+  leak.
+- **DONE (round 13): `diff` degrades, never lies.** `diff_manifest` returns a
+  `DiffReport { lines, partial }`. One unreadable file is `Unreadable`, not a
+  fatal abort (informational command must not hide everything over one locked
+  file). A root whose identity changed (dir → symlink) is reported and the
+  walk STOPS — children are never stat'd through an impostor (misleading
+  statuses + unbounded hashing of an unrelated tree). A truncated pre-manifest
+  flags `partial`, and the CLI prints "this diff is PARTIAL" — same
+  loud-coverage-gap honesty as the round-9 hook path.
 - **A completed action can legitimately have zero manifests** (step 6): a
   crash between `start_action` and `attach_manifest`, or a safe/mutating
   action that snapshotted nothing. The undo engine must treat "no manifests"
