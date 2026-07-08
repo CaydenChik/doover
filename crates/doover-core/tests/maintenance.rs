@@ -513,3 +513,45 @@ fn gc_keeps_a_young_unreferenced_object_but_reaps_aged_orphans() {
     assert!(!r.object_exists(&hash), "aged orphan must be reaped");
     assert!(report.objects_removed >= 1, "aged orphan counted");
 }
+
+/// Audit round 14 (reporting honesty, round-12 lesson applied to the new
+/// grace window): a young unreferenced object is KEPT by a real gc, so
+/// `--dry-run` must not COUNT it as removable — dry-run and real must agree
+/// exactly, or the estimate lies about what gc will do.
+#[test]
+fn gc_dry_run_does_not_count_a_young_unreferenced_object() {
+    let r = rig();
+    let base = doover_core::journal::now_ms();
+    r.action_at("keep.txt", "precious", base, "t1"); // referenced, ages the journal
+
+    // young, unreferenced (in-flight window) — real gc keeps it
+    let inflight = r.world.join("inflight.bin");
+    fs::write(&inflight, "promoted, not journaled").unwrap();
+    r.store.snapshot(&inflight, None).unwrap();
+
+    let dry = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: true,
+        },
+    )
+    .unwrap();
+    let real = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        dry.objects_removed, real.objects_removed,
+        "dry-run must not count the young object the real run keeps"
+    );
+    assert_eq!(real.objects_removed, 0, "nothing collectable this pass");
+}
