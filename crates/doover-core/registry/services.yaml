@@ -1,0 +1,74 @@
+# doover reversibility registry — external services & clients (data: CC0-1.0)
+#
+# These commands reach state a LOCAL snapshot cannot capture: databases,
+# container/cluster daemons, remote hosts. doover cannot undo them. The honest
+# thing is to FLAG them (externalizing/irreversible) so the journal records
+# "this happened and cannot be reversed" — and to NOT waste a full-cwd snapshot
+# on state that does not live in the working tree (which is what the generic
+# unknown fallback would otherwise do).
+
+rules:
+  - id: services.rsync
+    match: { command: rsync }
+    effect: destructive
+    scope:
+      paths: positional-last
+      flag_args: ["-e", "--rsh", "--exclude", "--include", "--filter", "--files-from", "--chmod", "--bwlimit", "--timeout", "--log-file"]
+    undo: snapshot-restore
+    notes: >
+      The destination (last positional) is overwritten; --delete removes files
+      under it. A remote dest (`host:/path`) captures as a harmless bogus local
+      path, and the local source is read-only. flag_args swallows value options
+      so their arguments are not mistaken for the destination.
+
+  - id: services.redis-cli
+    match: { command: redis-cli }
+    effect: externalizing
+    undo: none
+    notes: "Redis client; FLUSHALL/FLUSHDB/DEL are irreversible and live on the server, not the filesystem."
+
+  - id: services.psql
+    match: { command: psql }
+    effect: externalizing
+    undo: none
+    notes: "PostgreSQL client; DROP/DELETE/TRUNCATE live in the database — no local snapshot can reach them."
+
+  - id: services.mysql
+    match: { command: mysql }
+    effect: externalizing
+    undo: none
+    notes: "MySQL client; DROP/DELETE live in the database."
+
+  - id: services.mongosh
+    match: { command: mongosh }
+    effect: externalizing
+    undo: none
+    notes: "MongoDB shell; drops/deletes live in the database."
+
+  - id: services.mongo
+    match: { command: mongo }
+    effect: externalizing
+    undo: none
+    notes: "Legacy MongoDB shell."
+
+  - id: services.kubectl-delete
+    match: { command: kubectl, subcommand: delete }
+    effect: externalizing
+    undo: none
+    notes: >
+      Deletes cluster resources — irreversible, but the effect lives on the
+      cluster, beyond any local snapshot. Classified `externalizing` (the
+      "no snapshot can reach it" tier) so it is flagged without a pointless
+      cwd snapshot; the note conveys the danger.
+
+  - id: services.docker-rm
+    match: { command: docker, subcommand: rm }
+    effect: externalizing
+    undo: none
+    notes: "Removes a container; daemon state, not the filesystem."
+
+  - id: services.docker-rmi
+    match: { command: docker, subcommand: rmi }
+    effect: externalizing
+    undo: none
+    notes: "Removes an image from the daemon."

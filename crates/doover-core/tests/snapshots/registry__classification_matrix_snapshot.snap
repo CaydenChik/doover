@@ -57,5 +57,14 @@ posix.stat → Safe | None
 posix.tail → Safe | None
 posix.wc → Safe | None
 posix.which → Safe | None
+services.docker-rm → Externalizing | None
+services.docker-rmi → Externalizing | None
+services.kubectl-delete → Externalizing | None
+services.mongo → Externalizing | None
+services.mongosh → Externalizing | None
+services.mysql → Externalizing | None
+services.psql → Externalizing | None
+services.redis-cli → Externalizing | None
+services.rsync → Destructive | SnapshotRestore
 shell.redirect-append → Mutating | None
 shell.redirect-truncate → Destructive | SnapshotRestore

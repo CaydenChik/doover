@@ -460,7 +460,10 @@ impl Walker<'_> {
         }
         if sev >= Severity::Destructive && contributed == 0 {
             // destructive action with no pre-snapshottable paths: the engine
-            // must fall back to the unknown policy rather than claim coverage
+            // must fall back to the unknown policy rather than claim coverage.
+            // (External-state actions doover cannot snapshot are classified
+            // `externalizing` — below this threshold — so they are flagged
+            // without triggering a pointless cwd snapshot.)
             self.out.mark_unknown();
         }
     }

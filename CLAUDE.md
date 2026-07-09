@@ -98,6 +98,25 @@ confirm green → only then claim done. Build order and per-step test gates are 
   still flags externalizing. Revisit if effects ever become multi-valued.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
+- **DONE (D3 corpus audit): long-tail coverage measured, not guessed.** A
+  broad corpus probe found ZERO silent misses — nothing destructive/
+  irreversible classifies as `safe`; the unknown→cwd-fallback default is a
+  solid safety floor, now locked by `resolver_corpus_safety.rs`. Two quality
+  fixes on top: (1) `rsync` gets precise dest capture (positional-last) instead
+  of the cwd-only fallback; (2) external-state commands (`redis-cli`, `psql`,
+  `mysql`, `mongo(sh)`, `kubectl delete`, `docker rm`/`rmi`) are now
+  `externalizing` in `services.yaml` — FLAGGED as un-undoable AND no longer
+  triggering a pointless full-cwd snapshot of the project for state that isn't
+  in the working tree (which the generic unknown path did, and which could burn
+  the D1 time budget). MODEL (load-bearing, enforced by
+  `every_destructive_or_irreversible_rule_has_an_undo_strategy`): Destructive/
+  Irreversible = the "we snapshot before" tier (MUST have snapshot-restore;
+  `shred` fits — irreversible but we capture the pre-state); Externalizing and
+  below = the "no local snapshot can reach it" tier (undo: none). External
+  destruction → `externalizing`, never `irreversible`.
+  ACCEPTED (fallback is fine): tar/unzip/patch/perl -i/npm ci/make clean stay
+  on the unknown cwd fallback — covers the common in-cwd case; precise capture
+  is complex (combined flags, extraction dirs) and low marginal value.
 - **DONE (round 15): restore is fail-closed on unsafe manifest paths.** `undo`
   is a WRITE primitive fed from on-disk manifests (journal JSON). Restore now
   refuses any entry whose `rel` is non-relative or contains `..`

@@ -123,6 +123,7 @@ const SHIPPED: &[(&str, &str)] = &[
     ("git.yaml", include_str!("../registry/git.yaml")),
     ("net.yaml", include_str!("../registry/net.yaml")),
     ("posix.yaml", include_str!("../registry/posix.yaml")),
+    ("services.yaml", include_str!("../registry/services.yaml")),
 ];
 
 pub struct Registry {
