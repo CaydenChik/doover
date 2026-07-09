@@ -40,6 +40,31 @@ pub enum UnknownPolicy {
     Passthrough,
 }
 
+/// Default wall-clock budget for a single snapshot. Sized to finish, wrap up,
+/// and journal comfortably inside the harness hook timeout (installed at 20s),
+/// so the loud PARTIAL-coverage gap always wins the race against a SIGKILL
+/// rather than losing it (bench D1).
+const DEFAULT_SNAPSHOT_MS: u64 = 5_000;
+
+fn snapshot_budget() -> Option<std::time::Duration> {
+    parse_snapshot_budget(std::env::var("DOOVER_MAX_SNAPSHOT_MS").ok().as_deref())
+}
+
+/// Parse `DOOVER_MAX_SNAPSHOT_MS`, fail-safe. Unset or unparseable → the 5s
+/// default; an explicit `0` → no budget (unlimited, the documented opt-out).
+/// Garbage never silently reduces protection to nothing.
+fn parse_snapshot_budget(v: Option<&str>) -> Option<std::time::Duration> {
+    let default = std::time::Duration::from_millis(DEFAULT_SNAPSHOT_MS);
+    match v {
+        None => Some(default),
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+            Err(_) => Some(default),
+        },
+    }
+}
+
 pub struct HookConfig {
     /// Store + journal + user registry overlay live here (default ~/.doover).
     pub doover_home: PathBuf,
@@ -78,6 +103,7 @@ impl HookConfig {
             limits: Limits {
                 max_files: env_u64("DOOVER_MAX_FILES", 100_000),
                 max_bytes: env_u64("DOOVER_MAX_BYTES", 5 * 1024 * 1024 * 1024),
+                max_duration: snapshot_budget(),
             },
             unknown_policy,
         }
@@ -304,4 +330,31 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
         }
     }
     Ok(action)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{DEFAULT_SNAPSHOT_MS, parse_snapshot_budget};
+    use std::time::Duration;
+
+    #[test]
+    fn budget_parse_is_fail_safe() {
+        let default = Some(Duration::from_millis(DEFAULT_SNAPSHOT_MS));
+        // unset and garbage both fall to the safe default — never off
+        assert_eq!(parse_snapshot_budget(None), default);
+        assert_eq!(parse_snapshot_budget(Some("nonsense")), default);
+        assert_eq!(parse_snapshot_budget(Some("-5")), default);
+        assert_eq!(parse_snapshot_budget(Some("")), default);
+        // explicit 0 is the documented "no budget" opt-out
+        assert_eq!(parse_snapshot_budget(Some("0")), None);
+        // a real value is honored (whitespace tolerated)
+        assert_eq!(
+            parse_snapshot_budget(Some("2500")),
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(
+            parse_snapshot_budget(Some("  8000 ")),
+            Some(Duration::from_millis(8000))
+        );
+    }
 }

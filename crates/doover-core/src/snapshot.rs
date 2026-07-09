@@ -24,7 +24,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
@@ -74,6 +74,11 @@ pub struct StoreOptions {
 pub struct Limits {
     pub max_files: u64,
     pub max_bytes: u64,
+    /// Wall-clock ceiling for a single snapshot. `None` = no time limit.
+    /// When exceeded the walk stops and the manifest is marked `truncated` — a
+    /// loud, journaled coverage gap — instead of letting the hook run past the
+    /// harness timeout and be SIGKILLed with nothing recorded (bench D1).
+    pub max_duration: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -220,8 +225,25 @@ impl Store {
         // recording a warning and continuing, never aborting the whole snapshot
         let mut files: u64 = 0;
         let mut bytes: u64 = 0;
+        // wall-clock budget: stop the walk cleanly before the hook runs past the
+        // harness timeout and is SIGKILLed with nothing journaled (bench D1).
+        // Checked between entries, so overshoot is bounded by one entry's cost.
+        let deadline = limits
+            .and_then(|l| l.max_duration)
+            .map(|d| Instant::now() + d);
         let walker = walkdir::WalkDir::new(path).sort_by_file_name();
         for item in walker {
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    manifest.truncated = true;
+                    manifest.warnings.push(format!(
+                        "snapshot time budget exceeded; PARTIAL coverage — stopped after \
+                         {} entries (undo of this action can only restore what was captured)",
+                        manifest.entries.len()
+                    ));
+                    break;
+                }
+            }
             let item = match item {
                 Ok(i) => i,
                 Err(e) => {

@@ -366,7 +366,7 @@ fn install_bash_hooks(root: &mut serde_json::Value) -> Result<bool, String> {
         if !present {
             arr.push(json!({
                 "matcher": "Bash",
-                "hooks": [{ "type": "command", "command": cmd, "timeout": 10 }]
+                "hooks": [{ "type": "command", "command": cmd, "timeout": 20 }]
             }));
             changed = true;
         }

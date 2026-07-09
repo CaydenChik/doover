@@ -309,6 +309,7 @@ fn limits_truncate_and_report() {
     let limits = Limits {
         max_files: 5,
         max_bytes: u64::MAX,
+        max_duration: None,
     };
     let m = snap(&j.store, &d, Some(&limits));
     assert!(m.truncated, "exceeding max_files must set truncated");
@@ -448,6 +449,7 @@ fn max_bytes_limit_truncates() {
     let limits = Limits {
         max_files: u64::MAX,
         max_bytes: 2500,
+        max_duration: None,
     };
     let m = j.store.snapshot(&d, Some(&limits)).unwrap();
     assert!(m.truncated, "byte budget exceeded must set truncated");
@@ -759,4 +761,56 @@ fn restore_refuses_a_manifest_whose_rel_is_absolute() {
         !victim.exists(),
         "restore wrote to an absolute path outside the tree"
     );
+}
+
+// --- time budget (bench D1) --------------------------------------------------
+
+/// A snapshot must stop at its wall-clock budget and mark the manifest
+/// `truncated` (a loud, partial coverage gap) rather than run unbounded into
+/// the harness hook timeout. Determinism: 2,000 files cannot be captured in
+/// ~0 ms on any machine, so a spent (ZERO) budget truncates for certain — no
+/// wall-clock race.
+#[test]
+fn snapshot_stops_at_a_time_budget_and_marks_partial() {
+    let j = jail();
+    let d = j.world.join("big");
+    for i in 0..2000 {
+        write(&d.join(format!("f{i:04}.txt")), "x");
+    }
+
+    let spent = Limits {
+        max_files: u64::MAX,
+        max_bytes: u64::MAX,
+        max_duration: Some(std::time::Duration::ZERO),
+    };
+    let m = j.store.snapshot(&d, Some(&spent)).unwrap();
+    assert!(
+        m.truncated,
+        "a spent time budget must truncate the snapshot"
+    );
+    assert!(
+        m.entries.len() < 2001,
+        "capture must be partial, got {}",
+        m.entries.len()
+    );
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.to_lowercase().contains("budget")),
+        "a time-budget cutoff must be a loud warning: {:?}",
+        m.warnings
+    );
+
+    // a generous budget captures the whole tree, no truncation
+    let roomy = Limits {
+        max_files: u64::MAX,
+        max_bytes: u64::MAX,
+        max_duration: Some(std::time::Duration::from_secs(120)),
+    };
+    let full = j.store.snapshot(&d, Some(&roomy)).unwrap();
+    assert!(
+        !full.truncated,
+        "a 120s budget must not truncate 2000 tiny files"
+    );
+    assert_eq!(full.entries.len(), 2001, "root dir + 2000 files");
 }

@@ -53,6 +53,15 @@ Timeout-cliff sweep (reflink, `rm -rf d`, median):
    `MAX_FILES`/`MAX_BYTES` bound *storage*, not *wall-clock* — so the existing
    limits cannot prevent the timeout.
 
+## Status: FIXED
+
+The wall-clock budget below is implemented: `Limits.max_duration` (default 5s
+via `DOOVER_MAX_SNAPSHOT_MS`) stops the walk and marks the manifest
+`truncated`, reusing the existing loud-gap / partial-restore / PARTIAL-diff
+machinery. The installed hook `timeout` was raised 10→20s so the budget wins
+the race. See `snapshot_stops_at_a_time_budget_and_marks_partial` and
+`a_snapshot_time_budget_is_a_loud_journaled_gap`.
+
 ## Verdict
 
 The design does **not** need a general async/deferred mode — the common path is

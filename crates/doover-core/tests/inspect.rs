@@ -230,6 +230,7 @@ fn diff_report_carries_the_recorded_coverage_gaps() {
     let limits = doover_core::snapshot::Limits {
         max_files: 2,
         max_bytes: u64::MAX,
+        max_duration: None,
     };
     let m = store.snapshot(&d, Some(&limits)).unwrap();
     assert!(m.truncated, "test rig: limits must actually truncate");

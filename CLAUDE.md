@@ -53,6 +53,17 @@ confirm green → only then claim done. Build order and per-step test gates are 
   known-destructive command with a huge scope (`chmod -R / …`) would otherwise
   snapshot unbounded. Step 5 (hook engine) must pass `Limits` to every
   `snapshot()` call and treat truncation as a loud, journaled gap.
+- **DONE (bench D1): snapshot has a wall-clock budget, not just file/byte
+  limits.** The benchmark showed cost is ~0.19 ms/file and the 10s hook
+  timeout was hit at ~50k files → SIGKILL → destructive command proceeds
+  UNPROTECTED and UNLOGGED. `MAX_FILES`/`MAX_BYTES` bound storage, not time.
+  Fix: `Limits.max_duration` (default 5s via `DOOVER_MAX_SNAPSHOT_MS`,
+  fail-safe parse — `0`=unlimited opt-out, garbage/unset=default, never
+  silently off) stops the walk and sets `manifest.truncated`, riding the
+  EXISTING loud-gap / partial-restore / PARTIAL-diff machinery (rounds 9, 13).
+  The installed hook `timeout` was raised 10→20s so the 5s budget + wrap-up
+  always wins the race and the loud gap is guaranteed, not probabilistic.
+  Budget is checked between entries, so overshoot is bounded by one entry.
 - **The unknown-policy fallback snapshots cwd only.** Opaque commands touching
   absolute paths outside cwd (`eval`, function bodies) are only partially
   covered. This is inherent to static analysis — the README/docs must state it

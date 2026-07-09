@@ -30,6 +30,7 @@ fn rig() -> Rig {
         limits: Limits {
             max_files: 100_000,
             max_bytes: 5 * 1024 * 1024 * 1024,
+            max_duration: None,
         },
         unknown_policy: UnknownPolicy::SnapshotCwd,
     };
@@ -183,6 +184,7 @@ fn limits_bound_known_destructive_scopes_and_note_the_gap() {
     r.cfg.limits = Limits {
         max_files: 3,
         max_bytes: u64::MAX,
+        max_duration: None,
     };
     fs::create_dir_all(r.cwd.join("big")).unwrap();
     for i in 0..10 {
@@ -283,6 +285,7 @@ fn truncated_snapshot_of_a_destructive_action_is_a_gap() {
     r.cfg.limits = Limits {
         max_files: 2,
         max_bytes: u64::MAX,
+        max_duration: None,
     };
     fs::create_dir_all(r.cwd.join("big")).unwrap();
     for i in 0..10 {
@@ -306,6 +309,7 @@ fn unknown_command_with_a_truncated_defensive_snapshot_warns() {
     r.cfg.limits = Limits {
         max_files: 2,
         max_bytes: u64::MAX,
+        max_duration: None,
     };
     for i in 0..10 {
         fs::write(r.cwd.join(format!("f{i}.txt")), "x").unwrap();
@@ -397,5 +401,41 @@ fn engine_snapshots_are_sufficient_to_undo_the_real_command() {
     assert_eq!(
         fs::read_to_string(r.cwd.join("photos/one.jpg")).unwrap(),
         "memories"
+    );
+}
+
+/// bench D1: the time-budget cutoff must flow through the SAME loud, journaled
+/// protection-gap path as the file/byte limits — a destructive command whose
+/// snapshot ran out of time is UNPROTECTED and must say so, never a SIGKILL
+/// with nothing recorded.
+#[test]
+fn a_snapshot_time_budget_is_a_loud_journaled_gap() {
+    let mut r = rig();
+    r.cfg.limits = Limits {
+        max_files: u64::MAX,
+        max_bytes: u64::MAX,
+        max_duration: Some(std::time::Duration::ZERO),
+    };
+    fs::create_dir_all(r.cwd.join("big")).unwrap();
+    for i in 0..10 {
+        fs::write(r.cwd.join(format!("big/f{i}.txt")), "x").unwrap();
+    }
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf big")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    assert!(
+        outcome.gaps.iter().any(|g| g.contains("truncated")),
+        "a time-budget cutoff is a protection gap: {:?}",
+        outcome.gaps
+    );
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s1").unwrap()[0];
+    assert!(
+        j.manifests(a.id).unwrap()[0].truncated,
+        "manifest must be truncated"
+    );
+    assert!(
+        a.note.as_deref().is_some_and(|n| n.contains("truncated")),
+        "note: {:?}",
+        a.note
     );
 }

@@ -35,6 +35,7 @@ fn rig() -> Rig {
             limits: Limits {
                 max_files: 100_000,
                 max_bytes: 5 << 30,
+                max_duration: None,
             },
             unknown_policy: UnknownPolicy::SnapshotCwd,
         },
