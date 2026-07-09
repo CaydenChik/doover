@@ -7,8 +7,27 @@ rules:
     undo: none
     notes: "May POST/PUT/upload; effects live on remote systems no snapshot can reach."
 
+  - id: net.curl-output
+    match: { command: curl, flags_any: ["-o", "--output", "-O", "--remote-name"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-o", "--output"] }
+    undo: snapshot-restore
+    notes: >
+      `-o file` writes the response OVER a local file (data loss on an existing
+      target); the path_flag captures it precisely. `-O`/--remote-name writes to
+      the URL basename in cwd — not statically knowable, so paths:none falls back
+      to the unknown (cwd) policy. Outranks net.curl (higher severity) because
+      the local overwrite is what undo must cover; it still externalizes too.
+
   - id: net.wget
     match: { command: wget }
     effect: mutating
     undo: none
-    notes: "Downloads create local files; additive. -O over an existing file is a gap until parser flag handling (step 2)."
+    notes: "Bare download is additive — wget saves as file.N, never overwriting."
+
+  - id: net.wget-output
+    match: { command: wget, flags_any: ["-O", "--output-document"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-O", "--output-document"] }
+    undo: snapshot-restore
+    notes: "`-O file` truncates/overwrites the target; the path_flag captures it (closes the step-2 gap)."

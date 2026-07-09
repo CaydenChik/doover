@@ -84,3 +84,101 @@ fn gzip_family_captures_the_file_it_replaces() {
     let gz = f.outside.join("important.gz");
     f.assert_captures(&format!("gunzip {}", gz.display()), &gz);
 }
+
+#[test]
+fn wget_output_flag_captures_the_file_it_overwrites() {
+    // `wget -O file url` truncates `file`; bare `wget url` is additive (saves
+    // as file.N, never overwrites) and stays non-destructive.
+    let f = fix();
+    let dest = f.outside.join("important");
+    f.assert_captures(
+        &format!("wget -O {} http://example.com/x", dest.display()),
+        &dest,
+    );
+    f.assert_captures(
+        &format!(
+            "wget --output-document={} http://example.com/x",
+            dest.display()
+        ),
+        &dest,
+    );
+    // bare download must NOT be destructive (nothing to snapshot)
+    let ctx = Ctx {
+        cwd: &f.cwd,
+        home: &f.home,
+    };
+    let bare = resolve("wget http://example.com/x", &f.reg, &ctx);
+    assert!(
+        bare.severity < Severity::Destructive,
+        "bare wget is additive, got {:?}",
+        bare.severity
+    );
+}
+
+#[test]
+fn curl_output_flag_captures_the_file_it_overwrites() {
+    // `curl -o file url` writes the response over `file`. It also externalizes,
+    // but for undo the local overwrite is what matters — must be snapshotted.
+    let f = fix();
+    let dest = f.outside.join("important");
+    f.assert_captures(
+        &format!("curl -o {} http://example.com/x", dest.display()),
+        &dest,
+    );
+    f.assert_captures(
+        &format!("curl --output {} http://example.com/x", dest.display()),
+        &dest,
+    );
+    // `curl -O` uses the remote basename (not statically known) -> must at
+    // least be destructive so the cwd fallback engages, not externalizing-only
+    let ctx = Ctx {
+        cwd: &f.cwd,
+        home: &f.home,
+    };
+    let remote = resolve("curl -O http://example.com/important", &f.reg, &ctx);
+    assert!(
+        remote.severity >= Severity::Destructive && remote.has_unknown,
+        "curl -O must be destructive+fallback, got {:?} unk={}",
+        remote.severity,
+        remote.has_unknown
+    );
+}
+
+#[test]
+fn git_working_tree_discarding_subcommands_are_destructive_repo_scoped() {
+    // `git restore` (modern `checkout --`), `git rm`, and
+    // `git switch --discard-changes` all clobber the working tree. Like
+    // checkout/reset --hard/clean they must be destructive and repo-scoped —
+    // precise capture, not the cwd-only fallback.
+    let jail = tempfile::tempdir().unwrap();
+    let repo = jail.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let home = jail.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let reg = Registry::builtin().unwrap();
+    let ctx = Ctx {
+        cwd: &repo,
+        home: &home,
+    };
+    let repo_norm = repo.canonicalize().unwrap_or(repo.clone());
+
+    for c in [
+        "git restore .",
+        "git restore src/main.rs",
+        "git rm file.rs",
+        "git switch --discard-changes main",
+    ] {
+        let r = resolve(c, &reg, &ctx);
+        assert!(
+            r.severity >= Severity::Destructive,
+            "`{c}` must be destructive, got {:?}",
+            r.severity
+        );
+        assert!(
+            r.paths.iter().any(|p| p == &repo_norm || p == &repo),
+            "`{c}` must capture the repo root precisely, got {:?} (unk={})",
+            r.paths,
+            r.has_unknown
+        );
+    }
+}

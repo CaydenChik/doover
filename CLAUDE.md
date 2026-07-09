@@ -71,6 +71,20 @@ confirm green → only then claim done. Build order and per-step test gates are 
   (attached-suffix form) isn't matched by `flags_any: [-i]` → cwd fallback,
   but GNU sed writes the `.bak` backup so the original survives anyway, and a
   prefix-match fix risks breaking the common `sed -i 's//' file` form.
+- **DONE (round 17): fixed MISCLASSIFICATIONS — commands that were `mutating`/
+  `externalizing` (no snapshot) but overwrite local files.** The dangerous
+  mirror of round 16: a wrong "no-snapshot" class means data loss with NO
+  fallback. `wget -O file` (was `mutating`) and `curl -o file` (was
+  `externalizing`) truncate an existing target — now `*-output` variants
+  classify destructive and capture the target via `path_flags`. `curl -O`/
+  `wget` bare stay additive. Added `git.restore`/`git.rm`/`git.switch
+  --discard-changes` (working-tree clobberers, were Unknown→cwd-fallback) as
+  destructive+repo-scoped like checkout. Audited EVERY `safe`/`mutating` rule;
+  `find` was already correct (find-delete/find-exec companion rules exist).
+  DELIBERATE TRADEOFF: `curl -o` now reads `destructive` not `externalizing`
+  (severity model picks one; Destructive>Externalizing). undo-coverage wins
+  over the exfil flag — and the common upload form `curl -d @x URL` (no `-o`)
+  still flags externalizing. Revisit if effects ever become multi-valued.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
 - **DONE (round 15): restore is fail-closed on unsafe manifest paths.** `undo`

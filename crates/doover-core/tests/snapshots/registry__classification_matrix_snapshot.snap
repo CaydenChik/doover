@@ -33,10 +33,15 @@ git.diff → Safe | None
 git.log → Safe | None
 git.push → Externalizing | None
 git.reset-hard → Destructive | SnapshotRestore
+git.restore → Destructive | SnapshotRestore
+git.rm → Destructive | SnapshotRestore
 git.show → Safe | None
 git.status → Safe | None
+git.switch-discard → Destructive | SnapshotRestore
 net.curl → Externalizing | None
+net.curl-output → Destructive | SnapshotRestore
 net.wget → Mutating | None
+net.wget-output → Destructive | SnapshotRestore
 posix.du → Safe | None
 posix.echo → Safe | None
 posix.find → Safe | None

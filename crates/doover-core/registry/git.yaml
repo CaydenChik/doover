@@ -27,6 +27,27 @@ rules:
     undo: snapshot-restore
     notes: "Conservative: pathspec form (`git checkout -- .`) clobbers the working tree. Branch-switch refinement lands with the parser (step 2)."
 
+  - id: git.restore
+    match: { command: git, subcommand: restore }
+    effect: destructive
+    scope: { paths: repo }
+    undo: snapshot-restore
+    notes: "Modern `git checkout -- <path>`: discards working-tree changes, unrecoverable via git."
+
+  - id: git.rm
+    match: { command: git, subcommand: rm }
+    effect: destructive
+    scope: { paths: repo }
+    undo: snapshot-restore
+    notes: "Removes tracked files from the working tree. --cached (index-only) over-captures harmlessly."
+
+  - id: git.switch-discard
+    match: { command: git, subcommand: switch, flags_any: ["--discard-changes", "-f", "--force"] }
+    effect: destructive
+    scope: { paths: repo }
+    undo: snapshot-restore
+    notes: "Plain `git switch` refuses to lose changes; --discard-changes/-f overrides that guard."
+
   - id: git.push
     match: { command: git, subcommand: push }
     effect: externalizing
