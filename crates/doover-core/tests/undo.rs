@@ -38,6 +38,7 @@ fn rig() -> Rig {
                 max_duration: None,
             },
             unknown_policy: UnknownPolicy::SnapshotCwd,
+            maintenance: doover_core::maintenance::MaintenanceBudget::disabled(),
         },
         cwd,
     }

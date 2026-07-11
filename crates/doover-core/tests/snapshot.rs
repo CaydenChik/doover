@@ -814,3 +814,40 @@ fn snapshot_stops_at_a_time_budget_and_marks_partial() {
     );
     assert_eq!(full.entries.len(), 2001, "root dir + 2000 files");
 }
+
+// --- D2: disk exhaustion hygiene ----------------------------------------------
+
+/// A failed ingest (ENOSPC, unwritable objects dir) must not leak its partial
+/// tmp file for an hour until clean_tmp reaps it — repeated failures would
+/// stack partial copies on an already-strained disk.
+#[test]
+fn failed_ingest_leaves_no_tmp_droppings() {
+    let j = jail();
+    let f = j.world.join("f.txt");
+    write(&f, "content");
+    let store_root = j.world.parent().unwrap().join("store");
+    let objects = store_root.join("objects");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o555)).unwrap();
+    let result = j.store.snapshot(&f, None);
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        result.is_err(),
+        "unwritable objects dir must fail the snapshot"
+    );
+    let tmp = store_root.join("tmp");
+    assert_eq!(
+        fs::read_dir(&tmp).unwrap().count(),
+        0,
+        "failed ingest must clean its tmp file immediately"
+    );
+}
+
+#[test]
+fn free_bytes_reports_a_sane_value() {
+    let j = jail();
+    let free = doover_core::snapshot::free_bytes(&j.world);
+    assert!(
+        free.is_some_and(|b| b > 0),
+        "free_bytes on a live fs: {free:?}"
+    );
+}

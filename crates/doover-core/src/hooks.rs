@@ -75,6 +75,10 @@ pub struct HookConfig {
     /// unboundedly).
     pub limits: Limits,
     pub unknown_policy: UnknownPolicy,
+    /// Store budgets + the automatic gc cadence (D2). The post hook runs gc
+    /// when the cadence or free-space floor fires, so the store self-bounds
+    /// without a cron.
+    pub maintenance: crate::maintenance::MaintenanceBudget,
 }
 
 impl HookConfig {
@@ -106,6 +110,7 @@ impl HookConfig {
                 max_duration: snapshot_budget(),
             },
             unknown_policy,
+            maintenance: crate::maintenance::MaintenanceBudget::from_env(),
         }
     }
 }
@@ -329,7 +334,100 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
             }
         }
     }
+    maybe_gc(cfg, &journal, action);
     Ok(action)
+}
+
+/// How long a free-space breach waits between triggered passes. A low disk
+/// that doover cannot fix (someone else's data, CoW-shared blocks) must not
+/// re-run a full gc on every single action.
+const FREE_LOW_RETRIGGER_SECS: u64 = 600;
+
+/// Automatic gc from the post hook (D2): the store must self-bound without a
+/// cron. STRICTLY fail-open — the action already completed; no maintenance
+/// failure may surface to the harness.
+///
+/// Scope is deliberately narrower than manual `doover gc` (D2 review):
+/// - `gc_every == 0` disables ALL automatic gc, free-space path included;
+/// - the free-space floor triggers a retention+cap pass (rate-limited) and a
+///   loud warning, but NEVER deficit-driven eviction — destroying history
+///   over disk pressure that is usually not doover's fault (and frees ~0
+///   physical bytes on CoW) is a decision only an explicit `doover gc` makes;
+/// - the pass carries a wall-clock budget so it stays off the critical path;
+/// - anything evicted (or an unmeetable budget) is journaled on the
+///   triggering action and warned to stderr — never silent.
+fn maybe_gc(cfg: &HookConfig, journal: &Journal, action: ActionId) {
+    let b = cfg.maintenance;
+    if b.gc_every == 0 {
+        return; // full opt-out of automatic maintenance
+    }
+    let cadence_due = action % (b.gc_every as i64).max(1) == 0;
+    let free_low = b
+        .min_free_bytes
+        .zip(crate::snapshot::free_bytes(&cfg.doover_home))
+        .is_some_and(|(floor, free)| free < floor);
+    let free_low_due = free_low && free_low_retrigger_elapsed(cfg);
+    if !cadence_due && !free_low_due {
+        return;
+    }
+    let Ok(store) = Store::open(cfg.doover_home.join("store")) else {
+        return;
+    };
+    let report = crate::maintenance::gc(
+        journal,
+        &store,
+        &cfg.doover_home,
+        &crate::maintenance::GcOptions {
+            keep_days: b.keep_days,
+            dry_run: false,
+            cap_bytes: b.cap_bytes,
+            // floor never drives AUTOMATIC eviction — manual gc only
+            min_free_bytes: None,
+            time_budget: Some(std::time::Duration::from_secs(3)),
+        },
+    );
+    touch_gc_marker(cfg);
+    let Ok(report) = report else { return };
+
+    // visibility: history removal is never silent (D2 review, critical)
+    if report.cap_evicted_actions > 0 || report.still_over_budget {
+        let note = format!(
+            "auto-gc: evicted {} old action(s) to satisfy the store size cap{}",
+            report.cap_evicted_actions,
+            if report.still_over_budget {
+                "; STILL over budget (bounded by pins/recent actions — run `doover gc`)"
+            } else {
+                ""
+            }
+        );
+        let _ = journal.add_note(action, &note);
+        eprintln!("doover: {note}");
+    }
+    if free_low {
+        eprintln!(
+            "doover: disk space is low (below the DOOVER_MIN_FREE_BYTES floor); \
+             doover's store is bounded by its size cap — run `doover gc` to review \
+             or evict more history"
+        );
+    }
+}
+
+/// Rate limit for the free-space trigger, via the mtime of a marker file.
+/// Fail-open in the triggering direction: no marker (first run) or an
+/// unreadable one means "due".
+fn free_low_retrigger_elapsed(cfg: &HookConfig) -> bool {
+    let marker = cfg.doover_home.join(".last-auto-gc");
+    match std::fs::metadata(&marker).and_then(|m| m.modified()) {
+        Ok(at) => std::time::SystemTime::now()
+            .duration_since(at)
+            .map(|age| age.as_secs() >= FREE_LOW_RETRIGGER_SECS)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
+fn touch_gc_marker(cfg: &HookConfig) {
+    let _ = std::fs::write(cfg.doover_home.join(".last-auto-gc"), b"");
 }
 
 #[cfg(test)]

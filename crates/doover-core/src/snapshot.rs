@@ -735,6 +735,18 @@ impl Store {
         Ok(self.object_paths()?.len() as u64)
     }
 
+    /// Apparent store size: the sum of object lengths. On CoW filesystems the
+    /// blocks may be shared with the originals (actual usage lower), which is
+    /// exactly why this is the PREDICTABLE bound the size cap enforces — the
+    /// free-space floor covers the physical-disk side.
+    pub fn total_bytes(&self) -> Result<u64, SnapshotError> {
+        let mut total = 0u64;
+        for p in self.object_paths()? {
+            total = total.saturating_add(fs::metadata(&p).map(|m| m.len()).unwrap_or(0));
+        }
+        Ok(total)
+    }
+
     pub fn object_paths(&self) -> Result<Vec<PathBuf>, SnapshotError> {
         let mut out = Vec::new();
         for item in walkdir::WalkDir::new(&self.objects) {
@@ -772,20 +784,32 @@ impl Store {
     /// correct even if the source mutates mid-snapshot.
     fn ingest(&self, src: &Path) -> Result<(String, u64), SnapshotError> {
         let tmp = self.tmp_path();
-        if self.opts.force_copy {
-            fs::copy(src, &tmp).map_err(|e| io_err(src, e))?;
-        } else {
-            reflink_copy::reflink_or_copy(src, &tmp).map_err(|e| io_err(src, e))?;
+        // any failure after the tmp file exists must remove it NOW — leaking
+        // partials until clean_tmp's hour-long age gate would stack copies on
+        // a disk that is likely already strained (ENOSPC is a failure mode
+        // this path must expect)
+        let result = self.ingest_via(src, &tmp);
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
         }
-        let hash = hash_file(&tmp)?;
-        let len = fs::metadata(&tmp).map_err(|e| io_err(&tmp, e))?.len();
+        result
+    }
+
+    fn ingest_via(&self, src: &Path, tmp: &Path) -> Result<(String, u64), SnapshotError> {
+        if self.opts.force_copy {
+            fs::copy(src, tmp).map_err(|e| io_err(src, e))?;
+        } else {
+            reflink_copy::reflink_or_copy(src, tmp).map_err(|e| io_err(src, e))?;
+        }
+        let hash = hash_file(tmp)?;
+        let len = fs::metadata(tmp).map_err(|e| io_err(tmp, e))?.len();
         let object = self.object_path(&hash);
         if object.exists() {
-            let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_file(tmp);
         } else {
             let parent = object.parent().expect("object path has parent");
             fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-            fs::rename(&tmp, &object).map_err(|e| io_err(&object, e))?;
+            fs::rename(tmp, &object).map_err(|e| io_err(&object, e))?;
             // objects are immutable content: drop write bits
             let _ = fs::set_permissions(&object, fs::Permissions::from_mode(0o444));
         }
@@ -879,6 +903,37 @@ fn remove_any(path: &Path) -> Result<(), SnapshotError> {
     }
 }
 
+/// Free space available to unprivileged writes on the filesystem holding
+/// `path` (statvfs f_bavail × f_frsize). `None` when it cannot be determined —
+/// callers must treat that as "no pressure signal", never as zero: evicting
+/// undo history on a misread would destroy data to fix a phantom problem.
+#[cfg(unix)]
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    interpret_statvfs(s.f_bavail as u64, s.f_frsize as u64, s.f_blocks as u64)
+}
+
+/// Degenerate geometry (FUSE stubs and some network mounts report all-zero
+/// statvfs on SUCCESS) must read as "indeterminate", never as "0 bytes free" —
+/// Some(0) would masquerade as a maximal disk-pressure emergency. A zero
+/// f_bavail with sane geometry remains a legitimate full-disk signal.
+fn interpret_statvfs(bavail: u64, frsize: u64, blocks: u64) -> Option<u64> {
+    if frsize == 0 || blocks == 0 {
+        return None;
+    }
+    Some(bavail.saturating_mul(frsize))
+}
+
+#[cfg(not(unix))]
+pub fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
 const MMAP_THRESHOLD: u64 = 1024 * 1024;
 
 pub(crate) fn hash_file(path: &Path) -> Result<String, SnapshotError> {
@@ -892,4 +947,19 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, SnapshotError> {
         hasher.update(&fs::read(path).map_err(|e| io_err(path, e))?);
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+#[cfg(test)]
+mod statvfs_tests {
+    use super::interpret_statvfs;
+
+    #[test]
+    fn degenerate_statvfs_geometry_is_indeterminate_not_zero() {
+        assert_eq!(interpret_statvfs(0, 0, 0), None, "all-zero FUSE stub");
+        assert_eq!(interpret_statvfs(100, 0, 100), None, "frsize 0");
+        assert_eq!(interpret_statvfs(100, 4096, 0), None, "blocks 0");
+        // a genuinely full disk with sane geometry IS a real zero
+        assert_eq!(interpret_statvfs(0, 4096, 1_000_000), Some(0));
+        assert_eq!(interpret_statvfs(10, 4096, 1_000_000), Some(40_960));
+    }
 }

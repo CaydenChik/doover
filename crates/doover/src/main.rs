@@ -544,11 +544,21 @@ fn run_gc(keep_days: i64, dry_run: bool) -> i32 {
         eprintln!("doover: cannot open journal/store");
         return 1;
     };
+    // manual gc enforces the same env-driven budgets as the automatic trigger
+    let budget = doover_core::maintenance::MaintenanceBudget::from_env();
     match doover_core::maintenance::gc(
         &journal,
         &store,
         &dh,
-        &doover_core::maintenance::GcOptions { keep_days, dry_run },
+        &doover_core::maintenance::GcOptions {
+            keep_days,
+            dry_run,
+            cap_bytes: budget.cap_bytes,
+            // manual gc is the ONE place deficit-driven eviction may run —
+            // the user is looking at the report
+            min_free_bytes: budget.min_free_bytes,
+            time_budget: None,
+        },
     ) {
         Ok(r) => {
             let verb = if r.dry_run { "would free" } else { "freed" };
@@ -560,6 +570,38 @@ fn run_gc(keep_days: i64, dry_run: bool) -> i32 {
                 r.sessions_pruned,
                 r.tmp_removed,
             );
+            if r.over_cap_bytes_before > 0 {
+                println!(
+                    "store over its size cap by {} KiB before this pass",
+                    r.over_cap_bytes_before / 1024
+                );
+            }
+            if r.free_deficit_bytes_before > 0 {
+                println!(
+                    "free space {} KiB below the floor before this pass",
+                    r.free_deficit_bytes_before / 1024
+                );
+            }
+            if r.cap_evicted_actions > 0 {
+                println!(
+                    "evicted {} old action(s) to satisfy the store budget",
+                    r.cap_evicted_actions
+                );
+            }
+            // dry-run cannot simulate the iterative eviction pass — say so
+            // instead of letting "would free" read as the whole story
+            if r.dry_run && (r.over_cap_bytes_before > 0 || r.free_deficit_bytes_before > 0) {
+                println!(
+                    "note: a real gc would ALSO evict oldest unpinned actions until within \
+                     budget (eviction is not simulated in dry-run)"
+                );
+            }
+            if r.still_over_budget {
+                println!(
+                    "warning: still over budget — the rest is pinned or too recent to evict \
+                     (raise DOOVER_MAX_STORE_BYTES, unpin, or free disk space)"
+                );
+            }
             0
         }
         Err(e) => {

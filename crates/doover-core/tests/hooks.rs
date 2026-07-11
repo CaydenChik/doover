@@ -33,6 +33,7 @@ fn rig() -> Rig {
             max_duration: None,
         },
         unknown_policy: UnknownPolicy::SnapshotCwd,
+        maintenance: doover_core::maintenance::MaintenanceBudget::disabled(),
     };
     Rig {
         _tmp: tmp,
@@ -437,5 +438,198 @@ fn a_snapshot_time_budget_is_a_loud_journaled_gap() {
         a.note.as_deref().is_some_and(|n| n.contains("truncated")),
         "note: {:?}",
         a.note
+    );
+}
+
+// --- D2: automatic gc trigger in the post hook --------------------------------
+
+/// The post hook runs gc when the maintenance budget's cadence fires. On an
+/// all-fresh store eviction can't touch anything (hot window + grace), so the
+/// observable proof that gc RAN is its tmp sweep: a stale (2h) tmp file is
+/// reaped by the triggered gc.
+#[test]
+fn post_hook_triggers_gc_on_cadence() {
+    let mut r = rig();
+    r.cfg.maintenance = doover_core::maintenance::MaintenanceBudget {
+        cap_bytes: None,
+        min_free_bytes: None,
+        gc_every: 1, // every completed action
+        keep_days: 365,
+    };
+    // plant a crash leftover: a 2h-old tmp entry the triggered gc must reap
+    let tmp_dir = r.cfg.doover_home.join("store/tmp");
+    fs::create_dir_all(&tmp_dir).unwrap();
+    fs::write(tmp_dir.join("999-1"), "crash leftover").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(tmp_dir.join("999-1"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    fs::write(r.cwd.join("f.txt"), "x").unwrap();
+    let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &pre).unwrap();
+    let post = hooks::parse_post_event(&post_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_post(&r.cfg, &post).unwrap();
+
+    assert!(
+        !tmp_dir.join("999-1").exists(),
+        "post-hook cadence must have run gc (stale tmp reaped)"
+    );
+}
+
+/// gc_every = 0 disables the trigger entirely.
+#[test]
+fn post_hook_gc_trigger_disabled_by_zero_cadence() {
+    let mut r = rig();
+    r.cfg.maintenance = doover_core::maintenance::MaintenanceBudget {
+        cap_bytes: None,
+        min_free_bytes: None,
+        gc_every: 0,
+        keep_days: 365,
+    };
+    let tmp_dir = r.cfg.doover_home.join("store/tmp");
+    fs::create_dir_all(&tmp_dir).unwrap();
+    fs::write(tmp_dir.join("999-2"), "crash leftover").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(tmp_dir.join("999-2"))
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+
+    fs::write(r.cwd.join("f.txt"), "x").unwrap();
+    let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &pre).unwrap();
+    let post = hooks::parse_post_event(&post_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_post(&r.cfg, &post).unwrap();
+
+    assert!(
+        tmp_dir.join("999-2").exists(),
+        "cadence 0 must never trigger gc"
+    );
+}
+
+/// The trigger is fail-open: a broken store must not fail the post hook.
+#[test]
+fn post_hook_gc_trigger_failure_is_swallowed() {
+    let mut r = rig();
+    r.cfg.maintenance = doover_core::maintenance::MaintenanceBudget {
+        cap_bytes: Some(1),
+        min_free_bytes: None,
+        gc_every: 1,
+        keep_days: 365,
+    };
+    fs::write(r.cwd.join("f.txt"), "x").unwrap();
+    let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &pre).unwrap();
+    // sabotage AFTER the pre snapshot: an unreadable tmp dir lets Store::open
+    // succeed (create_dir_all on an existing dir) and degrades the post-state
+    // snapshot to a journaled note, while the triggered gc's clean_tmp
+    // read_dir fails — exactly the failure maybe_gc must swallow
+    use std::os::unix::fs::PermissionsExt;
+    let tmp_dir = r.cfg.doover_home.join("store/tmp");
+    fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let post = hooks::parse_post_event(&post_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    let result = hooks::handle_post(&r.cfg, &post);
+    fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    result.expect("gc failure must never fail the post hook");
+}
+
+/// D2 review (critical): automatic maintenance must never evict silently, and
+/// the free-space floor must never drive automatic eviction at all. With a
+/// tiny cap and an old evictable action, the triggered gc DOES evict — and
+/// journals a loud note on the triggering action.
+#[test]
+fn post_hook_gc_eviction_is_journaled_never_silent() {
+    let mut r = rig();
+    r.cfg.maintenance = doover_core::maintenance::MaintenanceBudget {
+        cap_bytes: Some(1),
+        min_free_bytes: None,
+        gc_every: 1,
+        keep_days: 365,
+    };
+    // seed an OLD evictable action directly in the journal + store
+    fs::create_dir_all(&r.cfg.doover_home).unwrap();
+    let j = journal(&r.cfg);
+    j.begin_session("old-s", "claude-code", "/p").unwrap();
+    let old = j
+        .start_action(&doover_core::journal::NewAction {
+            session_id: "old-s",
+            tool_use_id: Some("t-old"),
+            raw_command: "rm ancient",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .unwrap();
+    j.complete_by_tool_use("old-s", "t-old", 1).unwrap();
+    let ancient = doover_core::journal::now_ms() - 30 * 24 * 60 * 60 * 1000;
+    j.set_started_at_for_test(old, ancient).unwrap();
+    j.set_session_started_at_for_test("old-s", ancient).unwrap();
+    let store = doover_core::snapshot::Store::open(r.cfg.doover_home.join("store")).unwrap();
+    let f = r.cwd.join("ancient.txt");
+    fs::write(&f, "ancient content").unwrap();
+    let m = store.snapshot(&f, None).unwrap();
+    j.attach_manifest(old, &m, doover_core::journal::ManifestRole::Pre)
+        .unwrap();
+    // backdate the object past the grace window so it is genuinely evictable
+    let obj = store
+        .object_paths()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one object");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&obj, fs::Permissions::from_mode(0o644)).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ancient as u64);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&obj)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(when))
+        .unwrap();
+
+    // a fresh action triggers the cadence-1 gc
+    fs::write(r.cwd.join("f.txt"), "x").unwrap();
+    let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &pre).unwrap();
+    let post = hooks::parse_post_event(&post_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    let acted_on = hooks::handle_post(&r.cfg, &post).unwrap();
+
+    assert!(!obj.exists(), "cap pressure evicts the ancient object");
+    let note = j.action(acted_on).unwrap().note;
+    assert!(
+        note.as_deref().is_some_and(|n| n.contains("auto-gc")),
+        "eviction must be journaled on the triggering action, got {note:?}"
+    );
+}
+
+/// D2 review: the free-space floor alone must NOT evict in the automatic
+/// path (deficit eviction is manual-gc-only). An unmeetable floor with no
+/// cap pressure leaves history intact.
+#[test]
+fn post_hook_free_space_floor_never_auto_evicts() {
+    let mut r = rig();
+    r.cfg.maintenance = doover_core::maintenance::MaintenanceBudget {
+        cap_bytes: None,
+        min_free_bytes: Some(u64::MAX), // permanently breached
+        gc_every: 1,
+        keep_days: 365,
+    };
+    fs::write(r.cwd.join("f.txt"), "precious history").unwrap();
+    let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &pre).unwrap();
+    let post = hooks::parse_post_event(&post_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_post(&r.cfg, &post).unwrap();
+
+    let store = doover_core::snapshot::Store::open(r.cfg.doover_home.join("store")).unwrap();
+    assert!(
+        store.object_count().unwrap() > 0,
+        "floor breach must not evict automatically — manual gc only"
     );
 }

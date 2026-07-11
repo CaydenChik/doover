@@ -562,9 +562,13 @@ impl Journal {
     /// or redo would fail on a journal entry that still exists.
     pub fn live_hashes(&self, retain_after_ms: i64) -> Result<BTreeSet<String>, JournalError> {
         let mut stmt = self.conn.prepare(
+            // `pending` is live regardless of age: a long-running command's
+            // pre-snapshot must survive until its post event settles it —
+            // evicting those objects would strand the action doover is
+            // actively protecting (D2 review)
             "SELECT m.hashes FROM manifests m
              JOIN actions a ON a.id = m.action_id
-             WHERE a.pinned = 1 OR a.started_at_ms >= ?1
+             WHERE a.pinned = 1 OR a.started_at_ms >= ?1 OR a.status = 'pending'
                 OR EXISTS (SELECT 1 FROM actions r
                            WHERE r.target_action_id = a.id
                              AND (r.pinned = 1 OR r.started_at_ms >= ?1))",
@@ -667,6 +671,30 @@ impl Journal {
             Err(_) => self.conn.execute_batch("ROLLBACK;").unwrap_or(()),
         }
         result
+    }
+
+    /// The `started_at_ms` of the last row in the next oldest-first batch of
+    /// evictable actions strictly before `before_ms` (size-cap eviction, D2).
+    /// Evictable = the same condition `prune_before` deletes by: unpinned,
+    /// non-pending, not referenced by an undo. `None` = nothing left to evict
+    /// below the ceiling — the caller must stop and report, never force.
+    pub fn oldest_evictable_batch_end(
+        &self,
+        batch: u32,
+        before_ms: i64,
+    ) -> Result<Option<i64>, JournalError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.started_at_ms FROM actions a
+             WHERE a.started_at_ms < ?1 AND a.pinned = 0 AND a.status != 'pending'
+               AND NOT EXISTS (SELECT 1 FROM actions r WHERE r.target_action_id = a.id)
+             ORDER BY a.started_at_ms ASC
+             LIMIT ?2",
+        )?;
+        let mut last = None;
+        for row in stmt.query_map(rusqlite::params![before_ms, batch], |r| r.get::<_, i64>(0))? {
+            last = Some(row?);
+        }
+        Ok(last)
     }
 
     /// Test support: rewrite an action's timestamp so retention tests can

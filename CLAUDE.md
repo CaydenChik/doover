@@ -135,6 +135,33 @@ confirm green → only then claim done. Build order and per-step test gates are 
   `saturating_sub`/`saturating_mul` → cutoff floors at i64::MIN (infinite
   window, keeps everything: the safe direction). resolver.rs already
   saturates; this was the only remaining overflow-prone site.
+- **DONE (D2, revised by a 4-lens adversarial review before commit): store
+  size cap + free-space floor + automatic gc.** `DOOVER_MAX_STORE_BYTES`
+  (5 GiB default) caps the store's apparent size; over-cap gc evicts oldest
+  actions (rows AND objects, same audited pipeline as retention: cutoff →
+  live_hashes → prune → prune_before). ABSOLUTE eviction floors: pins,
+  pending rows, chain-referenced rows, the 1h hot window, and the journal's
+  newest action. LOAD-BEARING constraints from the review — do not "fix":
+  (1) the free-space floor (`DOOVER_MIN_FREE_BYTES`, 1 GiB) NEVER drives
+  automatic eviction — low disk is usually not doover's fault and deleting
+  CoW clones frees ~0 physical bytes; deficit eviction runs ONLY from manual
+  `doover gc` where the report is visible. Auto path: rate-limited (10 min
+  marker) retention+cap pass + loud stderr warning.
+  (2) automatic eviction is NEVER silent: journaled note on the triggering
+  action + stderr.
+  (3) `DOOVER_GC_EVERY` (50) gates ALL automatic gc; 0 = full opt-out.
+  (4) triggered gc carries a 3s time budget (D1 discipline); manual gc is
+  unbounded.
+  (5) `DOOVER_KEEP_DAYS=0` = retention opt-out (keep forever), NOT "prune
+  all" — the knob convention.
+  (6) `live_hashes` protects `pending` rows' objects regardless of age (a
+  long-running command's pre-snapshot must outlive the eviction window).
+  (7) gc's anchor is min(MAX(started_at), now): one forward-skewed timestamp
+  must not collapse the hot window (backward-skew rule untouched).
+  (8) statvfs degenerate geometry (frsize/blocks == 0) reads None, never
+  Some(0) — no phantom disk-pressure emergencies.
+  (9) dry-run does not simulate eviction; it measures the same pressure and
+  the CLI prints an explicit "real gc would also evict" caveat.
 - **DONE (round 14): GC-vs-writer race.** Hooks are separate processes that
   promote a content object into `objects/` and only THEN journal the manifest
   referencing it. A `doover gc` racing that window saw an object no journal

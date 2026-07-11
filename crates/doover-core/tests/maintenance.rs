@@ -125,6 +125,9 @@ fn gc_collects_old_unpinned_and_keeps_recent_and_pinned() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -153,6 +156,9 @@ fn gc_cutoff_is_journal_relative_not_wall_clock() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -181,6 +187,9 @@ fn gc_dry_run_removes_nothing_but_reports() {
         &GcOptions {
             keep_days: 7,
             dry_run: true,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -212,6 +221,9 @@ fn gc_prunes_old_journal_rows_but_never_referenced_or_pinned_ones() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -242,6 +254,9 @@ fn gc_after_prune_leaves_undo_of_recent_actions_working() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -283,6 +298,9 @@ fn gc_cleans_stale_store_tmp_entries() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -307,6 +325,9 @@ fn gc_on_an_empty_journal_is_a_noop() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -475,6 +496,9 @@ fn gc_keeps_a_young_unreferenced_object_but_reaps_aged_orphans() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -507,6 +531,9 @@ fn gc_keeps_a_young_unreferenced_object_but_reaps_aged_orphans() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -536,6 +563,9 @@ fn gc_dry_run_does_not_count_a_young_unreferenced_object() {
         &GcOptions {
             keep_days: 7,
             dry_run: true,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -546,6 +576,9 @@ fn gc_dry_run_does_not_count_a_young_unreferenced_object() {
         &GcOptions {
             keep_days: 7,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .unwrap();
@@ -574,6 +607,9 @@ fn gc_keep_days_extreme_value_does_not_overflow() {
         &GcOptions {
             keep_days: i64::MAX,
             dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
         },
     )
     .expect("gc must not panic on an extreme keep_days");
@@ -582,4 +618,269 @@ fn gc_keep_days_extreme_value_does_not_overflow() {
         "an infinite window keeps everything"
     );
     assert!(r.object_exists(&h), "even the oldest object is retained");
+}
+
+// --- D2: store size cap + free-space floor (oldest-first eviction) -----------
+
+fn gc_opts(keep_days: i64, dry_run: bool) -> GcOptions {
+    GcOptions {
+        keep_days,
+        dry_run,
+        cap_bytes: None,
+        min_free_bytes: None,
+        time_budget: None,
+    }
+}
+
+/// Size-cap eviction: oldest evictable actions go first (rows AND objects, so
+/// the journal never lists an un-undoable action). Three floors hold under
+/// ANY pressure: pins, the hot window — and the journal's NEWEST action,
+/// which is always inside the (journal-relative) hot window: your last undo
+/// point is never sacrificed to a budget. When floors prevent reaching the
+/// cap, the report says so honestly instead of pretending success.
+#[test]
+fn gc_size_cap_evicts_oldest_first_but_never_pins_or_the_newest() {
+    let r = rig();
+    let base = doover_core::journal::now_ms() - 40 * DAY_MS;
+    let (_a1, h_old) = r.action_at("old.txt", "oldest content", base, "t1");
+    let (a2, h_pin) = r.action_at("pin.txt", "pinned content", base + DAY_MS, "t2");
+    let (_a3, h_mid) = r.action_at("mid.txt", "middle content", base + 2 * DAY_MS, "t3");
+    let (_a4, h_new) = r.action_at("new.txt", "newest content", base + 3 * DAY_MS, "t4");
+    r.journal.set_pinned(a2, true).unwrap();
+
+    let mut opts = gc_opts(365, false); // retention window keeps everything
+    opts.cap_bytes = Some(1); // force eviction of everything evictable
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+
+    assert!(!r.object_exists(&h_old), "oldest evicted first");
+    assert!(!r.object_exists(&h_mid), "next evictable goes too");
+    assert!(
+        r.object_exists(&h_pin),
+        "pinned object survives ANY cap pressure"
+    );
+    assert!(
+        r.object_exists(&h_new),
+        "the newest action is never evicted — the last undo point survives"
+    );
+    let (_, per_status) = r.journal.stats().unwrap();
+    let rows: u64 = per_status.iter().map(|(_, n)| n).sum();
+    assert_eq!(rows, 2, "journal keeps exactly the pin and the newest");
+    assert!(report.cap_evicted_actions >= 2);
+    assert!(
+        report.still_over_budget,
+        "cap unreachable past the floors must be reported, not hidden"
+    );
+}
+
+/// The hot window: rows/objects from the last hour are NEVER size-evicted —
+/// they may belong to an in-flight session (round-12 FK guard) and their
+/// objects are grace-protected anyway (round 14). The action a user is most
+/// likely to undo is the one that just happened.
+#[test]
+fn gc_size_cap_never_touches_the_hot_window() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_old, h_old) = r.action_at("old.txt", "cold content", now - 30 * DAY_MS, "t1");
+    let (_hot, h_hot) = r.action_at("hot.txt", "hot content", now, "t2");
+
+    let mut opts = gc_opts(365, false);
+    opts.cap_bytes = Some(1);
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+
+    assert!(!r.object_exists(&h_old), "cold action evicted");
+    assert!(r.object_exists(&h_hot), "hot action untouchable by the cap");
+    assert!(
+        report.still_over_budget,
+        "over-cap with only hot rows left must be reported"
+    );
+}
+
+/// A free-space floor works like the cap: u64::MAX floor cannot be satisfied,
+/// so everything evictable is evicted and the deficit is reported.
+#[test]
+fn gc_free_space_floor_evicts_and_reports_deficit() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_old, h_old) = r.action_at("old.txt", "cold", now - 30 * DAY_MS, "t1");
+    let (_new, h_new) = r.action_at("new.txt", "warm", now, "t2");
+
+    let mut opts = gc_opts(365, false);
+    opts.min_free_bytes = Some(u64::MAX);
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+
+    assert!(
+        !r.object_exists(&h_old),
+        "free-space pressure evicts the old"
+    );
+    assert!(
+        r.object_exists(&h_new),
+        "newest survives even disk pressure"
+    );
+    assert!(report.free_deficit_bytes_before > 0, "deficit measured");
+    assert!(report.still_over_budget, "an unreachable floor is reported");
+}
+
+/// No cap configured -> byte-for-byte the pre-D2 behavior (retention only).
+#[test]
+fn gc_without_budgets_is_retention_only() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_old, h) = r.action_at("f.txt", "content", now - 30 * DAY_MS, "t1");
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &gc_opts(365, false)).unwrap();
+    assert!(r.object_exists(&h), "within retention, no cap: kept");
+    assert_eq!(report.cap_evicted_actions, 0);
+    assert!(!report.still_over_budget);
+}
+
+/// Round-12 honesty rule applied to the cap: dry-run measures the SAME
+/// over-budget quantity the real run acts on, and removes nothing.
+#[test]
+fn gc_dry_run_measures_over_cap_without_evicting() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_old, h) = r.action_at("old.txt", "cold content", now - 30 * DAY_MS, "t1");
+    r.action_at("new.txt", "warm content", now, "t2");
+
+    let mut dry = gc_opts(365, true);
+    dry.cap_bytes = Some(1);
+    let d = maintenance::gc(&r.journal, &r.store, &r.dh, &dry).unwrap();
+    assert!(r.object_exists(&h), "dry-run must not evict");
+    assert!(d.over_cap_bytes_before > 0);
+    assert_eq!(d.cap_evicted_actions, 0);
+
+    let mut real = gc_opts(365, false);
+    real.cap_bytes = Some(1);
+    let rr = maintenance::gc(&r.journal, &r.store, &r.dh, &real).unwrap();
+    assert_eq!(
+        d.over_cap_bytes_before, rr.over_cap_bytes_before,
+        "dry-run and real must measure the same pressure"
+    );
+    assert!(rr.cap_evicted_actions >= 1);
+}
+
+// --- D2 adversarial-review regressions ----------------------------------------
+
+/// Review (data-loss lens): a PENDING action's objects must survive any gc,
+/// however old the row is — a long-running command's pre-snapshot is the very
+/// thing doover is protecting, and its post event has not settled yet.
+#[test]
+fn gc_never_evicts_a_pending_actions_objects() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    // a pending action, 3 days old (long-running command) in its OWN session —
+    // a same-session successor would abandon it (the round-5 contract); the
+    // realistic long-runner is a concurrent session
+    r.journal
+        .begin_session("s-slow", "claude-code", "/p")
+        .unwrap();
+    let id = r
+        .journal
+        .start_action(&NewAction {
+            session_id: "s-slow",
+            tool_use_id: Some("t-pend"),
+            raw_command: "slow-destructive-thing",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .unwrap();
+    r.journal
+        .set_started_at_for_test(id, now - 3 * DAY_MS)
+        .unwrap();
+    let f = r.world.join("pending.txt");
+    fs::write(&f, "in-flight precious").unwrap();
+    let m = r.store.snapshot(&f, None).unwrap();
+    let hash = m
+        .entries
+        .iter()
+        .find_map(|e| match &e.kind {
+            EntryKind::File { hash, .. } => Some(hash.clone()),
+            _ => None,
+        })
+        .unwrap();
+    r.journal
+        .attach_manifest(id, &m, ManifestRole::Pre)
+        .unwrap();
+    r.backdate_object(&hash, now - 3 * DAY_MS);
+    r.action_at("new.txt", "recent", now, "t2");
+
+    // retention pressure AND cap pressure — the pending object survives both
+    let mut opts = gc_opts(1, false);
+    opts.cap_bytes = Some(1);
+    let _ = maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+    assert!(
+        r.object_exists(&hash),
+        "a pending action's snapshot objects are untouchable"
+    );
+}
+
+/// Review (data-loss lens): ONE forward-skewed timestamp (a brief clock jump
+/// recorded a far-future row) must not become a phantom "newest" that makes
+/// every real action look ancient. The gc anchor clamps to min(newest, now).
+#[test]
+fn gc_forward_skewed_timestamp_does_not_collapse_the_window() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_real, h_real) = r.action_at("real.txt", "real content", now - 60_000, "t1");
+    // phantom: clock jumped 10 years forward for one action
+    let (_ph, h_ph) = r.action_at("phantom.txt", "phantom", now + 3650 * DAY_MS, "t2");
+
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &gc_opts(7, false)).unwrap();
+    assert!(
+        r.object_exists(&h_real),
+        "a minute-old REAL action must survive despite the phantom future row"
+    );
+    assert!(
+        r.object_exists(&h_ph),
+        "the phantom row itself is kept (> cutoff)"
+    );
+    assert_eq!(report.actions_pruned, 0);
+}
+
+/// Review (fail-open lens): a spent eviction time budget stops the pass
+/// cleanly — nothing half-done, the shortfall reported, a later pass resumes.
+#[test]
+fn gc_eviction_time_budget_stops_cleanly_and_reports() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_old, h_old) = r.action_at("old.txt", "cold", now - 30 * DAY_MS, "t1");
+    r.action_at("new.txt", "warm", now, "t2");
+
+    let mut opts = gc_opts(365, false);
+    opts.cap_bytes = Some(1);
+    opts.time_budget = Some(std::time::Duration::ZERO); // already spent
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+    assert!(r.object_exists(&h_old), "spent budget: nothing evicted");
+    assert_eq!(report.cap_evicted_actions, 0);
+    assert!(report.still_over_budget, "shortfall must be reported");
+
+    // and a later, unbounded pass finishes the job
+    opts.time_budget = None;
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+    assert!(
+        !r.object_exists(&h_old),
+        "unbounded pass completes the eviction"
+    );
+    assert!(report.cap_evicted_actions >= 1);
+}
+
+/// Review: DOOVER_KEEP_DAYS=0 follows the knob convention — retention OPT-OUT
+/// (keep forever), not "prune everything older than the newest action".
+#[test]
+fn keep_days_zero_is_a_retention_opt_out() {
+    // parse level (the trigger path uses this)
+    let b = {
+        // simulate: from_env reads real env; test the mapping via a tiny probe
+        // of the documented contract instead — keep_days=i64::MAX keeps all
+        doover_core::maintenance::MaintenanceBudget::disabled()
+    };
+    assert_eq!(b.gc_every, 0);
+    // gc level: i64::MAX keep_days (what 0 maps to) prunes nothing
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    let (_old, h) = r.action_at("old.txt", "ancient", now - 300 * DAY_MS, "t1");
+    r.action_at("new.txt", "recent", now, "t2");
+    let report = maintenance::gc(&r.journal, &r.store, &r.dh, &gc_opts(i64::MAX, false)).unwrap();
+    assert!(r.object_exists(&h), "retention opt-out keeps everything");
+    assert_eq!(report.actions_pruned, 0);
 }
