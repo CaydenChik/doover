@@ -49,6 +49,17 @@ confirm green → only then claim done. Build order and per-step test gates are 
 
 ## Carried-forward design risks (address at the step noted; do not forget)
 
+- **OPEN (round 18, plausible but unverified — check before launch):**
+  (a) the D1 snapshot budget is PER-TARGET; a destructive command with N
+  large scopes can stack N×5s past the 20s hook timeout — consider one
+  shared deadline across handle_pre's snapshot loop; (b) a user setting
+  `DOOVER_MAX_SNAPSHOT_MS` ≥ ~17s (or `0`) re-creates the SIGKILL blind spot
+  behind the 20s installed timeout — a `doctor` check comparing the two is
+  the right home; (c) `status`/`doctor` are blind to the D2 budgets (no
+  store size, no over-cap state); (d) the stderr half of "eviction is never
+  silent" and the `.last-auto-gc` rate limit are untested; (e) gc --dry-run
+  prints past-tense "pruned N" for actions it did not take.
+
 - **Snapshot limits must apply to ALL scopes, not just the unknown policy.** A
   known-destructive command with a huge scope (`chmod -R / …`) would otherwise
   snapshot unbounded. Step 5 (hook engine) must pass `Limits` to every
