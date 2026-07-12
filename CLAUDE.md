@@ -49,16 +49,26 @@ confirm green → only then claim done. Build order and per-step test gates are 
 
 ## Carried-forward design risks (address at the step noted; do not forget)
 
-- **OPEN (round 18, plausible but unverified — check before launch):**
-  (a) the D1 snapshot budget is PER-TARGET; a destructive command with N
-  large scopes can stack N×5s past the 20s hook timeout — consider one
-  shared deadline across handle_pre's snapshot loop; (b) a user setting
-  `DOOVER_MAX_SNAPSHOT_MS` ≥ ~17s (or `0`) re-creates the SIGKILL blind spot
-  behind the 20s installed timeout — a `doctor` check comparing the two is
-  the right home; (c) `status`/`doctor` are blind to the D2 budgets (no
-  store size, no over-cap state); (d) the stderr half of "eviction is never
-  silent" and the `.last-auto-gc` rate limit are untested; (e) gc --dry-run
-  prints past-tense "pruned N" for actions it did not take.
+- **DONE (round 19): all five round-18 leads verified and fixed.** (a) the
+  snapshot budget is now ONE shared deadline per hook invocation
+  (`slice_limits`/`hook_deadline` in hooks.rs, both handle_pre and
+  handle_post) — N targets can no longer stack N×5s past the harness
+  timeout; a spent budget truncates later targets immediately and loudly.
+  (b) `doctor` cross-checks the effective snapshot budget against the
+  installed hook timeout (warns on no-headroom and on unlimited). (c)
+  `status` shows store size vs cap with an OVER marker. (d) the stderr
+  eviction warning is pinned through the real binary, and the free-low
+  rate limiter has a first-fires/second-suppressed behavior test. (e)
+  dry-run gc says "would prune".
+- **PROCESS RULE (round 19, learned the hard way): mutation testing runs in
+  a WORKTREE, never the live tree.** A round-18 verifier agent mutated
+  `touch_gc_marker` to a no-op in the real tree, died to a session limit
+  before reverting, and the mutation SHIPPED in the round-18 commit (the
+  gate was green precisely because that guard was untested — the agent had
+  proven its own point). Caught by round 19's new rate-limiter test. The
+  `make test` gate now has a `hygiene` tripwire failing on any `MUTATION`
+  marker in source, and audit prompts must instruct agents to use isolated
+  worktrees for destructive verification.
 
 - **Snapshot limits must apply to ALL scopes, not just the unknown policy.** A
   known-destructive command with a huge scope (`chmod -R / …`) would otherwise

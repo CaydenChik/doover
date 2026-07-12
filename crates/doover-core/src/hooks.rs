@@ -50,6 +50,14 @@ fn snapshot_budget() -> Option<std::time::Duration> {
     parse_snapshot_budget(std::env::var("DOOVER_MAX_SNAPSHOT_MS").ok().as_deref())
 }
 
+/// The snapshot time budget the hook binary will actually run with —
+/// exposed for `doover doctor`, which cross-checks it against the installed
+/// hook timeout (a budget at/above the timeout re-creates the SIGKILL blind
+/// spot the budget exists to close).
+pub fn effective_snapshot_budget() -> Option<std::time::Duration> {
+    snapshot_budget()
+}
+
 /// Parse `DOOVER_MAX_SNAPSHOT_MS`, fail-safe. Unset or unparseable → the 5s
 /// default; an explicit `0` → no budget (unlimited, the documented opt-out).
 /// Garbage never silently reduces protection to nothing.
@@ -146,6 +154,25 @@ mod wire {
         pub tool_input: Option<ToolInput>,
         pub duration_ms: Option<i64>,
     }
+}
+
+/// One wall-clock deadline shared by EVERY snapshot in a single hook
+/// invocation (round 19): N targets must never stack N budgets past the
+/// harness timeout — that would re-create the SIGKILL blind spot the D1
+/// budget exists to close. Each call gets the time remaining; at/after the
+/// deadline a zero budget makes the snapshot truncate immediately, which the
+/// existing machinery journals as a loud gap. A `None` base budget (explicit
+/// opt-out) stays unlimited.
+fn slice_limits(base: &Limits, deadline: Option<std::time::Instant>) -> Limits {
+    let mut l = *base;
+    if let Some(dl) = deadline {
+        l.max_duration = Some(dl.saturating_duration_since(std::time::Instant::now()));
+    }
+    l
+}
+
+fn hook_deadline(limits: &Limits) -> Option<std::time::Instant> {
+    limits.max_duration.map(|d| std::time::Instant::now() + d)
 }
 
 pub fn parse_pre_event(json: &str) -> Result<PreEvent, HookError> {
@@ -264,10 +291,11 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
     };
     if !targets.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
+        let deadline = hook_deadline(&cfg.limits);
         for path in &targets {
             // once the action exists, per-path failures become loud gaps,
             // never lost protection for the OTHER paths — and never silent
-            match store.snapshot(path, Some(&cfg.limits)) {
+            match store.snapshot(path, Some(&slice_limits(&cfg.limits, deadline))) {
                 Ok(manifest) => {
                     if manifest.truncated {
                         note_gap(
@@ -321,8 +349,9 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
     let pre = journal.manifests_by_role(action, ManifestRole::Pre)?;
     if !pre.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
+        let deadline = hook_deadline(&cfg.limits);
         for m in &pre {
-            match store.snapshot(&m.path, Some(&cfg.limits)) {
+            match store.snapshot(&m.path, Some(&slice_limits(&cfg.limits, deadline))) {
                 Ok(post) => journal.attach_manifest(action, &post, ManifestRole::Post)?,
                 Err(e) => journal.add_note(
                     action,
@@ -420,7 +449,7 @@ fn free_low_retrigger_elapsed(cfg: &HookConfig) -> bool {
 }
 
 fn touch_gc_marker(cfg: &HookConfig) {
-    let _ = cfg; // MUTATION: marker never written — rate limit disabled
+    let _ = std::fs::write(cfg.doover_home.join(".last-auto-gc"), b"");
 }
 
 #[cfg(test)]

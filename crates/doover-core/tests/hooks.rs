@@ -683,3 +683,99 @@ fn post_hook_free_space_floor_never_auto_evicts() {
         "no eviction happened, so no eviction note: {note:?}"
     );
 }
+
+/// Round 19 (round-18 lead confirmed): the snapshot time budget must be
+/// shared across ALL of one hook invocation's targets — N huge targets must
+/// not stack N budgets past the harness timeout (that re-creates the exact
+/// SIGKILL blind spot D1 closed). With a 300ms budget consumed by the first
+/// (huge) target, the second target must come out truncated near-empty; under
+/// per-target budgets it would capture completely.
+#[test]
+fn snapshot_budget_is_shared_across_targets_not_stacked() {
+    let mut r = rig();
+    r.cfg.limits = Limits {
+        max_files: u64::MAX,
+        max_bytes: u64::MAX,
+        max_duration: Some(std::time::Duration::from_millis(300)),
+    };
+    // "aaa_big" sorts before "zzz_small" in the resolver's ordered path set
+    let big = r.cwd.join("aaa_big");
+    fs::create_dir_all(&big).unwrap();
+    for i in 0..20_000 {
+        fs::write(big.join(format!("f{i:05}.dat")), "x").unwrap();
+    }
+    let small = r.cwd.join("zzz_small");
+    fs::create_dir_all(&small).unwrap();
+    for i in 0..10 {
+        fs::write(small.join(format!("s{i}.txt")), "y").unwrap();
+    }
+
+    let ev =
+        hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm -rf aaa_big zzz_small")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    assert!(outcome.needs_warning(), "budget cutoff is a loud gap");
+
+    let j = journal(&r.cfg);
+    let manifests = j
+        .manifests_by_role(outcome.action_id, doover_core::journal::ManifestRole::Pre)
+        .unwrap();
+    let small_manifest = manifests
+        .iter()
+        .find(|m| m.path.ends_with("zzz_small"))
+        .expect("second target still journaled (protection gap is loud, not absent)");
+    assert!(
+        small_manifest.truncated,
+        "second target must inherit the SPENT shared budget, not a fresh one"
+    );
+    assert!(
+        small_manifest.entries.len() <= 1,
+        "spent budget -> near-empty capture, got {} entries (a fresh per-target \
+         budget would have captured all 11)",
+        small_manifest.entries.len()
+    );
+}
+
+/// Round 19 (round-18 lead d): the free-space trigger is rate-limited by the
+/// .last-auto-gc marker — a persistently low disk must not re-run a full gc
+/// on every action. First breach runs (marker absent); the next action, with
+/// the marker fresh, must NOT run. Observable via the stale-tmp sweep.
+#[test]
+fn free_space_trigger_is_rate_limited_by_the_marker() {
+    let mut r = rig();
+    r.cfg.maintenance = doover_core::maintenance::MaintenanceBudget {
+        cap_bytes: None,
+        min_free_bytes: Some(u64::MAX), // permanently breached
+        gc_every: 1_000_000,            // cadence never fires for tiny ids
+        keep_days: 365,
+    };
+    let tmp_dir = r.cfg.doover_home.join("store/tmp");
+    let plant = |name: &str| {
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join(name), "leftover").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(tmp_dir.join(name))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    };
+    let cycle = |tool: &str| {
+        fs::write(r.cwd.join(format!("{tool}.txt")), "x").unwrap();
+        let pre = hooks::parse_pre_event(&pre_json("s1", tool, &r.cwd, "ls")).unwrap();
+        hooks::handle_pre(&r.cfg, &pre).unwrap();
+        let post = hooks::parse_post_event(&post_json("s1", tool, &r.cwd, "ls")).unwrap();
+        hooks::handle_post(&r.cfg, &post).unwrap();
+    };
+
+    plant("999-a");
+    cycle("t1"); // marker absent -> free-low gc runs, reaps the stale tmp
+    assert!(!tmp_dir.join("999-a").exists(), "first breach triggers gc");
+
+    plant("999-b");
+    cycle("t2"); // marker fresh -> suppressed
+    assert!(
+        tmp_dir.join("999-b").exists(),
+        "a fresh marker must suppress the free-low re-trigger"
+    );
+}

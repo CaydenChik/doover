@@ -3,8 +3,13 @@ BIN   := target/debug/doover
 
 .PHONY: test fmt clippy unit build e2e canary
 
-test: fmt clippy unit e2e
+test: hygiene fmt clippy unit e2e
 	@echo "ALL TEST SUITES GREEN"
+
+# Tripwire (round 19): a verifier agent once left a live `// MUTATION` in a
+# committed guard — mutation-testing edits must never survive into the tree.
+hygiene:
+	@! grep -rn "MUTATION" crates/ --include="*.rs" || 		(echo "FATAL: leftover mutation marker in source" >&2; exit 1)
 
 fmt:
 	$(CARGO) fmt --all -- --check

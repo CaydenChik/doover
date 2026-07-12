@@ -585,3 +585,134 @@ fn gc_honors_the_keep_days_env_and_rejects_negative_footguns() {
         .success()
         .stdout(predicate::str::contains("rm keep.txt"));
 }
+
+// --- round 19: doctor/status budget visibility + eviction is loud on stderr -------
+
+#[test]
+fn doctor_warns_when_the_snapshot_budget_cannot_fit_the_hook_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+    // budget 30s vs installed 20s timeout: the SIGKILL blind spot returns
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .current_dir(tmp.path())
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .env("DOOVER_MAX_SNAPSHOT_MS", "30000")
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no headroom"));
+    // unlimited budget: same class of warning
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .current_dir(tmp.path())
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .env("DOOVER_MAX_SNAPSHOT_MS", "0")
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("UNLIMITED"));
+    // the default fits and says so
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .current_dir(tmp.path())
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .env_remove("DOOVER_MAX_SNAPSHOT_MS")
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fits the 20s hook timeout"));
+}
+
+#[test]
+fn status_shows_store_size_against_the_cap() {
+    let (_tmp, dh) = journal_one_action("rm keep.txt");
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("status")
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("store size:").and(predicate::str::contains("cap")));
+}
+
+#[test]
+fn auto_gc_eviction_warns_on_stderr_through_the_real_binary() {
+    // round 18 lead (d): "eviction is never silent" was only asserted for the
+    // journal note — this pins the stderr half through the shipped binary.
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // seed an ancient evictable action directly (row + backdated object)
+    std::fs::create_dir_all(&dh).unwrap();
+    let j = doover_core::journal::Journal::open(&dh.join("journal.db")).unwrap();
+    j.begin_session("old-s", "claude-code", "/p").unwrap();
+    let old = j
+        .start_action(&doover_core::journal::NewAction {
+            session_id: "old-s",
+            tool_use_id: Some("t-old"),
+            raw_command: "rm ancient",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .unwrap();
+    j.complete_by_tool_use("old-s", "t-old", 1).unwrap();
+    let ancient = doover_core::journal::now_ms() - 30 * 24 * 60 * 60 * 1000;
+    j.set_started_at_for_test(old, ancient).unwrap();
+    j.set_session_started_at_for_test("old-s", ancient).unwrap();
+    let store = doover_core::snapshot::Store::open(dh.join("store")).unwrap();
+    std::fs::write(cwd.join("ancient.txt"), "ancient content").unwrap();
+    let m = store.snapshot(&cwd.join("ancient.txt"), None).unwrap();
+    j.attach_manifest(old, &m, doover_core::journal::ManifestRole::Pre)
+        .unwrap();
+    let obj = store.object_paths().unwrap().into_iter().next().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&obj, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ancient as u64);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&obj)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
+    }
+
+    // a real pre+post cycle with cap pressure and cadence 1
+    let env = [
+        ("DOOVER_GC_EVERY", "1"),
+        ("DOOVER_MAX_STORE_BYTES", "1"),
+        ("DOOVER_KEEP_DAYS", "365"),
+    ];
+    for (event, sub) in [("PreToolUse", "pre"), ("PostToolUse", "post")] {
+        let mut ev = serde_json::json!({
+            "session_id": "s-now", "cwd": cwd.to_string_lossy(),
+            "hook_event_name": event, "tool_name": "Bash",
+            "tool_use_id": "t-now", "tool_input": { "command": "ls" }
+        });
+        if event == "PostToolUse" {
+            ev["duration_ms"] = serde_json::json!(3);
+            ev["tool_response"] = serde_json::json!({"stdout":"","stderr":"","interrupted":false});
+        }
+        let mut c = hook_cmd(&dh, sub);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let assert = c.write_stdin(ev.to_string()).assert().success();
+        if sub == "post" {
+            assert.stderr(predicate::str::contains("auto-gc"));
+        }
+    }
+    assert!(!obj.exists(), "cap pressure evicted the ancient object");
+}

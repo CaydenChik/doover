@@ -576,9 +576,13 @@ fn run_gc(keep_days: Option<i64>, dry_run: bool) -> i32 {
         },
     ) {
         Ok(r) => {
-            let verb = if r.dry_run { "would free" } else { "freed" };
+            let (verb, prune_verb) = if r.dry_run {
+                ("would free", "would prune")
+            } else {
+                ("freed", "pruned")
+            };
             println!(
-                "{verb} {} object(s), {} KiB; pruned {} action(s), {} session(s); {} tmp",
+                "{verb} {} object(s), {} KiB; {prune_verb} {} action(s), {} session(s); {} tmp",
                 r.objects_removed,
                 r.bytes_freed / 1024,
                 r.actions_pruned,
@@ -659,7 +663,53 @@ fn run_status() -> i32 {
         );
     }
     println!("store objects: {objects}");
+    let budget = doover_core::maintenance::MaintenanceBudget::from_env();
+    match (store.total_bytes(), budget.cap_bytes) {
+        (Ok(size), Some(cap)) => println!(
+            "store size:   {} MiB / cap {} MiB{}",
+            size / (1024 * 1024),
+            cap / (1024 * 1024),
+            if size > cap {
+                "  (OVER — run `doover gc`)"
+            } else {
+                ""
+            }
+        ),
+        (Ok(size), None) => println!("store size:   {} MiB (no cap)", size / (1024 * 1024)),
+        (Err(e), _) => println!("store size:   unreadable ({e})"),
+    }
     0
+}
+
+/// Smallest `timeout` (seconds) among installed doover hook entries; None if
+/// none carry one (Claude Code then applies its own default).
+fn min_doover_hook_timeout(settings: &serde_json::Value) -> Option<u64> {
+    let mut min: Option<u64> = None;
+    for event in ["PreToolUse", "PostToolUse"] {
+        for entry in settings
+            .get("hooks")
+            .and_then(|h| h.get(event))
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            for h in entry
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let is_doover = h
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("doover hook"));
+                if let (true, Some(t)) = (is_doover, h.get("timeout").and_then(|t| t.as_u64())) {
+                    min = Some(min.map_or(t, |m: u64| m.min(t)));
+                }
+            }
+        }
+    }
+    min
 }
 
 fn run_doctor() -> i32 {
@@ -733,7 +783,32 @@ fn run_doctor() -> i32 {
         .iter()
         .find(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains("doover hook pre")));
     match installed_at {
-        Some(p) => println!("  [ok]   Claude Code hooks installed ({})", p.display()),
+        Some(p) => {
+            println!("  [ok]   Claude Code hooks installed ({})", p.display());
+            // budget-vs-timeout cross-check (round 19): if the snapshot
+            // budget cannot finish inside the harness timeout, the harness
+            // SIGKILLs mid-snapshot and the loud-gap guarantee is lost
+            let timeout_s = std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .and_then(|v| min_doover_hook_timeout(&v));
+            if let Some(t) = timeout_s {
+                const WRAP_UP_MARGIN_MS: u64 = 2_000;
+                match doover_core::hooks::effective_snapshot_budget() {
+                    None => println!(
+                        "  [warn] snapshot budget is UNLIMITED (DOOVER_MAX_SNAPSHOT_MS=0) —                          the {t}s hook timeout can SIGKILL a long snapshot with nothing journaled"
+                    ),
+                    Some(b) if b.as_millis() as u64 + WRAP_UP_MARGIN_MS >= t * 1000 => println!(
+                        "  [warn] snapshot budget ({} ms) leaves no headroom inside the {t}s                          hook timeout — lower DOOVER_MAX_SNAPSHOT_MS or raise the timeout",
+                        b.as_millis()
+                    ),
+                    Some(b) => println!(
+                        "  [ok]   snapshot budget {} ms fits the {t}s hook timeout",
+                        b.as_millis()
+                    ),
+                }
+            }
+        }
         None => println!("  [warn] Claude Code hooks not found — run `doover init`"),
     }
 
