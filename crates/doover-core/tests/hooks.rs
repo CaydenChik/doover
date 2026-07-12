@@ -779,3 +779,26 @@ fn free_space_trigger_is_rate_limited_by_the_marker() {
         "a fresh marker must suppress the free-low re-trigger"
     );
 }
+
+/// D4: DOOVER_HOME holds plaintext commands and file snapshots — it must be
+/// 0700 regardless of umask, and a pre-existing LOOSE home (created by an
+/// older doover or a permissive umask) must be tightened on the next run.
+#[test]
+fn doover_home_is_private_and_loose_installs_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig();
+    // pre-create the home world-readable, like an old install would have
+    fs::create_dir_all(&r.cfg.doover_home).unwrap();
+    fs::set_permissions(&r.cfg.doover_home, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::write(r.cwd.join("f.txt"), "x").unwrap();
+    let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
+    hooks::handle_pre(&r.cfg, &pre).unwrap();
+
+    let mode = fs::metadata(&r.cfg.doover_home)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "home must be tightened to 0700, got {mode:o}");
+}

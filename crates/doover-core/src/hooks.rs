@@ -73,6 +73,21 @@ fn parse_snapshot_budget(v: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// Create DOOVER_HOME if needed and force it to 0700 (D4): the journal holds
+/// plaintext commands (which may embed secrets) and the store holds copies of
+/// user files — on a shared host neither may be readable by other users. The
+/// explicit chmod is umask-proof and also TIGHTENS a pre-existing loose home
+/// from an older install on the next run.
+pub fn ensure_private_home(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 pub struct HookConfig {
     /// Store + journal + user registry overlay live here (default ~/.doover).
     pub doover_home: PathBuf,
@@ -234,7 +249,7 @@ impl PreOutcome {
 }
 
 fn open_journal(cfg: &HookConfig) -> Result<Journal, HookError> {
-    std::fs::create_dir_all(&cfg.doover_home).map_err(|e| {
+    ensure_private_home(&cfg.doover_home).map_err(|e| {
         HookError::Parse(format!(
             "cannot create doover home {}: {e}",
             cfg.doover_home.display()

@@ -851,3 +851,18 @@ fn free_bytes_reports_a_sane_value() {
         "free_bytes on a live fs: {free:?}"
     );
 }
+
+/// D4: store objects are COPIES OF USER FILES — never world-readable.
+#[test]
+fn store_objects_are_owner_only() {
+    let j = jail();
+    let f = j.world.join("secret.txt");
+    write(&f, "api_key=hunter2");
+    j.store.snapshot(&f, None).unwrap();
+    let obj = j.store.object_paths().unwrap().into_iter().next().unwrap();
+    let mode = fs::metadata(&obj).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o400,
+        "objects must be 0400 (owner read-only), got {mode:o}"
+    );
+}

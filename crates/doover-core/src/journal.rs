@@ -42,6 +42,8 @@ impl ManifestRole {
 pub enum JournalError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("journal io: {0}")]
+    Io(#[from] std::io::Error),
     #[error("manifest serialization: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("action {0} not found")]
@@ -190,6 +192,20 @@ impl Journal {
 
     fn open_attempt(path: &Path) -> Result<Self, JournalError> {
         let conn = rusqlite::Connection::open(path)?;
+        // D4: raw commands may embed secrets — owner-only, umask-proof. The
+        // WAL/SHM sidecars inherit the db's mode on creation, but tighten any
+        // pre-existing ones from an older install too (best effort).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, private.clone())?;
+            for ext in ["-wal", "-shm"] {
+                let mut side = path.as_os_str().to_owned();
+                side.push(ext);
+                let _ = std::fs::set_permissions(std::path::Path::new(&side), private.clone());
+            }
+        }
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;

@@ -810,8 +810,9 @@ impl Store {
             let parent = object.parent().expect("object path has parent");
             fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
             fs::rename(tmp, &object).map_err(|e| io_err(&object, e))?;
-            // objects are immutable content: drop write bits
-            let _ = fs::set_permissions(&object, fs::Permissions::from_mode(0o444));
+            // objects are immutable content AND copies of user files:
+            // owner-read only (D4), never world-readable
+            let _ = fs::set_permissions(&object, fs::Permissions::from_mode(0o400));
         }
         Ok((hash, len))
     }

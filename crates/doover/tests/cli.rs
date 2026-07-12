@@ -716,3 +716,31 @@ fn auto_gc_eviction_warns_on_stderr_through_the_real_binary() {
     }
     assert!(!obj.exists(), "cap pressure evicted the ancient object");
 }
+
+// --- D4: data-at-rest lockdown ------------------------------------------------
+
+#[test]
+fn doover_home_and_journal_are_private_through_the_real_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, dh) = journal_one_action("rm keep.txt");
+    let dir_mode = std::fs::metadata(&dh).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        dir_mode, 0o700,
+        "DOOVER_HOME must be 0700, got {dir_mode:o}"
+    );
+    let db_mode = std::fs::metadata(dh.join("journal.db"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(db_mode, 0o600, "journal must be 0600, got {db_mode:o}");
+    // doctor reports the lockdown
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .env("DOOVER_HOME", &dh)
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("private (0700)"));
+}

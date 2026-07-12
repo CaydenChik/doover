@@ -115,7 +115,7 @@ enum Verb {
 /// Open the journal, creating DOOVER_HOME first so a fresh install reads as an
 /// empty history (friendly messages) rather than an open error.
 fn open_journal_or_exit(cfg: &doover_core::hooks::HookConfig) -> doover_core::journal::Journal {
-    if let Err(e) = std::fs::create_dir_all(&cfg.doover_home) {
+    if let Err(e) = doover_core::hooks::ensure_private_home(&cfg.doover_home) {
         eprintln!("doover: cannot create {}: {e}", cfg.doover_home.display());
         std::process::exit(1);
     }
@@ -532,7 +532,7 @@ fn cfg_journal_store() -> Option<(
     std::path::PathBuf,
 )> {
     let cfg = doover_core::hooks::HookConfig::from_env();
-    if std::fs::create_dir_all(&cfg.doover_home).is_err() {
+    if doover_core::hooks::ensure_private_home(&cfg.doover_home).is_err() {
         return None;
     }
     let j = doover_core::journal::Journal::open(&cfg.doover_home.join("journal.db")).ok()?;
@@ -718,9 +718,9 @@ fn run_doctor() -> i32 {
     println!("doover doctor");
 
     // 1. doover home writable
-    match std::fs::create_dir_all(&cfg.doover_home) {
+    match doover_core::hooks::ensure_private_home(&cfg.doover_home) {
         Ok(_) => println!(
-            "  [ok]   doover home writable: {}",
+            "  [ok]   doover home private (0700): {}",
             cfg.doover_home.display()
         ),
         Err(e) => {

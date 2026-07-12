@@ -857,3 +857,15 @@ fn concurrent_first_opens_do_not_race_the_migration() {
             .unwrap_or_else(|e| panic!("concurrent open #{i} failed the migration race: {e}"));
     }
 }
+
+/// D4: the journal stores raw commands (which may embed secrets) in
+/// plaintext — the DB file must be owner-only, umask notwithstanding.
+#[test]
+fn journal_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("journal.db");
+    let _j = Journal::open(&db).unwrap();
+    let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "journal must be 0600, got {mode:o}");
+}

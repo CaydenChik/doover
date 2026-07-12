@@ -49,6 +49,17 @@ confirm green → only then claim done. Build order and per-step test gates are 
 
 ## Carried-forward design risks (address at the step noted; do not forget)
 
+- **DONE (D4): data-at-rest lockdown.** `ensure_private_home()` (hooks.rs)
+  forces DOOVER_HOME to 0700 at EVERY creation path (hook open_journal, CLI
+  open_journal_or_exit / cfg_journal_store / doctor) — umask-proof, and it
+  TIGHTENS a pre-existing loose home from an older install on next run. The
+  journal db is chmod 0600 on open (load-bearing, errors surface; WAL/SHM
+  sidecars best-effort). Store objects are 0400, never world-readable (they
+  are copies of user files). doctor reports "home private (0700)".
+  FOR D8 DOCS: state the residual at-rest exposure plainly — the journal
+  stores raw commands in PLAINTEXT (bounded by retention gc, masked at
+  display); anyone with the SAME user account (or root) can read it.
+
 - **DONE (round 19): all five round-18 leads verified and fixed.** (a) the
   snapshot budget is now ONE shared deadline per hook invocation
   (`slice_limits`/`hook_deadline` in hooks.rs, both handle_pre and
