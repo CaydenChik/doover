@@ -109,6 +109,21 @@ impl MaintenanceBudget {
     }
 }
 
+/// The exact GcOptions the AUTOMATIC (post-hook) trigger runs with. A pure
+/// function so its load-bearing fields are pinned by unit test (round 18):
+/// never dry-run, floor NEVER drives automatic eviction, and the pass always
+/// carries the 3s time budget (D1 discipline on the hook path).
+pub fn auto_gc_options(b: &MaintenanceBudget) -> GcOptions {
+    GcOptions {
+        keep_days: b.keep_days,
+        dry_run: false,
+        cap_bytes: b.cap_bytes,
+        // deficit-driven eviction is a manual `doover gc` decision only
+        min_free_bytes: None,
+        time_budget: Some(std::time::Duration::from_secs(3)),
+    }
+}
+
 /// Fail-safe byte-budget parse: unset/garbage → default, explicit 0 → None
 /// (the opt-out). Config can never silently zero a protection budget.
 fn parse_opt_bytes(v: Option<&str>, default: u64) -> Option<u64> {
@@ -296,5 +311,35 @@ mod budget_parse_tests {
         assert_eq!(parse_u64_or(Some("25"), 50), 25);
         assert_eq!(parse_u64_or(Some("junk"), 50), 50);
         assert_eq!(parse_u64_or(None, 50), 50);
+    }
+}
+
+#[cfg(test)]
+mod auto_gc_options_tests {
+    use super::{MaintenanceBudget, auto_gc_options};
+
+    /// Round 18 (mutation-confirmed gaps): these fields are load-bearing D2
+    /// review constraints; a drive-by edit must fail HERE, not ship silently.
+    #[test]
+    fn auto_gc_options_pins_the_trigger_contract() {
+        let b = MaintenanceBudget {
+            cap_bytes: Some(123),
+            min_free_bytes: Some(999), // set — and must NOT reach the options
+            gc_every: 50,
+            keep_days: 7,
+        };
+        let o = auto_gc_options(&b);
+        assert!(!o.dry_run);
+        assert_eq!(o.cap_bytes, Some(123), "cap passes through");
+        assert_eq!(o.keep_days, 7, "retention passes through");
+        assert_eq!(
+            o.min_free_bytes, None,
+            "floor NEVER drives automatic eviction (manual gc only)"
+        );
+        assert_eq!(
+            o.time_budget,
+            Some(std::time::Duration::from_secs(3)),
+            "the triggered pass always carries the 3s budget (D1 discipline)"
+        );
     }
 }

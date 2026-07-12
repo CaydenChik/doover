@@ -377,14 +377,7 @@ fn maybe_gc(cfg: &HookConfig, journal: &Journal, action: ActionId) {
         journal,
         &store,
         &cfg.doover_home,
-        &crate::maintenance::GcOptions {
-            keep_days: b.keep_days,
-            dry_run: false,
-            cap_bytes: b.cap_bytes,
-            // floor never drives AUTOMATIC eviction — manual gc only
-            min_free_bytes: None,
-            time_budget: Some(std::time::Duration::from_secs(3)),
-        },
+        &crate::maintenance::auto_gc_options(&b),
     );
     touch_gc_marker(cfg);
     let Ok(report) = report else { return };
@@ -427,7 +420,7 @@ fn free_low_retrigger_elapsed(cfg: &HookConfig) -> bool {
 }
 
 fn touch_gc_marker(cfg: &HookConfig) {
-    let _ = std::fs::write(cfg.doover_home.join(".last-auto-gc"), b"");
+    let _ = cfg; // MUTATION: marker never written — rate limit disabled
 }
 
 #[cfg(test)]

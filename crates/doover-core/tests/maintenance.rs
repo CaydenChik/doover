@@ -884,3 +884,64 @@ fn keep_days_zero_is_a_retention_opt_out() {
     assert!(r.object_exists(&h), "retention opt-out keeps everything");
     assert_eq!(report.actions_pruned, 0);
 }
+
+/// Round 18 (mutation-confirmed zero coverage): the chain-reference clause of
+/// live_hashes — "a kept chain row must keep its OBJECTS, or redo would
+/// fail" — was the sole guard against gc stranding an undoable action, and
+/// no test exercised it. This one does, under BOTH retention and cap
+/// pressure: an old action undone today (recent undo row, old target) keeps
+/// its objects, and the full undo→redo→undo cycle still works after gc.
+#[test]
+fn gc_keeps_objects_of_an_old_action_referenced_by_a_recent_undo() {
+    let r = rig();
+    let now = doover_core::journal::now_ms();
+    // an old destructive action captured 10 days ago, world file still gone
+    let (old_id, h_old) = r.action_at("precious.txt", "irreplaceable", now - 10 * DAY_MS, "t1");
+    fs::remove_file(r.world.join("precious.txt")).unwrap(); // the rm happened
+    // POST manifest = state after the rm (absent) — what redo restores and
+    // the conflict oracle for undo, exactly as the real engine attaches it
+    let post = r
+        .store
+        .snapshot(&r.world.join("precious.txt"), None)
+        .unwrap();
+    r.journal
+        .attach_manifest(old_id, &post, ManifestRole::Post)
+        .unwrap();
+    r.action_at("recent.txt", "recent", now, "t2");
+
+    // undo the OLD action today: recent undo row referencing the old target
+    let engine = doover_core::undo::UndoEngine::new(&r.journal, &r.store);
+    engine
+        .undo(doover_core::undo::Selector::Action(old_id), true, false)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(r.world.join("precious.txt")).unwrap(),
+        "irreplaceable"
+    );
+
+    // retention pressure: keep_days=7 puts the old target past the window
+    maintenance::gc(&r.journal, &r.store, &r.dh, &gc_opts(7, false)).unwrap();
+    assert!(
+        r.object_exists(&h_old),
+        "objects of a recently-undone old action must survive retention gc"
+    );
+
+    // cap pressure: eviction must respect the chain reference too
+    let mut opts = gc_opts(365, false);
+    opts.cap_bytes = Some(1);
+    maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+    assert!(
+        r.object_exists(&h_old),
+        "objects of a recently-undone old action must survive cap eviction"
+    );
+
+    // and the chain still actually works: redo, then undo again
+    let engine = doover_core::undo::UndoEngine::new(&r.journal, &r.store);
+    engine
+        .redo(doover_core::undo::Selector::Latest, true, false)
+        .expect("redo after gc");
+    assert!(
+        !r.world.join("precious.txt").exists(),
+        "redo re-applied the rm"
+    );
+}

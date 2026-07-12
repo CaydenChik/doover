@@ -399,3 +399,59 @@ fn undo_recreates_a_file_the_command_created() {
         "undo of a creation deletes the file"
     );
 }
+
+// --- round 18: a truncated PRE capture must never be silently swapped in ---------
+
+/// Restoring a TRUNCATED pre-manifest replaces the whole live tree with the
+/// partial capture — every file the snapshot budget/limits skipped would be
+/// DELETED BY UNDO. That must be a refusal (conflict, force-gated), never a
+/// silent swap: undo must not destroy what it failed to capture.
+#[test]
+fn undo_refuses_to_swap_in_a_truncated_partial_capture() {
+    let mut r = rig();
+    r.cfg.limits = Limits {
+        max_files: 2, // force truncation of the 4-file pre-snapshot
+        max_bytes: u64::MAX,
+        max_duration: None,
+    };
+    for i in 0..4 {
+        fs::write(r.cwd.join(format!("f{i}.txt")), format!("content {i}")).unwrap();
+    }
+    // `chmod -R` classifies destructive over the tree but deletes nothing:
+    // the full tree still exists after the action — exactly the state where
+    // a partial-swap undo would destroy the uncaptured files
+    let id = r.run("s1", "t1", "chmod -R u+w .");
+    let j = r.journal();
+    let s = r.store();
+
+    let result = engine(&j, &s).undo(Selector::Action(id), false, false);
+    match result {
+        Err(UndoError::Conflicts(c)) => {
+            assert!(
+                c.iter().any(|m| m.to_lowercase().contains("truncated")
+                    || m.to_lowercase().contains("partial")),
+                "refusal must explain the partial capture: {c:?}"
+            );
+        }
+        other => panic!("truncated pre-capture must refuse without --force, got {other:?}"),
+    }
+    for i in 0..4 {
+        assert!(
+            r.read(&format!("f{i}.txt")).is_some(),
+            "refused undo must leave every live file intact (f{i}.txt)"
+        );
+    }
+
+    // --force proceeds, eyes open, with a loud warning
+    let report = engine(&j, &s)
+        .undo(Selector::Action(id), true, false)
+        .expect("--force may accept the partial restore");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.to_lowercase().contains("truncated") || w.to_lowercase().contains("partial")),
+        "forced partial restore must warn: {:?}",
+        report.warnings
+    );
+}

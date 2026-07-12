@@ -198,6 +198,25 @@ impl<'a> UndoEngine<'a> {
         let mut warnings = Vec::new();
         let mut conflicts = Vec::new();
         for m in restore_set {
+            // A TRUNCATED capture is a partial tree. Restore is stage-then-
+            // swap: swapping the partial in DELETES every live file the
+            // snapshot skipped — undo destroying exactly what it failed to
+            // capture (round 18). Refuse by default; --force proceeds with a
+            // loud warning for the "partial restore beats nothing" cases
+            // (e.g. recovering some of an rm -rf'd tree).
+            if m.truncated {
+                let msg = format!(
+                    "{}: the recorded capture was TRUNCATED (partial); restoring would \
+                     replace the tree with the partial capture, deleting anything it \
+                     missed",
+                    m.path.display()
+                );
+                if force {
+                    warnings.push(msg);
+                } else {
+                    conflicts.push(msg);
+                }
+            }
             match oracle.iter().find(|o| o.path == m.path) {
                 Some(o) => {
                     if o.truncated {

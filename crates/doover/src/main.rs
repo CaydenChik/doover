@@ -66,8 +66,9 @@ enum Command {
     /// Prune old snapshots and journal rows (journal-relative retention)
     Gc {
         /// Keep everything newer than this many days before the newest action
-        #[arg(long, default_value_t = 7)]
-        keep_days: i64,
+        /// (default: DOOVER_KEEP_DAYS or 7; 0 = keep forever)
+        #[arg(long)]
+        keep_days: Option<i64>,
         /// Show what would be removed without deleting
         #[arg(long)]
         dry_run: bool,
@@ -539,7 +540,21 @@ fn cfg_journal_store() -> Option<(
     Some((j, s, cfg.doover_home))
 }
 
-fn run_gc(keep_days: i64, dry_run: bool) -> i32 {
+fn run_gc(keep_days: Option<i64>, dry_run: bool) -> i32 {
+    // Flag > env > default-7, and 0 (or any non-positive value) follows the
+    // documented knob convention: keep forever. Without this, `--keep-days 0`
+    // would mean the OPPOSITE — prune everything older than the newest
+    // action — a data-loss footgun for anyone who read the env docs, and the
+    // clap default silently overrode DOOVER_KEEP_DAYS entirely (round 18).
+    let env_default = doover_core::maintenance::MaintenanceBudget::from_env().keep_days;
+    let keep_days = match keep_days {
+        Some(d) if d <= 0 => i64::MAX,
+        Some(d) => d,
+        None => env_default,
+    };
+    if keep_days == i64::MAX {
+        println!("retention disabled (keep forever); only budgets apply");
+    }
     let Some((journal, store, dh)) = cfg_journal_store() else {
         eprintln!("doover: cannot open journal/store");
         return 1;

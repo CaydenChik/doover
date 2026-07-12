@@ -610,8 +610,12 @@ fn post_hook_gc_eviction_is_journaled_never_silent() {
 }
 
 /// D2 review: the free-space floor alone must NOT evict in the automatic
-/// path (deficit eviction is manual-gc-only). An unmeetable floor with no
-/// cap pressure leaves history intact.
+/// path (deficit eviction is manual-gc-only). Round-18 mutation testing
+/// showed the first version of this test was VACUOUS — its only action was
+/// seconds old, so the hot window (not the floor rule) protected it and the
+/// exact regression this test guards shipped green. Now the fixture is an
+/// ANCIENT, genuinely evictable action: only the floor rule stands between
+/// it and deletion.
 #[test]
 fn post_hook_free_space_floor_never_auto_evicts() {
     let mut r = rig();
@@ -621,15 +625,61 @@ fn post_hook_free_space_floor_never_auto_evicts() {
         gc_every: 1,
         keep_days: 365,
     };
-    fs::write(r.cwd.join("f.txt"), "precious history").unwrap();
+    // ancient evictable action whose object is past every age guard
+    fs::create_dir_all(&r.cfg.doover_home).unwrap();
+    let j = journal(&r.cfg);
+    j.begin_session("old-s", "claude-code", "/p").unwrap();
+    let old = j
+        .start_action(&doover_core::journal::NewAction {
+            session_id: "old-s",
+            tool_use_id: Some("t-old"),
+            raw_command: "rm ancient",
+            effect: "destructive",
+            rule_id: None,
+            has_unknown: false,
+        })
+        .unwrap();
+    j.complete_by_tool_use("old-s", "t-old", 1).unwrap();
+    let ancient = doover_core::journal::now_ms() - 30 * 24 * 60 * 60 * 1000;
+    j.set_started_at_for_test(old, ancient).unwrap();
+    j.set_session_started_at_for_test("old-s", ancient).unwrap();
+    let store = doover_core::snapshot::Store::open(r.cfg.doover_home.join("store")).unwrap();
+    let f = r.cwd.join("ancient.txt");
+    fs::write(&f, "ancient content").unwrap();
+    let m = store.snapshot(&f, None).unwrap();
+    j.attach_manifest(old, &m, doover_core::journal::ManifestRole::Pre)
+        .unwrap();
+    let obj = store
+        .object_paths()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("one object");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&obj, fs::Permissions::from_mode(0o644)).unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ancient as u64);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&obj)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(when))
+        .unwrap();
+    fs::set_permissions(&obj, fs::Permissions::from_mode(0o444)).unwrap();
+
+    fs::write(r.cwd.join("f.txt"), "x").unwrap();
     let pre = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
     hooks::handle_pre(&r.cfg, &pre).unwrap();
     let post = hooks::parse_post_event(&post_json("s1", "t1", &r.cwd, "rm f.txt")).unwrap();
-    hooks::handle_post(&r.cfg, &post).unwrap();
+    let acted_on = hooks::handle_post(&r.cfg, &post).unwrap();
 
-    let store = doover_core::snapshot::Store::open(r.cfg.doover_home.join("store")).unwrap();
     assert!(
-        store.object_count().unwrap() > 0,
-        "floor breach must not evict automatically — manual gc only"
+        obj.exists(),
+        "an ANCIENT evictable object must survive floor-only pressure — \
+         deficit eviction is a manual-gc decision"
+    );
+    let note = j.action(acted_on).unwrap().note;
+    assert!(
+        !note.as_deref().is_some_and(|n| n.contains("evicted 1")),
+        "no eviction happened, so no eviction note: {note:?}"
     );
 }

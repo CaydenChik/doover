@@ -531,3 +531,57 @@ fn hook_post_without_pre_fails_open() {
         .success()
         .stderr(predicate::str::contains("fail-open"));
 }
+
+#[test]
+fn gc_keep_days_zero_flag_matches_the_env_opt_out_convention() {
+    // round 18: DOOVER_KEEP_DAYS=0 is documented as "keep forever" — the CLI
+    // flag must not mean the opposite (prune everything older than the newest
+    // action). Consistency here is data-loss-critical.
+    let (_tmp, dh) = journal_one_action("rm keep.txt");
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["gc", "--keep-days", "0"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("retention disabled"));
+    // the journaled action must still exist
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("log")
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rm keep.txt"));
+}
+
+#[test]
+fn gc_honors_the_keep_days_env_and_rejects_negative_footguns() {
+    // round 18: the clap default silently overrode DOOVER_KEEP_DAYS; and
+    // negative --keep-days values meant "prune all but the newest".
+    let (_tmp, dh) = journal_one_action("rm keep.txt");
+    // env opt-out honored when no flag is given
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("gc")
+        .env("DOOVER_HOME", &dh)
+        .env("DOOVER_KEEP_DAYS", "0")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("retention disabled"));
+    // negative flag = same keep-forever treatment, never a purge
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["gc", "--keep-days=-3"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("retention disabled"));
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("log")
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("rm keep.txt"));
+}
