@@ -830,3 +830,30 @@ fn kill9_mid_transaction_leaves_no_torn_rows() {
         .unwrap();
     assert_eq!(j.action(after).unwrap().seq, 2);
 }
+
+/// Round 20 (found by the S9 concurrency stress e2e): concurrent FIRST opens
+/// of a fresh journal raced the schema migration — every loser died on
+/// `duplicate column name: role`, every hook failed open, and nothing was
+/// protected on a brand-new install with parallel agents. All simultaneous
+/// opens must succeed.
+#[test]
+fn concurrent_first_opens_do_not_race_the_migration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("journal.db");
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait(); // maximal simultaneity
+                Journal::open(&db).map(|_| ())
+            })
+        })
+        .collect();
+    for (i, h) in handles.into_iter().enumerate() {
+        h.join()
+            .unwrap()
+            .unwrap_or_else(|e| panic!("concurrent open #{i} failed the migration race: {e}"));
+    }
+}

@@ -144,6 +144,19 @@ pub struct ActionRecord {
     pub note: Option<String>,
 }
 
+/// True for SQLITE_BUSY / SQLITE_LOCKED — the transient contention class the
+/// open() retry loop absorbs.
+fn is_busy(e: &JournalError) -> bool {
+    matches!(
+        e,
+        JournalError::Sqlite(rusqlite::Error::SqliteFailure(f, _))
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -157,22 +170,50 @@ pub struct Journal {
 
 impl Journal {
     pub fn open(path: &Path) -> Result<Self, JournalError> {
+        // Bounded retry on BUSY/LOCKED: the busy handler cannot wait in every
+        // path (SQLite returns immediately where waiting could deadlock, e.g.
+        // around the fresh-file WAL switch under concurrent first opens —
+        // round 20). Total worst-case wait ~1s, far under the hook timeout,
+        // and hook callers fail open anyway.
+        let mut last = None;
+        for _ in 0..40 {
+            match Self::open_attempt(path) {
+                Err(e) if is_busy(&e) => {
+                    last = Some(e);
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                other => return other,
+            }
+        }
+        Err(last.expect("loop ran at least once"))
+    }
+
+    fn open_attempt(path: &Path) -> Result<Self, JournalError> {
         let conn = rusqlite::Connection::open(path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "wal")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > SCHEMA_VERSION {
-            return Err(JournalError::SchemaTooNew { found: version });
-        }
-        // stepwise migrations: each block moves exactly one version forward,
-        // so any past journal upgrades along the same audited path
-        if version == 0 {
-            conn.execute_batch(
-                "BEGIN;
-                 CREATE TABLE IF NOT EXISTS sessions(
+        // Double-checked migration under an EXCLUSIVE transaction (round 20,
+        // found by the S9 concurrency stress test): concurrent FIRST opens of
+        // a fresh journal each read user_version before anyone migrated, and
+        // the losers re-ran `ALTER TABLE` into "duplicate column name" — every
+        // hook failed open, so a brand-new install with parallel agents had
+        // ZERO protection. BEGIN EXCLUSIVE serializes racers (busy_timeout
+        // queues them) and the version is re-read INSIDE the lock, so late
+        // arrivals see the migrated version and skip.
+        conn.execute_batch("BEGIN EXCLUSIVE;")?;
+        let migrate = (|| -> Result<(), JournalError> {
+            let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if version > SCHEMA_VERSION {
+                return Err(JournalError::SchemaTooNew { found: version });
+            }
+            // stepwise migrations: each block moves exactly one version
+            // forward, so any past journal upgrades along the same audited path
+            if version == 0 {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS sessions(
                     id TEXT PRIMARY KEY,
                     harness TEXT NOT NULL,
                     cwd TEXT NOT NULL,
@@ -210,22 +251,26 @@ impl Journal {
                     truncated INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS idx_manifests_action ON manifests(action_id);
-                 PRAGMA user_version = 1;
-                 COMMIT;",
-            )?;
-            version = 1;
+                 PRAGMA user_version = 1;",
+                )?;
+                version = 1;
+            }
+            if version == 1 {
+                // v2: manifests gain a role — pre (undo restores it) or post
+                // (redo restores it; conflict oracle). Existing rows are all pre.
+                conn.execute_batch(
+                    "ALTER TABLE manifests ADD COLUMN role TEXT NOT NULL DEFAULT 'pre'
+                        CHECK(role IN ('pre','post'));
+                     PRAGMA user_version = 2;",
+                )?;
+            }
+            Ok(())
+        })();
+        match &migrate {
+            Ok(()) => conn.execute_batch("COMMIT;")?,
+            Err(_) => conn.execute_batch("ROLLBACK;").unwrap_or(()),
         }
-        if version == 1 {
-            // v2: manifests gain a role — pre (undo restores it) or post
-            // (redo restores it; conflict oracle). Existing rows are all pre.
-            conn.execute_batch(
-                "BEGIN;
-                 ALTER TABLE manifests ADD COLUMN role TEXT NOT NULL DEFAULT 'pre'
-                    CHECK(role IN ('pre','post'));
-                 PRAGMA user_version = 2;
-                 COMMIT;",
-            )?;
-        }
+        migrate?;
         Ok(Self { conn })
     }
 

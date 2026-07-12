@@ -104,3 +104,61 @@ run_log_first_destructive() {
   [[ "$output" == *"would undo"* ]]
   [ "$(cat "$PROJ/n.txt")" = "x" ]
 }
+
+@test "S3c: LAUNCH CLAIM — a realistic tree restores byte-identical (diff -r)" {
+  # nested dirs, an executable, a symlink, a larger file, dot-files —
+  # the restoration must be indistinguishable from the original
+  mkdir -p "$PROJ/app/src/utils" "$PROJ/app/assets"
+  echo 'fn main() {}' > "$PROJ/app/src/main.rs"
+  echo 'pub fn helper() {}' > "$PROJ/app/src/utils/helper.rs"
+  printf '#!/bin/sh\necho hi\n' > "$PROJ/app/build.sh"; chmod 755 "$PROJ/app/build.sh"
+  head -c 262144 /dev/urandom > "$PROJ/app/assets/blob.bin"
+  echo 'secret=1' > "$PROJ/app/.env"
+  ln -s src/main.rs "$PROJ/app/entry.rs"
+  cp -R "$PROJ/app" "$JAIL/reference"
+
+  agent_runs t9 'rm -rf app'
+  [ ! -e "$PROJ/app" ]
+
+  run "$DOOVER_BIN" undo
+  [ "$status" -eq 0 ]
+  # byte-identical tree, symlinks compared as links
+  run diff -r "$JAIL/reference" "$PROJ/app"
+  [ "$status" -eq 0 ]
+  # executable bit survived
+  [ -x "$PROJ/app/build.sh" ]
+  # symlink is a symlink pointing at the same target
+  [ "$(readlink "$PROJ/app/entry.rs")" = "src/main.rs" ]
+}
+
+@test "S9: 8 concurrent agent sessions + concurrent gc keep the journal coherent" {
+  # the D5 stress check: parallel hook processes hammering one DOOVER_HOME
+  # while gc runs concurrently — no lost actions, no deadlock, journal sane
+  for i in 1 2 3 4 5 6 7 8; do
+    (
+      mkdir -p "$PROJ/w$i"
+      echo "data $i" > "$PROJ/w$i/f.txt"
+      printf '{"session_id":"con-%s","cwd":"%s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_use_id":"t%s","tool_input":{"command":"rm -rf w%s"}}' \
+        "$i" "$PROJ" "$i" "$i" | "$DOOVER_BIN" hook pre
+      rm -rf "$PROJ/w$i"
+      printf '{"session_id":"con-%s","cwd":"%s","hook_event_name":"PostToolUse","tool_name":"Bash","tool_use_id":"t%s","duration_ms":3,"tool_input":{"command":"rm -rf w%s"},"tool_response":{"stdout":"","stderr":"","interrupted":false}}' \
+        "$i" "$PROJ" "$i" "$i" | "$DOOVER_BIN" hook post
+    ) &
+  done
+  "$DOOVER_BIN" gc >/dev/null 2>&1 &
+  wait
+
+  # every action landed and completed; the journal passes integrity
+  run "$DOOVER_BIN" log -n 50
+  [ "$status" -eq 0 ]
+  for i in 1 2 3 4 5 6 7 8; do
+    [[ "$output" == *"rm -rf w$i"* ]]
+  done
+  [[ "$output" != *"pending"* ]]
+  run "$DOOVER_BIN" doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"journal integrity"* ]]
+  # and one of the concurrent actions is actually undoable
+  run "$DOOVER_BIN" undo
+  [ "$status" -eq 0 ]
+}
