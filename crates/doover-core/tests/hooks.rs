@@ -802,3 +802,55 @@ fn doover_home_is_private_and_loose_installs_are_tightened() {
         & 0o777;
     assert_eq!(mode, 0o700, "home must be tightened to 0700, got {mode:o}");
 }
+
+/// Round 21 (D7 open item, confirmed): when DOOVER_HOME lives INSIDE the
+/// project, a defensive cwd snapshot must not ingest doover's own store and
+/// journal — recursive bloat, and it would capture the secret-bearing journal
+/// into a snapshot. Every manifest entry must be outside DOOVER_HOME.
+#[test]
+fn a_cwd_snapshot_never_captures_doover_home() {
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let dh = proj.join(".doover"); // home nested under the project
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(proj.join("real.txt"), "user data").unwrap();
+    let cfg = HookConfig {
+        doover_home: dh.clone(),
+        home: tmp.path().join("h"),
+        limits: doover_core::snapshot::Limits {
+            max_files: 100_000,
+            max_bytes: 5 << 30,
+            max_duration: None,
+        },
+        unknown_policy: UnknownPolicy::SnapshotCwd,
+        maintenance: doover_core::maintenance::MaintenanceBudget::disabled(),
+    };
+    fs::create_dir_all(&cfg.home).unwrap();
+
+    // an UNKNOWN command -> defensive cwd snapshot of proj (contains .doover)
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &proj, "frobnicate ./real.txt")).unwrap();
+    hooks::handle_pre(&cfg, &ev).unwrap();
+
+    let j = journal(&cfg);
+    let manifests = j
+        .manifests_by_role(1, doover_core::journal::ManifestRole::Pre)
+        .unwrap();
+    // form-independent: no captured entry's rel path may traverse `.doover`
+    // (the store/journal dir name), regardless of symlink/canonical path form
+    for m in &manifests {
+        for e in &m.entries {
+            assert!(
+                !e.rel.components().any(|c| c.as_os_str() == ".doover"),
+                "self-snapshot: captured doover's own {}",
+                e.rel.display()
+            );
+        }
+    }
+    // sanity: the user's real file WAS captured
+    assert!(
+        manifests
+            .iter()
+            .any(|m| m.entries.iter().any(|e| e.rel.ends_with("real.txt"))),
+        "the user's own file must still be captured"
+    );
+}

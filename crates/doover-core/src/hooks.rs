@@ -310,7 +310,11 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
         for path in &targets {
             // once the action exists, per-path failures become loud gaps,
             // never lost protection for the OTHER paths — and never silent
-            match store.snapshot(path, Some(&slice_limits(&cfg.limits, deadline))) {
+            match store.snapshot_excluding(
+                path,
+                Some(&slice_limits(&cfg.limits, deadline)),
+                std::slice::from_ref(&cfg.doover_home),
+            ) {
                 Ok(manifest) => {
                     if manifest.truncated {
                         note_gap(
@@ -366,7 +370,11 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
         let store = Store::open(cfg.doover_home.join("store"))?;
         let deadline = hook_deadline(&cfg.limits);
         for m in &pre {
-            match store.snapshot(&m.path, Some(&slice_limits(&cfg.limits, deadline))) {
+            match store.snapshot_excluding(
+                &m.path,
+                Some(&slice_limits(&cfg.limits, deadline)),
+                std::slice::from_ref(&cfg.doover_home),
+            ) {
                 Ok(post) => journal.attach_manifest(action, &post, ManifestRole::Post)?,
                 Err(e) => journal.add_note(
                     action,

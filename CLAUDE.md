@@ -128,6 +128,25 @@ confirm green → only then claim done. Build order and per-step test gates are 
   (severity model picks one; Destructive>Externalizing). undo-coverage wins
   over the exfil flag — and the common upload form `curl -d @x URL` (no `-o`)
   still flags externalizing. Revisit if effects ever become multi-valued.
+- **DONE (round 21): overlay SHADOW attack fixed.** The same-id downgrade
+  guard was insufficient — a DIFFERENT-id overlay rule matching the same
+  command (e.g. `aaa.rm` effect:safe) out-competed shipped `coreutils.rm` at
+  lookup and made `rm -rf` classify SAFE with no snapshot, silently. Fix:
+  Registry tracks `shipped_count`; `lookup_command` enforces a PROTECTION
+  FLOOR — the resolved effect is never weaker than the shipped-only registry
+  would give for that command, regardless of id/score/tie-break. Lookup
+  tie-break also now favors the STRONGER effect (a protection tool must not
+  resolve ties toward the safer class). Load-time warning when an overlay
+  shadows protected shipped protection. Legitimate use preserved (new
+  commands, upgrades). Pinned by 4 registry tests.
+- **DONE (round 21, closes the D7 self-snapshot open item): a cwd snapshot
+  never ingests DOOVER_HOME.** With the store/journal nested inside a project,
+  the defensive cwd snapshot captured doover's own internals (13/15 entries)
+  — recursive bloat AND capture of the secret-bearing journal into a
+  snapshot. `Store::snapshot_excluding` prunes any subtree under DOOVER_HOME
+  (lexical prefix, symlink-resolution intentionally avoided so identity games
+  can't dodge it); both hook loops pass `cfg.doover_home`. Pinned by a
+  regression test proven red-without-fix.
 - **`doover` is a safety net, not a security boundary** — reiterate in user
   docs; a deliberately adversarial agent can still defeat static scoping.
 - **DONE (D3 corpus audit): long-tail coverage measured, not guessed.** A

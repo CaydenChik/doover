@@ -56,6 +56,32 @@ fn rel_is_safe(rel: &Path) -> bool {
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
+/// Lexical absolute normalization (no filesystem access): make relative paths
+/// absolute against cwd, then fold `.`/`..`. Used only for prefix comparison
+/// in the exclusion check — symlink resolution is intentionally avoided so a
+/// symlinked project can't dodge the DOOVER_HOME exclusion by identity games.
+fn normalize_abs(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/"))
+            .join(path)
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn io_err(path: &Path, source: io::Error) -> SnapshotError {
     SnapshotError::Io {
         path: path.display().to_string(),
@@ -185,6 +211,20 @@ impl Store {
         path: &Path,
         limits: Option<&Limits>,
     ) -> Result<Manifest, SnapshotError> {
+        self.snapshot_excluding(path, limits, &[])
+    }
+
+    /// Like [`Self::snapshot`] but prunes any subtree under an `exclude` path.
+    /// The hook passes DOOVER_HOME so a defensive cwd snapshot of a project
+    /// that CONTAINS doover's own store/journal never ingests doover's
+    /// internals — recursive bloat and capture of the (secret-bearing) journal
+    /// (round 21). Exclusions are compared lexically after normalization.
+    pub fn snapshot_excluding(
+        &self,
+        path: &Path,
+        limits: Option<&Limits>,
+        exclude: &[PathBuf],
+    ) -> Result<Manifest, SnapshotError> {
         let mut manifest = Manifest {
             schema: MANIFEST_SCHEMA,
             path: path.to_path_buf(),
@@ -231,8 +271,11 @@ impl Store {
         let deadline = limits
             .and_then(|l| l.max_duration)
             .map(|d| Instant::now() + d);
-        let walker = walkdir::WalkDir::new(path).sort_by_file_name();
-        for item in walker {
+        // normalized exclusion roots (DOOVER_HOME): any entry at or under one
+        // is pruned so doover never snapshots its own state
+        let excludes: Vec<PathBuf> = exclude.iter().map(|p| normalize_abs(p)).collect();
+        let mut walker = walkdir::WalkDir::new(path).sort_by_file_name().into_iter();
+        while let Some(item) = walker.next() {
             if let Some(dl) = deadline {
                 if Instant::now() >= dl {
                     manifest.truncated = true;
@@ -242,6 +285,15 @@ impl Store {
                         manifest.entries.len()
                     ));
                     break;
+                }
+            }
+            if let Ok(entry) = &item {
+                let abs = normalize_abs(entry.path());
+                if excludes.iter().any(|ex| abs == *ex || abs.starts_with(ex)) {
+                    if entry.file_type().is_dir() {
+                        walker.skip_current_dir();
+                    }
+                    continue;
                 }
             }
             let item = match item {

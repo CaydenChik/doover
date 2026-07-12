@@ -129,6 +129,12 @@ const SHIPPED: &[(&str, &str)] = &[
 pub struct Registry {
     rules: Vec<Rule>,
     index: HashMap<String, usize>,
+    /// Number of leading rules that are SHIPPED (built-in). Everything at or
+    /// after this index is a user overlay. Lookup uses this to enforce a
+    /// protection floor: an overlay can never resolve a command to a WEAKER
+    /// effect than the shipped registry alone would (the shadow-attack guard,
+    /// round 21) — regardless of rule id, match score, or tie-breaks.
+    shipped_count: usize,
 }
 
 impl Registry {
@@ -156,7 +162,12 @@ impl Registry {
                 });
             }
         }
-        Ok(Self { rules, index })
+        let shipped_count = rules.len();
+        Ok(Self {
+            rules,
+            index,
+            shipped_count,
+        })
     }
 
     /// The shipped registry. Must always be valid — a failure here is a bug
@@ -236,6 +247,25 @@ impl Registry {
                 self.rules[i] = rule;
             }
             None => {
+                // A new-id overlay rule that matches the same command as a
+                // protected shipped rule but classifies it WEAKER is a shadow
+                // attempt. The lookup floor already prevents the downgrade;
+                // warn so the user knows their rule was (partially) ignored
+                // (round 21).
+                if let Some(cmd) = rule.matcher.command.as_deref() {
+                    let shadows_protected = self.rules[..self.shipped_count].iter().any(|s| {
+                        s.matcher.command.as_deref() == Some(cmd)
+                            && is_protected(s.effect)
+                            && rule.effect < s.effect
+                    });
+                    if shadows_protected {
+                        warnings.push(format!(
+                            "overlay `{}` classifies `{cmd}` weaker than the shipped protection; \
+                             the downgrade is ignored at lookup (safety floor)",
+                            rule.id
+                        ));
+                    }
+                }
                 self.index.insert(rule.id.clone(), self.rules.len());
                 self.rules.push(rule);
             }
@@ -246,48 +276,39 @@ impl Registry {
     /// subcommand outranks a bare-command rule, and a matching `flags_any`
     /// outranks both. Rules with a subcommand or flags requirement that the
     /// invocation doesn't satisfy don't match at all.
-    pub fn lookup_command(
-        &self,
+    pub fn lookup_command<'a>(
+        &'a self,
         command: &str,
         subcommand: Option<&str>,
         flags: &[String],
-    ) -> Option<&Rule> {
-        self.rules
-            .iter()
-            .filter_map(|rule| {
-                let m = &rule.matcher;
-                if m.command.as_deref() != Some(command) {
-                    return None;
-                }
-                let mut score = 1usize;
-                if let Some(want) = m.subcommand.as_deref() {
-                    if subcommand != Some(want) {
-                        return None;
-                    }
-                    score += 2;
-                }
-                if let Some(want_any) = &m.flags_any {
-                    // a flag is value-taking when the rule itself declares it
-                    // consumes/carries a value; only then can `-oVALUE`
-                    // attached-short forms match (never `-rf` boolean clusters)
-                    let value_taking = |w: &str| {
-                        rule.scope.as_ref().is_some_and(|s| {
-                            s.path_flags.iter().any(|x| x == w)
-                                || s.flag_args.iter().any(|x| x == w)
-                        })
-                    };
-                    if !want_any
-                        .iter()
-                        .any(|w| flags.iter().any(|f| flag_matches(f, w, value_taking(w))))
-                    {
-                        return None;
-                    }
-                    score += 4;
-                }
-                Some((score, rule))
-            })
-            .max_by(|(sa, ra), (sb, rb)| sa.cmp(sb).then_with(|| rb.id.cmp(&ra.id)))
-            .map(|(_, rule)| rule)
+    ) -> Option<&'a Rule> {
+        let best = |rules: &'a [Rule]| -> Option<&'a Rule> {
+            rules
+                .iter()
+                .filter_map(|rule| {
+                    score_command_match(rule, command, subcommand, flags).map(|s| (s, rule))
+                })
+                // most specific match wins; on a tie, the STRONGER effect wins
+                // (a protection tool must never resolve a tie toward the less
+                // dangerous classification); id only for final determinism
+                .max_by(|(sa, ra), (sb, rb)| {
+                    sa.cmp(sb)
+                        .then_with(|| ra.effect.cmp(&rb.effect))
+                        .then_with(|| rb.id.cmp(&ra.id))
+                })
+                .map(|(_, rule)| rule)
+        };
+        let overall = best(&self.rules);
+        // Protection floor (shadow-attack guard, round 21): an overlay may
+        // add or STRENGTHEN a classification, never weaken the shipped one.
+        // If the shipped-only best is protected and stronger than the overall
+        // winner, the shipped rule stands — no overlay id/score/tie-break can
+        // downgrade `rm` to safe.
+        let shipped = best(&self.rules[..self.shipped_count]);
+        match (overall, shipped) {
+            (Some(o), Some(s)) if is_protected(s.effect) && s.effect > o.effect => Some(s),
+            (o, _) => o,
+        }
     }
 
     pub fn lookup_redirect(&self, op: &str) -> Option<&Rule> {
@@ -307,6 +328,46 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+}
+
+/// Match score of `rule` against a command invocation, or `None` if the rule
+/// does not apply. Shared by the overall and shipped-only lookup passes so the
+/// protection floor compares like with like.
+fn score_command_match(
+    rule: &Rule,
+    command: &str,
+    subcommand: Option<&str>,
+    flags: &[String],
+) -> Option<usize> {
+    let m = &rule.matcher;
+    if m.command.as_deref() != Some(command) {
+        return None;
+    }
+    let mut score = 1usize;
+    if let Some(want) = m.subcommand.as_deref() {
+        if subcommand != Some(want) {
+            return None;
+        }
+        score += 2;
+    }
+    if let Some(want_any) = &m.flags_any {
+        // a flag is value-taking when the rule itself declares it
+        // consumes/carries a value; only then can `-oVALUE` attached-short
+        // forms match (never `-rf` boolean clusters)
+        let value_taking = |w: &str| {
+            rule.scope.as_ref().is_some_and(|s| {
+                s.path_flags.iter().any(|x| x == w) || s.flag_args.iter().any(|x| x == w)
+            })
+        };
+        if !want_any
+            .iter()
+            .any(|w| flags.iter().any(|f| flag_matches(f, w, value_taking(w))))
+        {
+            return None;
+        }
+        score += 4;
+    }
+    Some(score)
 }
 
 /// Whether an observed flag token satisfies a wanted flag: exact match, the

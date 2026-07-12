@@ -287,3 +287,69 @@ fn classification_matrix_snapshot() {
     lines.sort();
     insta::assert_snapshot!(lines.join("\n"));
 }
+
+/// Round 21 (shadow attack): the same-id downgrade guard is not enough — a
+/// DIFFERENT-id overlay rule matching the same command must not out-compete a
+/// shipped protected rule at lookup and silently make `rm` safe.
+#[test]
+fn overlay_cannot_shadow_a_shipped_rule_with_a_different_id() {
+    // two ids, one sorting before and one after "coreutils.rm", both weaker —
+    // neither the tie-break nor score may let them win
+    let dir = overlay_dir(&[(
+        "evil.yaml",
+        "rules:\n\
+         \x20 - id: aaa.rm\n    match: { command: rm }\n    effect: safe\n    undo: none\n\
+         \x20 - id: zzz.rm\n    match: { command: rm }\n    effect: safe\n    undo: none\n",
+    )]);
+    let (r, warnings) = Registry::with_overlay(dir.path()).unwrap();
+    assert_eq!(
+        r.lookup_command("rm", None, &[]).unwrap().effect,
+        Effect::Destructive,
+        "a different-id overlay must not downgrade rm's shipped protection"
+    );
+    assert!(
+        warnings.iter().any(|w| w.contains("rm")),
+        "shadowing attempt must warn the user: {warnings:?}"
+    );
+}
+
+/// A MORE-SPECIFIC weaker overlay (higher match score) must also not win over
+/// a protected shipped rule — score must never override the protection floor.
+#[test]
+fn a_more_specific_overlay_cannot_downgrade_protection() {
+    let dir = overlay_dir(&[(
+        "evil.yaml",
+        "rules:\n  - id: my.rm-rf\n    match: { command: rm, flags_any: [\"-rf\"] }\n    effect: safe\n    undo: none\n",
+    )]);
+    let (r, _w) = Registry::with_overlay(dir.path()).unwrap();
+    assert_eq!(
+        r.lookup_command("rm", None, &["-rf".into()])
+            .unwrap()
+            .effect,
+        Effect::Destructive,
+        "a higher-score overlay must not beat the shipped protection floor"
+    );
+}
+
+/// The legitimate cases still work: an overlay may add rules for NEW commands
+/// and may UPGRADE (strengthen) a shipped classification.
+#[test]
+fn overlay_shadow_fix_preserves_legitimate_upgrades_and_new_commands() {
+    let dir = overlay_dir(&[(
+        "ok.yaml",
+        "rules:\n\
+         \x20 - id: my.frob\n    match: { command: frobnicate }\n    effect: destructive\n    scope: { paths: positional }\n    undo: snapshot-restore\n\
+         \x20 - id: my.ls-danger\n    match: { command: ls }\n    effect: destructive\n    scope: { paths: positional }\n    undo: snapshot-restore\n",
+    )]);
+    let (r, _w) = Registry::with_overlay(dir.path()).unwrap();
+    assert_eq!(
+        r.lookup_command("frobnicate", None, &[]).unwrap().effect,
+        Effect::Destructive,
+        "new-command overlay rule works"
+    );
+    assert_eq!(
+        r.lookup_command("ls", None, &[]).unwrap().effect,
+        Effect::Destructive,
+        "upgrading a shipped safe rule to destructive is allowed"
+    );
+}
