@@ -101,9 +101,9 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     ".turbo",
 ];
 
-/// The directories a snapshot will skip when walking a tree it was not pointed
-/// at directly. Never applies to an explicitly targeted path.
-pub fn skip_dirs() -> Vec<String> {
+/// The directory names a snapshot may skip. Never applies to an explicitly
+/// targeted path, and (inside a git repo) only to directories git ignores.
+pub fn skip_dir_names() -> Vec<String> {
     match std::env::var("DOOVER_SKIP_DIRS") {
         Ok(v) => v
             .split(',')
@@ -113,6 +113,15 @@ pub fn skip_dirs() -> Vec<String> {
             .collect(),
         Err(_) => DEFAULT_SKIP_DIRS.iter().map(|s| s.to_string()).collect(),
     }
+}
+
+/// The skip policy for a snapshot rooted at `path`: the name list, gated by
+/// the enclosing repository's gitignore so a build-NAMED directory that git
+/// actually tracks (real source in `build/`, a committed Go `vendor/`) is
+/// still captured.
+pub fn skip_policy_for(path: &std::path::Path) -> crate::snapshot::SkipPolicy {
+    let repo = crate::resolver::find_repo_root(path);
+    crate::snapshot::SkipPolicy::new(skip_dir_names(), repo.as_deref())
 }
 
 /// Create DOOVER_HOME if needed and force it to 0700 (D4): the journal holds
@@ -349,8 +358,8 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
     if !targets.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
         let deadline = hook_deadline(&cfg.limits);
-        let skips = skip_dirs();
         for path in &targets {
+            let skips = skip_policy_for(path);
             // once the action exists, per-path failures become loud gaps,
             // never lost protection for the OTHER paths — and never silent
             match store.snapshot_scoped(
@@ -413,8 +422,8 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
     if !pre.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
         let deadline = hook_deadline(&cfg.limits);
-        let skips = skip_dirs();
         for m in &pre {
+            let skips = skip_policy_for(&m.path);
             match store.snapshot_scoped(
                 &m.path,
                 Some(&slice_limits(&cfg.limits, deadline)),

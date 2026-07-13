@@ -82,6 +82,64 @@ fn normalize_abs(path: &Path) -> PathBuf {
     out
 }
 
+/// Which directories a snapshot walks past.
+///
+/// A NAME alone is only a guess: plenty of projects keep real, irreplaceable
+/// source in a folder called `build/`, and Go projects commit `vendor/`.
+/// Skipping those by name would mean undo could never bring them back — a
+/// data-loss bug in a tool that exists to prevent data loss.
+///
+/// So a directory is skipped only when BOTH hold:
+///   1. its name is on the list (it is the KIND of thing that gets rebuilt), and
+///   2. git already ignores it (the project itself declares it disposable).
+///
+/// Gitignored-but-not-a-build-dir (`.env`, a local database) is captured —
+/// that is precisely what git does NOT protect and what doover is for.
+///
+/// Outside a git repo there is no disposability signal, so the name list is all
+/// there is; the fallback is name-only. Every other uncertainty (no repo root,
+/// unreadable .gitignore, a nested ignore we did not load) resolves toward
+/// CAPTURING: being slower is recoverable, being lossy is not.
+pub struct SkipPolicy {
+    names: Vec<String>,
+    gitignore: Option<ignore::gitignore::Gitignore>,
+}
+
+impl SkipPolicy {
+    /// `repo_root` = the enclosing git repository, if any.
+    pub fn new(names: Vec<String>, repo_root: Option<&Path>) -> Self {
+        let gitignore = repo_root.and_then(|root| {
+            let mut b = ignore::gitignore::GitignoreBuilder::new(root);
+            // root .gitignore plus the repo's private excludes; a pattern we
+            // fail to load simply means we capture that directory
+            b.add(root.join(".gitignore"));
+            b.add(root.join(".git/info/exclude"));
+            b.build().ok()
+        });
+        Self { names, gitignore }
+    }
+
+    /// Skip nothing (used by plain `snapshot()` and by tests).
+    pub fn none() -> Self {
+        Self {
+            names: Vec::new(),
+            gitignore: None,
+        }
+    }
+
+    fn skips(&self, dir: &Path, name: &str) -> bool {
+        if !self.names.iter().any(|n| n == name) {
+            return false;
+        }
+        match &self.gitignore {
+            // inside a repo: git must agree the directory is disposable
+            Some(gi) => gi.matched_path_or_any_parents(dir, true).is_ignore(),
+            // no repo: the name list is the only signal we have
+            None => true,
+        }
+    }
+}
+
 fn io_err(path: &Path, source: io::Error) -> SnapshotError {
     SnapshotError::Io {
         path: path.display().to_string(),
@@ -217,7 +275,7 @@ impl Store {
         path: &Path,
         limits: Option<&Limits>,
     ) -> Result<Manifest, SnapshotError> {
-        self.snapshot_scoped(path, limits, &[], &[])
+        self.snapshot_scoped(path, limits, &[], &SkipPolicy::none())
     }
 
     pub fn snapshot_excluding(
@@ -226,7 +284,7 @@ impl Store {
         limits: Option<&Limits>,
         exclude: &[PathBuf],
     ) -> Result<Manifest, SnapshotError> {
-        self.snapshot_scoped(path, limits, exclude, &[])
+        self.snapshot_scoped(path, limits, exclude, &SkipPolicy::none())
     }
 
     /// The full snapshot entry point.
@@ -235,19 +293,20 @@ impl Store {
     /// DOOVER_HOME so a defensive cwd snapshot of a project that CONTAINS
     /// doover's own store never ingests doover's internals (round 21).
     ///
-    /// `skip_dir_names` prunes regenerable build/dependency directories found
-    /// INSIDE the tree (`target/`, `node_modules/`, …). Dogfooding showed a
-    /// Rust repo is 99.5% `target/`: without this the time budget is spent on
-    /// build artifacts and the user's actual source never gets captured. The
-    /// snapshot ROOT is never skipped, so `rm -rf target` still snapshots
-    /// target/ in full — skipping only applies to dirs we find while walking a
-    /// tree the user did not point at directly.
+    /// `skip` prunes regenerable build/dependency directories found INSIDE the
+    /// tree (`target/`, `node_modules/`, …) — see [`SkipPolicy`] for why a name
+    /// alone is not enough. Dogfooding showed a Rust repo is 99.5% `target/`:
+    /// without this the time budget is spent on build artifacts and the user's
+    /// actual source never gets captured. The snapshot ROOT is never skipped,
+    /// so `rm -rf target` still snapshots target/ in full — skipping only
+    /// applies to dirs we find while walking a tree the user did not point at
+    /// directly.
     pub fn snapshot_scoped(
         &self,
         path: &Path,
         limits: Option<&Limits>,
         exclude: &[PathBuf],
-        skip_dir_names: &[String],
+        skip: &SkipPolicy,
     ) -> Result<Manifest, SnapshotError> {
         let mut manifest = Manifest {
             schema: MANIFEST_SCHEMA,
@@ -324,7 +383,7 @@ impl Store {
                 // (an explicitly targeted `target/` must still be captured)
                 if entry.depth() > 0 && entry.file_type().is_dir() {
                     let name = entry.file_name().to_string_lossy();
-                    if skip_dir_names.iter().any(|s| *s == name) {
+                    if skip.skips(entry.path(), &name) {
                         manifest.skipped_dirs.push(entry.path().to_path_buf());
                         walker.skip_current_dir();
                         continue;

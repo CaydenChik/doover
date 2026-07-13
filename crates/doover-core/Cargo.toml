@@ -20,6 +20,7 @@ glob.workspace = true
 reflink-copy.workspace = true
 blake3.workspace = true
 walkdir.workspace = true
+ignore.workspace = true
 regex.workspace = true
 xattr.workspace = true
 libc.workspace = true

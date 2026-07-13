@@ -1079,7 +1079,8 @@ fn glob_match_allowed(relative: &str, pat_components: &[&str]) -> bool {
     true
 }
 
-fn find_repo_root(start: &Path) -> Option<PathBuf> {
+/// Nearest enclosing git repository (walks up looking for `.git`).
+pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|p| p.join(".git").exists())

@@ -883,10 +883,14 @@ fn snapshot_skips_regenerable_build_dirs_but_records_them() {
             write(&proj.join(junk).join(format!("j{i}.bin")), "junk");
         }
     }
-    let skips: Vec<String> = ["target", "node_modules", "__pycache__", ".venv"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    // no git repo here -> name-only fallback
+    let skips = doover_core::snapshot::SkipPolicy::new(
+        ["target", "node_modules", "__pycache__", ".venv"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        None,
+    );
     let m = j.store.snapshot_scoped(&proj, None, &[], &skips).unwrap();
 
     let rels: Vec<String> = m
@@ -930,7 +934,7 @@ fn an_explicitly_targeted_build_dir_is_still_fully_captured() {
     for i in 0..5 {
         write(&target.join(format!("artifact{i}.o")), "build output");
     }
-    let skips = vec!["target".to_string()];
+    let skips = doover_core::snapshot::SkipPolicy::new(vec!["target".to_string()], None);
     let m = j.store.snapshot_scoped(&target, None, &[], &skips).unwrap();
     assert_eq!(m.entries.len(), 6, "root + 5 files fully captured");
     assert!(m.skipped_dirs.is_empty());
@@ -946,7 +950,7 @@ fn skipped_dirs_survive_the_restore_and_do_not_trip_the_conflict_oracle() {
     let proj = j.world.join("proj");
     write(&proj.join("src/main.rs"), "v1");
     write(&proj.join("target/app.o"), "build output");
-    let skips = vec!["target".to_string()];
+    let skips = doover_core::snapshot::SkipPolicy::new(vec!["target".to_string()], None);
     let m = j.store.snapshot_scoped(&proj, None, &[], &skips).unwrap();
     assert_eq!(m.skipped_dirs.len(), 1);
 
@@ -978,4 +982,101 @@ fn skipped_dirs_survive_the_restore_and_do_not_trip_the_conflict_oracle() {
         proj.join("target/extra.o").exists(),
         "skipped dir must NOT be deleted by the swap"
     );
+}
+
+// --- the gitignore gate: name alone is a guess, git's ignore is a declaration --
+
+fn git_repo(root: &Path, gitignore: &str) {
+    fs::create_dir_all(root.join(".git")).unwrap(); // enough for repo-root detection
+    write(&root.join(".gitignore"), gitignore);
+}
+
+/// THE data-loss path the gate closes: a directory whose NAME looks like build
+/// output but which git tracks (so it is real, irreplaceable source) must be
+/// captured. Skipping it would mean undo could not bring it back.
+#[test]
+fn a_build_named_dir_that_git_tracks_is_still_captured() {
+    let j = jail();
+    let proj = j.world.join("proj");
+    git_repo(&proj, "target/\nnode_modules/\n"); // build/ NOT ignored
+    write(&proj.join("src/main.rs"), "source");
+    write(
+        &proj.join("build/generate.sh"),
+        "REAL SOURCE that lives in build/",
+    );
+    write(&proj.join("target/app.o"), "artifact");
+    write(&proj.join("node_modules/dep.js"), "dep");
+    write(&proj.join(".env"), "API_KEY=secret"); // gitignored by nothing here
+
+    let policy = doover_core::snapshot::SkipPolicy::new(
+        ["target", "node_modules", "build", "dist"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        Some(&proj),
+    );
+    let m = j.store.snapshot_scoped(&proj, None, &[], &policy).unwrap();
+    let rels: Vec<String> = m
+        .entries
+        .iter()
+        .map(|e| e.rel.to_string_lossy().into_owned())
+        .collect();
+    let has = |p: &str| rels.iter().any(|r| r == p);
+
+    assert!(has("src/main.rs"), "source captured");
+    assert!(
+        has("build/generate.sh"),
+        "a build-NAMED dir that git TRACKS is real source — must be captured, got {rels:?}"
+    );
+    assert!(!has("target/app.o"), "gitignored + build name -> skipped");
+    assert!(
+        !has("node_modules/dep.js"),
+        "gitignored + build name -> skipped"
+    );
+    assert_eq!(m.skipped_dirs.len(), 2, "only target/ and node_modules/");
+}
+
+/// The flagship case must survive the gate: `.env` is gitignored but is NOT a
+/// build dir, so it is exactly what doover exists to protect.
+#[test]
+fn a_gitignored_secret_is_still_captured() {
+    let j = jail();
+    let proj = j.world.join("proj");
+    git_repo(&proj, ".env\ntarget/\n");
+    write(&proj.join(".env"), "API_KEY=secret");
+    write(&proj.join("target/app.o"), "artifact");
+
+    let policy = doover_core::snapshot::SkipPolicy::new(vec!["target".to_string()], Some(&proj));
+    let m = j.store.snapshot_scoped(&proj, None, &[], &policy).unwrap();
+    let rels: Vec<String> = m
+        .entries
+        .iter()
+        .map(|e| e.rel.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        rels.iter().any(|r| r == ".env"),
+        "gitignored but not a build dir: capture it — this is the whole pitch"
+    );
+    assert!(!rels.iter().any(|r| r.starts_with("target")));
+}
+
+/// Outside a git repo there is no disposability signal, so the name list is all
+/// we have: fall back to name-only (documented) rather than reintroduce the
+/// 5-second stall for every non-git project.
+#[test]
+fn outside_a_git_repo_the_name_list_still_applies() {
+    let j = jail();
+    let proj = j.world.join("plain"); // no .git anywhere
+    write(&proj.join("index.js"), "source");
+    write(&proj.join("node_modules/dep.js"), "dep");
+
+    let policy = doover_core::snapshot::SkipPolicy::new(vec!["node_modules".to_string()], None);
+    let m = j.store.snapshot_scoped(&proj, None, &[], &policy).unwrap();
+    let rels: Vec<String> = m
+        .entries
+        .iter()
+        .map(|e| e.rel.to_string_lossy().into_owned())
+        .collect();
+    assert!(rels.iter().any(|r| r == "index.js"));
+    assert!(!rels.iter().any(|r| r.starts_with("node_modules")));
 }
