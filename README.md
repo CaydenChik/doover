@@ -49,6 +49,12 @@ dangerous commands reversible instead.
 
 macOS or Linux (WSL works; native Windows doesn't).
 
+**Cargo** (needs Rust 1.85+):
+
+```console
+$ cargo install doover
+```
+
 **Homebrew:**
 
 ```console
@@ -60,15 +66,6 @@ $ brew install doover
 **Prebuilt binaries** for every platform are on the
 [releases page](https://github.com/CaydenChik/doover/releases), with
 `SHA256SUMS` to verify.
-
-**From source** (needs Rust 1.85+):
-
-```console
-$ git clone https://github.com/CaydenChik/doover
-$ cargo install --path doover/crates/doover
-```
-
-A `cargo install doover` package is landing on crates.io shortly.
 
 ## Set up
 
