@@ -168,6 +168,12 @@ pub struct Manifest {
     /// unreadable subtrees, skipped special files (sockets/devices), fifos.
     /// A non-empty list means coverage has gaps the caller must surface.
     pub warnings: Vec<String>,
+    /// Regenerable build/dependency directories deliberately not captured
+    /// (`target/`, `node_modules/`, …). This is POLICY, not a coverage gap:
+    /// it keeps the time budget on the user's source instead of artifacts a
+    /// build command recreates. Recorded so `show` can be honest about it.
+    #[serde(default)]
+    pub skipped_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -211,19 +217,37 @@ impl Store {
         path: &Path,
         limits: Option<&Limits>,
     ) -> Result<Manifest, SnapshotError> {
-        self.snapshot_excluding(path, limits, &[])
+        self.snapshot_scoped(path, limits, &[], &[])
     }
 
-    /// Like [`Self::snapshot`] but prunes any subtree under an `exclude` path.
-    /// The hook passes DOOVER_HOME so a defensive cwd snapshot of a project
-    /// that CONTAINS doover's own store/journal never ingests doover's
-    /// internals — recursive bloat and capture of the (secret-bearing) journal
-    /// (round 21). Exclusions are compared lexically after normalization.
     pub fn snapshot_excluding(
         &self,
         path: &Path,
         limits: Option<&Limits>,
         exclude: &[PathBuf],
+    ) -> Result<Manifest, SnapshotError> {
+        self.snapshot_scoped(path, limits, exclude, &[])
+    }
+
+    /// The full snapshot entry point.
+    ///
+    /// `exclude` prunes subtrees under an absolute path — the hook passes
+    /// DOOVER_HOME so a defensive cwd snapshot of a project that CONTAINS
+    /// doover's own store never ingests doover's internals (round 21).
+    ///
+    /// `skip_dir_names` prunes regenerable build/dependency directories found
+    /// INSIDE the tree (`target/`, `node_modules/`, …). Dogfooding showed a
+    /// Rust repo is 99.5% `target/`: without this the time budget is spent on
+    /// build artifacts and the user's actual source never gets captured. The
+    /// snapshot ROOT is never skipped, so `rm -rf target` still snapshots
+    /// target/ in full — skipping only applies to dirs we find while walking a
+    /// tree the user did not point at directly.
+    pub fn snapshot_scoped(
+        &self,
+        path: &Path,
+        limits: Option<&Limits>,
+        exclude: &[PathBuf],
+        skip_dir_names: &[String],
     ) -> Result<Manifest, SnapshotError> {
         let mut manifest = Manifest {
             schema: MANIFEST_SCHEMA,
@@ -233,6 +257,7 @@ impl Store {
             truncated: false,
             skipped: 0,
             warnings: Vec::new(),
+            skipped_dirs: Vec::new(),
         };
         let meta = match fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -294,6 +319,16 @@ impl Store {
                         walker.skip_current_dir();
                     }
                     continue;
+                }
+                // regenerable build dirs: skip the subtree, but NEVER the root
+                // (an explicitly targeted `target/` must still be captured)
+                if entry.depth() > 0 && entry.file_type().is_dir() {
+                    let name = entry.file_name().to_string_lossy();
+                    if skip_dir_names.iter().any(|s| *s == name) {
+                        manifest.skipped_dirs.push(entry.path().to_path_buf());
+                        walker.skip_current_dir();
+                        continue;
+                    }
                 }
             }
             let item = match item {

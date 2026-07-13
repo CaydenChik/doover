@@ -866,3 +866,72 @@ fn store_objects_are_owner_only() {
         "objects must be 0400 (owner read-only), got {mode:o}"
     );
 }
+
+// --- regenerable build dirs are skipped, never the root ------------------------
+
+/// Real-world dogfooding: a Rust repo is 99.5% `target/`. A defensive snapshot
+/// that walks it burns the entire time budget on regenerable artifacts and
+/// captures almost none of the user's actual source. Skip the known build dirs.
+#[test]
+fn snapshot_skips_regenerable_build_dirs_but_records_them() {
+    let j = jail();
+    let proj = j.world.join("proj");
+    write(&proj.join("src/main.rs"), "fn main() {}");
+    write(&proj.join("README.md"), "docs");
+    for junk in ["target", "node_modules", "__pycache__", ".venv"] {
+        for i in 0..5 {
+            write(&proj.join(junk).join(format!("j{i}.bin")), "junk");
+        }
+    }
+    let skips: Vec<String> = ["target", "node_modules", "__pycache__", ".venv"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let m = j.store.snapshot_scoped(&proj, None, &[], &skips).unwrap();
+
+    let rels: Vec<String> = m
+        .entries
+        .iter()
+        .map(|e| e.rel.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        rels.iter().any(|r| r.contains("main.rs")),
+        "source captured"
+    );
+    assert!(rels.iter().any(|r| r.contains("README")), "docs captured");
+    for junk in ["target", "node_modules", "__pycache__", ".venv"] {
+        assert!(
+            !rels.iter().any(|r| r.starts_with(junk)),
+            "{junk} must be skipped, got {rels:?}"
+        );
+    }
+    // honest: the manifest records exactly what it chose not to capture
+    assert_eq!(
+        m.skipped_dirs.len(),
+        4,
+        "skipped dirs recorded: {:?}",
+        m.skipped_dirs
+    );
+    // and it is NOT a protection gap (no alarm warnings for a deliberate policy)
+    assert!(
+        m.warnings.is_empty(),
+        "skipping is policy, not a gap: {:?}",
+        m.warnings
+    );
+}
+
+/// The root exception: `rm -rf target` explicitly names it, so it must be
+/// captured in full. Skipping applies to build dirs found INSIDE a tree, never
+/// to the tree the user actually pointed at.
+#[test]
+fn an_explicitly_targeted_build_dir_is_still_fully_captured() {
+    let j = jail();
+    let target = j.world.join("proj/target");
+    for i in 0..5 {
+        write(&target.join(format!("artifact{i}.o")), "build output");
+    }
+    let skips = vec!["target".to_string()];
+    let m = j.store.snapshot_scoped(&target, None, &[], &skips).unwrap();
+    assert_eq!(m.entries.len(), 6, "root + 5 files fully captured");
+    assert!(m.skipped_dirs.is_empty());
+}

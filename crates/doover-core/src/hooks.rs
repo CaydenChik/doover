@@ -73,6 +73,48 @@ fn parse_snapshot_budget(v: Option<&str>) -> Option<std::time::Duration> {
     }
 }
 
+/// Build/dependency directories that a build command recreates from source.
+/// Dogfooding a real Rust repo: `target/` was 166,391 of 167,292 files (99.5%)
+/// and 6.7 GB — a defensive snapshot spent its entire 5s budget on artifacts
+/// and captured 8% of the tree, almost none of it the user's actual code.
+/// Skipping these keeps the budget on what matters. Override with
+/// DOOVER_SKIP_DIRS (comma-separated; empty string = skip nothing).
+const DEFAULT_SKIP_DIRS: &[&str] = &[
+    "target",       // rust, maven
+    "node_modules", // node
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".tox",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".gradle",
+    ".terraform",
+    ".cargo",
+    "vendor", // go/php dependency vendoring
+    ".parcel-cache",
+    ".turbo",
+];
+
+/// The directories a snapshot will skip when walking a tree it was not pointed
+/// at directly. Never applies to an explicitly targeted path.
+pub fn skip_dirs() -> Vec<String> {
+    match std::env::var("DOOVER_SKIP_DIRS") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        Err(_) => DEFAULT_SKIP_DIRS.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
 /// Create DOOVER_HOME if needed and force it to 0700 (D4): the journal holds
 /// plaintext commands (which may embed secrets) and the store holds copies of
 /// user files — on a shared host neither may be readable by other users. The
@@ -307,13 +349,15 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
     if !targets.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
         let deadline = hook_deadline(&cfg.limits);
+        let skips = skip_dirs();
         for path in &targets {
             // once the action exists, per-path failures become loud gaps,
             // never lost protection for the OTHER paths — and never silent
-            match store.snapshot_excluding(
+            match store.snapshot_scoped(
                 path,
                 Some(&slice_limits(&cfg.limits, deadline)),
                 std::slice::from_ref(&cfg.doover_home),
+                &skips,
             ) {
                 Ok(manifest) => {
                     if manifest.truncated {
@@ -369,11 +413,13 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
     if !pre.is_empty() {
         let store = Store::open(cfg.doover_home.join("store"))?;
         let deadline = hook_deadline(&cfg.limits);
+        let skips = skip_dirs();
         for m in &pre {
-            match store.snapshot_excluding(
+            match store.snapshot_scoped(
                 &m.path,
                 Some(&slice_limits(&cfg.limits, deadline)),
                 std::slice::from_ref(&cfg.doover_home),
+                &skips,
             ) {
                 Ok(post) => journal.attach_manifest(action, &post, ManifestRole::Post)?,
                 Err(e) => journal.add_note(

@@ -468,6 +468,18 @@ fn run_show(id: i64) -> i32 {
             for w in &m.warnings {
                 println!("    warning: {w}");
             }
+            if !m.skipped_dirs.is_empty() {
+                println!(
+                    "    skipped {} regenerable dir(s) (rebuild, not restore): {}",
+                    m.skipped_dirs.len(),
+                    m.skipped_dirs
+                        .iter()
+                        .filter_map(|p| p.file_name())
+                        .map(|n| n.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
             for e in m.entries.iter().take(20) {
                 let kind = match &e.kind {
                     doover_core::snapshot::EntryKind::File { len, .. } => {

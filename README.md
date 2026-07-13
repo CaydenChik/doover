@@ -109,6 +109,12 @@ A few behaviors worth knowing:
 - **Restoring a whole directory replaces it.** If your shell is sitting
   inside that directory, run `cd .` afterwards to refresh it. doover tells
   you when this happens.
+- **Build directories are skipped.** When doover snapshots a whole tree it
+  walks past `target/`, `node_modules/`, `.venv/`, `dist/` and friends: they
+  are recreated by a build, and capturing them would spend the entire time
+  budget on artifacts instead of your source. Point a command straight at one
+  (`rm -rf target`) and it is captured in full. `doover show` lists whatever
+  was skipped.
 - **Partial snapshots restore partially, and say so.** If a snapshot was cut
   short (see limits below), `undo` refuses by default rather than replace a
   full tree with a partial copy.
@@ -190,6 +196,7 @@ alone.
 | `DOOVER_GC_EVERY` | `50` | Auto-cleanup every N actions (`0` = manual `gc` only) |
 | `DOOVER_MIN_FREE_BYTES` | `1 GiB` | Warn when disk falls below this |
 | `DOOVER_UNKNOWN_POLICY` | `snapshot-cwd` | `passthrough` disables the working-directory fallback |
+| `DOOVER_SKIP_DIRS` | `target,node_modules,.venv,dist,…` | Build dirs skipped when walking a tree (empty = skip nothing) |
 
 Pinned actions (`pinned` in the journal) survive any cleanup, and the most
 recent hour of history is never evicted for space.
