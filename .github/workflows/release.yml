@@ -1,0 +1,68 @@
+name: Release
+
+# Tag-driven: `git tag v0.1.0 && git push origin v0.1.0` builds binaries for
+# four platforms, checksums them, and publishes a GitHub Release. crates.io
+# publishing stays manual (see LAUNCH.md) so a bad tag can't ship a crate.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p doover --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          NAME="doover-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/doover" "$NAME/"
+          cp README.md LICENSE NOTICE.md "$NAME/"
+          tar czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            doover-*.tar.gz
+            doover-*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Combined checksums
+        run: cat doover-*.sha256 > SHA256SUMS
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "doover $GITHUB_REF_NAME" \
+            --generate-notes \
+            doover-*.tar.gz SHA256SUMS

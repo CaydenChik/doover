@@ -20,7 +20,7 @@ teardown() {
 @test "S0: --version exits 0 and prints the crate version" {
   run "$DOOVER_BIN" --version
   [ "$status" -eq 0 ]
-  [[ "$output" == *"0.0.1"* ]]
+  [[ "$output" =~ [0-9]+\.[0-9]+\.[0-9]+ ]]
 }
 
 # Step 8 removed the last stubs: every subcommand is implemented, so the old

@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
+readme = "../../README.md"
+keywords = ["undo", "snapshot", "ai-agents", "claude-code", "safety"]
+categories = ["command-line-utilities", "development-tools", "filesystem"]
 
 [dependencies]
 serde.workspace = true

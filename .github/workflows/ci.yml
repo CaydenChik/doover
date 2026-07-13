@@ -9,6 +9,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Supply-chain check: fail on known-vulnerable dependencies (RustSec).
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+
   test:
     strategy:
       fail-fast: false

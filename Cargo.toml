@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/doover-core", "crates/doover"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/CaydenChik/doover"
@@ -11,7 +11,7 @@ homepage = "https://github.com/CaydenChik/doover"
 rust-version = "1.85"
 
 [workspace.dependencies]
-doover-core = { path = "crates/doover-core", version = "0.0.1" }
+doover-core = { path = "crates/doover-core", version = "0.1.0" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
