@@ -2,6 +2,7 @@
 
 **Every agent deserves a do-over.**
 
+[![CI](https://github.com/CaydenChik/doover/actions/workflows/ci.yml/badge.svg)](https://github.com/CaydenChik/doover/actions)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Registry: CC0](https://img.shields.io/badge/registry%20data-CC0-lightgrey.svg)](crates/doover-core/registry/)
 
