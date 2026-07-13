@@ -47,14 +47,28 @@ dangerous commands reversible instead.
 
 ## Install
 
-Requires Rust (1.85+) and macOS or Linux (WSL works; native Windows doesn't).
+macOS or Linux (WSL works; native Windows doesn't).
+
+**Homebrew:**
+
+```console
+$ brew tap caydenchik/doover
+$ brew trust caydenchik/doover   # newer Homebrew asks once per third-party tap
+$ brew install doover
+```
+
+**Prebuilt binaries** for every platform are on the
+[releases page](https://github.com/CaydenChik/doover/releases), with
+`SHA256SUMS` to verify.
+
+**From source** (needs Rust 1.85+):
 
 ```console
 $ git clone https://github.com/CaydenChik/doover
 $ cargo install --path doover/crates/doover
 ```
 
-Homebrew and crates.io packages are on the way.
+A `cargo install doover` package is landing on crates.io shortly.
 
 ## Set up
 
