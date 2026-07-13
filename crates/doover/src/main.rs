@@ -130,6 +130,9 @@ fn open_journal_or_exit(cfg: &doover_core::hooks::HookConfig) -> doover_core::jo
 
 fn run_undo_redo(verb: Verb, id: Option<i64>, force: bool, dry_run: bool) {
     use doover_core::undo::{Selector, UndoEngine, UndoError};
+    // captured BEFORE the restore: a directory restore replaces the directory
+    // (stage-then-swap), so afterwards this call can fail outright
+    let shell_cwd = std::env::current_dir().ok();
     let cfg = doover_core::hooks::HookConfig::from_env();
     let journal = open_journal_or_exit(&cfg);
     let store = match doover_core::snapshot::Store::open(cfg.doover_home.join("store")) {
@@ -162,6 +165,27 @@ fn run_undo_redo(verb: Verb, id: Option<i64>, force: bool, dry_run: bool) {
             }
             for w in &report.warnings {
                 eprintln!("doover: warning: {w}");
+            }
+            // Restoring a directory swaps in a NEW directory inode. Any shell
+            // standing inside it (yours, most likely — you just ran this
+            // command there) is left with a stale cwd and starts failing with
+            // "getcwd: cannot access parent directories". The files are fine;
+            // the shell just needs to re-resolve. Say so, rather than let it
+            // look like doover broke the terminal.
+            if let Some(cwd) = &shell_cwd {
+                // compare canonical forms: on macOS the shell's cwd resolves
+                // /var -> /private/var while the journaled path may not
+                let cwd_real = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+                let inside_a_replaced_dir = report.restored_paths.iter().any(|p| {
+                    p.is_dir()
+                        && cwd_real.starts_with(p.canonicalize().unwrap_or_else(|_| p.clone()))
+                });
+                if inside_a_replaced_dir {
+                    println!(
+                        "note: a directory you are standing in was replaced. \
+                         Run `cd .` to refresh your shell (your files are fine)."
+                    );
+                }
             }
         }
         Err(e @ UndoError::Conflicts(_)) => {

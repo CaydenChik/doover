@@ -21,6 +21,7 @@ use crate::journal::{
     ActionId, ActionKind, ActionRecord, ActionStatus, Journal, JournalError, ManifestRole,
 };
 use crate::snapshot::{Manifest, SnapshotError, Store};
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub enum Selector {
@@ -80,6 +81,10 @@ pub struct UndoReport {
     /// Human-readable restore plan, one line per path.
     pub plan: Vec<String>,
     pub warnings: Vec<String>,
+    /// The paths actually restored. A directory restore replaces the directory
+    /// itself (stage-then-swap), so a shell standing inside one is left with a
+    /// stale cwd; the CLI uses this to tell the user to `cd .`.
+    pub restored_paths: Vec<PathBuf>,
 }
 
 pub struct UndoEngine<'a> {
@@ -265,6 +270,7 @@ impl<'a> UndoEngine<'a> {
                 dry_run: true,
                 plan,
                 warnings,
+                restored_paths: Vec::new(),
             });
         }
 
@@ -339,6 +345,7 @@ impl<'a> UndoEngine<'a> {
             dry_run: false,
             plan,
             warnings,
+            restored_paths: restore_set.iter().map(|m| m.path.clone()).collect(),
         })
     }
 }

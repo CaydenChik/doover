@@ -106,6 +106,9 @@ A few behaviors worth knowing:
   you why. `--force` proceeds anyway; `--dry-run` shows the plan first.
 - **Undo is itself journaled.** Undoing an undo is how `redo` works. History
   is append-only; nothing is ever silently rewritten.
+- **Restoring a whole directory replaces it.** If your shell is sitting
+  inside that directory, run `cd .` afterwards to refresh it. doover tells
+  you when this happens.
 - **Partial snapshots restore partially, and say so.** If a snapshot was cut
   short (see limits below), `undo` refuses by default rather than replace a
   full tree with a partial copy.

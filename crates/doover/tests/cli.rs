@@ -744,3 +744,66 @@ fn doover_home_and_journal_are_private_through_the_real_binary() {
         .success()
         .stdout(predicate::str::contains("private (0700)"));
 }
+
+/// User-#1 finding: restoring a DIRECTORY replaces its inode (stage-then-swap),
+/// which silently invalidates the shell's cwd if you are standing inside it —
+/// the terminal starts failing with `getcwd: cannot access parent directories`
+/// and it looks like doover broke your shell. Undo must say so and tell you the
+/// one-word fix.
+#[test]
+fn undo_warns_when_it_replaces_the_directory_you_are_standing_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(proj.join("src")).unwrap();
+    std::fs::write(proj.join("src/a.txt"), "work").unwrap();
+
+    // an unknown command -> defensive snapshot of the whole cwd (proj)
+    let ev = |event: &str| {
+        let mut v = serde_json::json!({
+            "session_id": "s", "cwd": proj.to_string_lossy(),
+            "hook_event_name": event, "tool_name": "Bash", "tool_use_id": "t",
+            "tool_input": { "command": "./mystery.sh" }
+        });
+        if event == "PostToolUse" {
+            v["duration_ms"] = serde_json::json!(1);
+            v["tool_response"] = serde_json::json!({"stdout":"","stderr":"","interrupted":false});
+        }
+        v.to_string()
+    };
+    hook_cmd(&dh, "pre")
+        .write_stdin(ev("PreToolUse"))
+        .assert()
+        .success();
+    std::fs::remove_file(proj.join("src/a.txt")).unwrap(); // the command ate it
+    hook_cmd(&dh, "post")
+        .write_stdin(ev("PostToolUse"))
+        .assert()
+        .success();
+
+    // run undo FROM INSIDE the directory that is about to be replaced
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("undo")
+        .current_dir(&proj)
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cd ."));
+    assert_eq!(
+        std::fs::read_to_string(proj.join("src/a.txt")).unwrap(),
+        "work"
+    );
+
+    // and NO such note when the restore does not touch your cwd
+    let outside = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    Command::cargo_bin("doover")
+        .unwrap()
+        .arg("redo")
+        .current_dir(&outside)
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cd .").not());
+}
