@@ -542,6 +542,34 @@ impl Store {
             return Err(e);
         }
 
+        // Carry the skipped (never-captured) dirs across the swap. We did not
+        // snapshot target/ or node_modules/, so we have nothing to restore for
+        // them — but swapping in a tree that omits them would DELETE them.
+        // Move them into staging first: undo leaves them exactly as they are.
+        for skipped in &manifest.skipped_dirs {
+            let Ok(rel) = skipped.strip_prefix(target_root) else {
+                continue;
+            };
+            if !rel_is_safe(rel) || !skipped.exists() {
+                continue;
+            }
+            let dest = staging.join(rel);
+            if let Some(parent) = dest.parent() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    let _ = remove_any(&staging);
+                    return Err(io_err(parent, e));
+                }
+            }
+            if let Err(e) = fs::rename(skipped, &dest) {
+                let _ = remove_any(&staging);
+                return Err(io_err(skipped, e));
+            }
+            report.warnings.push(format!(
+                "{}: not captured (regenerable); left as it is now",
+                rel.display()
+            ));
+        }
+
         if let Err(e) = remove_any(target_root) {
             let _ = remove_any(&staging);
             return Err(e);
@@ -695,9 +723,22 @@ impl Store {
             .iter()
             .map(|e| (e.rel.as_path(), &e.kind))
             .collect();
+        // The snapshot deliberately did not capture these (build dirs). The
+        // live tree still has them, so a naive walk would see "extra entries"
+        // and report a conflict on EVERY project with a target/ or
+        // node_modules/. Prune them here too: compare like with like.
+        let skipped: std::collections::BTreeSet<&Path> =
+            manifest.skipped_dirs.iter().map(|p| p.as_path()).collect();
         let mut seen = 0usize;
-        for item in walkdir::WalkDir::new(root).sort_by_file_name() {
+        let mut walker = walkdir::WalkDir::new(root).sort_by_file_name().into_iter();
+        while let Some(item) = walker.next() {
             let Ok(item) = item else { return Ok(false) };
+            if skipped.contains(item.path()) {
+                if item.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
             let rel = item.path().strip_prefix(root).unwrap_or(item.path());
             let Ok(meta) = fs::symlink_metadata(item.path()) else {
                 return Ok(false);

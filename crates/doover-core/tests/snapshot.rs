@@ -935,3 +935,47 @@ fn an_explicitly_targeted_build_dir_is_still_fully_captured() {
     assert_eq!(m.entries.len(), 6, "root + 5 files fully captured");
     assert!(m.skipped_dirs.is_empty());
 }
+
+/// The skip-list has teeth on BOTH sides of the round trip. A snapshot that
+/// skipped `target/` must still (a) compare equal to the unchanged live tree
+/// (or undo would refuse on every real project), and (b) restore WITHOUT
+/// deleting target/ — we never captured it, so we leave it exactly as it is.
+#[test]
+fn skipped_dirs_survive_the_restore_and_do_not_trip_the_conflict_oracle() {
+    let j = jail();
+    let proj = j.world.join("proj");
+    write(&proj.join("src/main.rs"), "v1");
+    write(&proj.join("target/app.o"), "build output");
+    let skips = vec!["target".to_string()];
+    let m = j.store.snapshot_scoped(&proj, None, &[], &skips).unwrap();
+    assert_eq!(m.skipped_dirs.len(), 1);
+
+    // (a) an unchanged world must NOT read as changed just because target/
+    // exists on disk and not in the manifest
+    assert!(
+        j.store.state_matches(&m).unwrap(),
+        "a snapshot with skipped dirs must still match the unchanged world"
+    );
+
+    // the command mangles the source AND writes new build output
+    write(&proj.join("src/main.rs"), "MANGLED");
+    write(&proj.join("target/app.o"), "newer build output");
+    write(&proj.join("target/extra.o"), "another artifact");
+
+    // (b) restore brings back the source and LEAVES target/ alone
+    j.store.restore(&m).unwrap();
+    assert_eq!(
+        fs::read_to_string(proj.join("src/main.rs")).unwrap(),
+        "v1",
+        "source restored"
+    );
+    assert_eq!(
+        fs::read_to_string(proj.join("target/app.o")).unwrap(),
+        "newer build output",
+        "skipped dir passed through untouched, not reverted"
+    );
+    assert!(
+        proj.join("target/extra.o").exists(),
+        "skipped dir must NOT be deleted by the swap"
+    );
+}
