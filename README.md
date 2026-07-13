@@ -2,14 +2,13 @@
 
 **Every agent deserves a do-over.**
 
-[![CI](https://github.com/CaydenChik/do-over/actions/workflows/ci.yml/badge.svg)](https://github.com/CaydenChik/do-over/actions)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Registry: CC0](https://img.shields.io/badge/registry%20data-CC0-lightgrey.svg)](crates/doover-core/registry/)
 
 Undo for your AI agent's shell commands. doover snapshots files *before* your
 agent's destructive commands run, keeps a journal of everything it did, and
-gives you a real `undo` — including for files your agent touched **outside
-your project**, and for everything git never saw.
+gives you a real `undo`, including for files your agent touched **outside
+your project** and for everything git never saw.
 
 ```console
 $ claude "clean up the build artifacts"
@@ -19,7 +18,7 @@ $ doover log
   #42  completed  destructive  rm -rf dist/ photos/
 
 $ doover undo
-  undo of action #42 complete — 2 path(s) restored
+  undo of action #42 complete: 2 path(s) restored
 
 $ ls photos/
   birthday.jpg  wedding.jpg          # back, byte for byte.
@@ -30,11 +29,11 @@ $ ls photos/
 Coding agents run shell commands all day, and shell commands have no undo.
 The existing safety mechanisms each stop short of the same spot:
 
-- **Claude Code checkpoints** rewind edits made through its file tools —
+- **Claude Code checkpoints** rewind edits made through its file tools,
   but changes made through the **Bash tool aren't checkpointed**. `rm -rf`
   is forever.
 - **Sandboxes** (Codex-style) confine the blast radius to your workspace.
-  Useful — but *inside* the workspace, deletion still has no recovery.
+  Useful, but *inside* the workspace deletion still has no recovery.
 - **git** protects what you committed. It does nothing for untracked files,
   ignored files (`.env`, local databases, that folder of test data), or any
   directory that isn't a repo. And the agent itself can run
@@ -42,7 +41,7 @@ The existing safety mechanisms each stop short of the same spot:
   *using* git.
 
 doover is the missing layer: a transaction log for agent shell actions.
-It doesn't ask for permission and it doesn't block anything — it makes the
+It doesn't ask for permission and it doesn't block anything. It makes the
 dangerous commands reversible instead.
 
 ## Install
@@ -50,8 +49,8 @@ dangerous commands reversible instead.
 Requires Rust (1.85+) and macOS or Linux (WSL works; native Windows doesn't).
 
 ```console
-$ git clone https://github.com/CaydenChik/do-over
-$ cargo install --path do-over/crates/doover
+$ git clone https://github.com/CaydenChik/doover
+$ cargo install --path doover/crates/doover
 ```
 
 Homebrew and crates.io packages are on the way.
@@ -82,7 +81,7 @@ when it couldn't fully protect something. Then one day:
 | `doover log` | Recent agent actions, most recent first |
 | `doover undo` | Restore the state before the last destructive action |
 | `doover undo 42` | Undo a specific action from `log` |
-| `doover redo` | Changed your mind — re-apply what you undid |
+| `doover redo` | Changed your mind? Re-applies what you undid |
 | `doover show 42` | One action in detail: command, snapshots, warnings |
 | `doover diff 42` | What changed since that action's before-state |
 | `doover status` | Store size, session summary, cap headroom |
@@ -119,16 +118,16 @@ PostToolUse hook records the after-state ──── doover undo restores build
 
 The interesting parts:
 
-- **A real bash parser** (not regexes) resolves what each command touches —
+- **A real bash parser** (not regexes) resolves what each command touches,
   through `&&` chains, pipes, redirects, globs, and quoting. Anything it
   can't fully account for (command substitution, `eval`, unknown tools) is
   treated as potentially destructive, never assumed safe.
-- **A reversibility registry** — YAML rules, [CC0-licensed](crates/doover-core/registry/) —
-  66 rules classifying the commands agents actually run, from `safe` to
+- **A reversibility registry** of 66 [CC0-licensed](crates/doover-core/registry/)
+  YAML rules classifying the commands agents actually run, from `safe` to
   `irreversible`: what `rm`, `mv`, `git checkout`, `rsync --delete`, `gzip`,
   `wget -O` put at risk, and which paths to capture.
 - **Copy-on-write snapshots.** On APFS/Btrfs/XFS, "copying" a file before
-  deletion shares its disk blocks — snapshotting a 1 GB directory costs
+  deletion shares its disk blocks, so snapshotting a 1 GB directory costs
   almost nothing until the original actually changes. Files are stored
   once, addressed by BLAKE3 hash, verified again before every restore.
 - **Restores are staged.** doover builds the restored tree next to the
@@ -141,9 +140,9 @@ Three tiers, depending on what the parser can prove:
 
 | | Example | What doover does |
 |---|---|---|
-| **Known destructive** | `rm -rf src/`, `git reset --hard`, `mv a b`, `tee f`, `rsync --delete` | Snapshots the exact affected paths — anywhere on disk, including outside your project |
+| **Known destructive** | `rm -rf src/`, `git reset --hard`, `mv a b`, `tee f`, `rsync --delete` | Snapshots the exact affected paths, anywhere on disk, including outside your project |
 | **Unknown / opaque** | `./deploy.sh`, `eval "$X"`, `python cleanup.py` | Snapshots your working directory as a precaution, and journals that coverage was best-effort |
-| **Beyond the filesystem** | `DROP TABLE`, `kubectl delete`, `git push --force` | Flags it in the journal as unrecoverable — no local snapshot can bring back remote state |
+| **Beyond the filesystem** | `DROP TABLE`, `kubectl delete`, `git push --force` | Flags it in the journal as unrecoverable; no local snapshot can bring back remote state |
 
 That middle tier is the one to internalize: for commands doover can't parse,
 protection covers **your working directory only**. A script that deletes
@@ -153,7 +152,7 @@ protection covers **your working directory only**. A script that deletes
 
 Measured on Apple Silicon / APFS (run `bench/hook_latency.py` yourself):
 
-- **~4 ms** per command when nothing needs snapshotting — which is most
+- **~4 ms** per command when nothing needs snapshotting, which is most
   commands (`ls`, `cat`, `git status`, builds, tests).
 - Snapshot cost scales with **file count**, not bytes: ~0.19 ms per file;
   a single 100 MB file costs ~70 ms.
@@ -186,18 +185,17 @@ Worth being direct about:
 
 - **Not a defense against a malicious agent.** doover analyzes commands
   statically; an adversary who *wants* to evade it can. It protects against
-  mistakes — which is what agents actually produce — not attacks. Treat it
-  like a seatbelt, not a vault.
+  mistakes, which is what agents actually produce, not against attacks.
+  Treat it like a seatbelt, not a vault.
 - **Not a backup tool.** History is bounded (7 days / 5 GiB by default) and
   lives on the same disk. Keep real backups.
 - **Not able to undo remote effects.** Dropped databases, deleted pods,
-  force-pushed branches — doover tells you it happened; it can't reverse it.
+  force-pushed branches: doover tells you it happened; it can't reverse it.
 - **Not encrypted at rest.** The journal stores the commands your agent ran
   in plaintext, and snapshots are copies of your files. Everything is
-  readable only by your user account (`0700`/`0600`), and command output in
-  `log`/`show` masks things that look like credentials — but anyone with
-  your account or root can read the raw data, and secrets remain until
-  retention prunes them.
+  readable only by your user account (`0700`/`0600`), and `log`/`show` mask
+  things that look like credentials. But anyone with your account or root
+  can read the raw data, and secrets remain until retention prunes them.
 - **Not a replacement for git, checkpoints, or sandboxes.** It's the layer
   they all leave open. Keep using all three.
 
@@ -216,18 +214,18 @@ rules:
 ```
 
 Overlays can add commands and *strengthen* classifications. They can't
-weaken a shipped one — a rule that says `rm` is safe is ignored, with a
+weaken a shipped one: a rule that says `rm` is safe is ignored, with a
 warning, no matter how it's phrased.
 
 The registry data is CC0 (public domain) precisely so other tools can steal
-it. If you map out what some command really destroys, send a PR — that
+it. If you map out what some command really destroys, send a PR. That
 knowledge is the most reusable part of this project.
 
 ## FAQ
 
 **Does it work with agents other than Claude Code?**
 The core is agent-agnostic; the hook wiring currently targets Claude Code's
-hook events. Adapters for other harnesses are a natural contribution —
+hook events. Adapters for other harnesses are a natural contribution;
 `doover hook pre` just reads JSON on stdin.
 
 **Multiple agents at once?**
@@ -239,12 +237,12 @@ command run; doover being broken means you lose the safety net, not your
 workflow. `doover doctor` tells you if that's happening.
 
 **How much disk does it use?**
-Usually little — snapshots share blocks with the originals on modern
+Usually very little. Snapshots share blocks with the originals on modern
 filesystems and identical content is stored once. The store is capped at
 5 GiB regardless, and `doover status` shows where you stand.
 
 **I undid the wrong thing.**
-`doover redo`. Undo never destroys information — it's another journaled,
+`doover redo`. Undo never destroys information; it's another journaled,
 reversible action.
 
 ## Development
@@ -255,7 +253,7 @@ $ make e2e      # the bats suite (runs the real binary in throwaway jails)
 $ make unit
 ```
 
-The test suite is the project's spine — every bug ever found lives on as a
+The test suite is the project's spine: every bug ever found lives on as a
 test. Read `CLAUDE.md` for the working rules if you're contributing.
 
 ## License

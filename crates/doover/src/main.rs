@@ -151,7 +151,7 @@ fn run_undo_redo(verb: Verb, id: Option<i64>, force: bool, dry_run: bool) {
                 println!("would {verb_str} action #{}:", report.target_action);
             } else {
                 println!(
-                    "{verb_str} of action #{} complete — {} path(s) restored{}",
+                    "{verb_str} of action #{} complete: {} path(s) restored{}",
                     report.target_action,
                     report.paths_restored,
                     if report.forced { " (forced)" } else { "" }
