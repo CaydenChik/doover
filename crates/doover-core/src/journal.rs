@@ -464,16 +464,30 @@ impl Journal {
 
     /// Newest command-kind action that is plausibly undoable: completed or
     /// abandoned, with at least one pre-manifest. Searches across sessions.
-    pub fn latest_undoable(&self) -> Result<Option<ActionRecord>, JournalError> {
+    /// Actions a bare `doover undo` may target, newest first.
+    ///
+    /// Deliberately a *candidate* list, not an answer: SQL can see that an
+    /// action has a snapshot, but not whether the command changed anything or
+    /// whether there is still anything to restore. Both of those are questions
+    /// about manifests and the live filesystem, and the undo engine answers
+    /// them (`pick_latest_undoable`). This used to be a `LIMIT 1` that returned
+    /// the newest row with a pre-manifest, which is how the user-#1 trial's
+    /// `doover undo` landed on a read-only command that had merely been given a
+    /// defensive snapshot.
+    ///
+    /// `undone` rows are included on purpose: a forced undo of a later action
+    /// can put an already-undone action's effect back in force, and the user
+    /// must be able to reach it again.
+    pub fn undo_candidates(&self, limit: usize) -> Result<Vec<ActionRecord>, JournalError> {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_ACTION} WHERE kind = 'command'
-               AND status IN ('completed','abandoned')
+               AND status IN ('completed','abandoned','undone')
                AND EXISTS (SELECT 1 FROM manifests m
                            WHERE m.action_id = actions.id AND m.role = 'pre')
-             ORDER BY id DESC LIMIT 1"
+             ORDER BY id DESC LIMIT ?1"
         ))?;
-        let mut rows = stmt.query_map([], row_to_action)?;
-        Ok(rows.next().transpose()?)
+        let rows = stmt.query_map([limit as i64], row_to_action)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Most recent actions across all sessions, newest first (for `log`).
@@ -508,18 +522,38 @@ impl Journal {
     /// machine instead of recursive status cascades (audit round 4). The
     /// exhaustive small-model test in T4 checks every sequence to depth 4
     /// against a reference implementation of these rules.
+    /// `allow_reundo` permits a target that is already `undone` (user-#1 trial).
+    ///
+    /// A forced undo of a LATER action can restore a world state that puts an
+    /// earlier action's effect back in force, leaving its row reading `undone`
+    /// while the files are gone again. Refusing on the strength of the status
+    /// column told the user their data was unrecoverable while the snapshot sat
+    /// in the store. Only the undo engine may pass `true`, and only after it has
+    /// checked the FILESYSTEM and found the world no longer matches the action's
+    /// pre-state — the status column cannot justify this on its own.
+    ///
+    /// Default (`false`) keeps the original guard exactly: undo of an undone
+    /// action is refused, so racing double-undos still admit exactly one winner.
+    /// Two *concurrent* re-undos would both be admitted and write a redundant
+    /// undo row; that is benign — restores are idempotent, both replay the same
+    /// manifests — and vastly preferable to the alternative, which was leaving a
+    /// user's data unreachable.
     pub fn record_undo(
         &self,
         session_id: &str,
         target: ActionId,
+        allow_reundo: bool,
     ) -> Result<ActionId, JournalError> {
         self.conn.execute_batch("BEGIN IMMEDIATE;")?;
         let result = (|| -> Result<ActionId, JournalError> {
             let target_rec = self.action(target)?;
-            if matches!(
-                target_rec.status,
-                ActionStatus::Pending | ActionStatus::Undone
-            ) {
+            let blocked = match target_rec.status {
+                // still in flight: there is no "before" to go back to
+                ActionStatus::Pending => true,
+                ActionStatus::Undone => !allow_reundo,
+                _ => false,
+            };
+            if blocked {
                 return Err(JournalError::NotUndoable {
                     id: target,
                     status: target_rec.status,

@@ -80,8 +80,15 @@ fn show_prints_action_detail_with_manifest_summary() {
         );
 }
 
+/// Redaction happens at WRITE time, not just at display time (user-#1 trial).
+///
+/// This test used to be called `..._but_journal_keeps_raw` and asserted the
+/// opposite of its second half: that `journal.db` held the bearer token in
+/// plaintext while `show` printed `[redacted]`. The test was honest; the design
+/// it pinned was wrong. Masking on screen while storing the secret buys false
+/// confidence, which is worse than not redacting at all.
 #[test]
-fn show_and_log_redact_secrets_at_display_time_but_journal_keeps_raw() {
+fn show_and_log_redact_secrets_and_the_journal_never_stores_them() {
     let secret = "sk-live-Sup3rSecret";
     let (_tmp, dh) = journal_one_action(&format!(
         "curl -H \"Authorization: Bearer {secret}\" -o out https://x"
@@ -97,10 +104,14 @@ fn show_and_log_redact_secrets_at_display_time_but_journal_keeps_raw() {
         assert!(!out.contains(secret), "{args:?} leaked the secret: {out}");
         assert!(out.contains("[redacted]"), "{args:?} shows the mask");
     }
-    // the journal itself keeps the raw command (undo semantics unchanged;
-    // redaction is a display concern)
+    // and the secret never reached the disk in the first place
     let j = doover_core::journal::Journal::open(&dh.join("journal.db")).unwrap();
-    assert!(j.action(1).unwrap().raw_command.contains(secret));
+    let stored = j.action(1).unwrap().raw_command;
+    assert!(
+        !stored.contains(secret),
+        "the journal row still holds the secret: {stored}"
+    );
+    assert!(stored.contains("[redacted]"), "masked, not merely dropped");
 }
 
 #[test]
@@ -806,4 +817,150 @@ fn undo_warns_when_it_replaces_the_directory_you_are_standing_in() {
         .assert()
         .success()
         .stdout(predicate::str::contains("cd .").not());
+}
+
+/// End-to-end, through the REAL binary: the user-#1 trial's headline bug — the
+/// worst in the project's history. Undo a destructive action, then --force-undo
+/// a LATER action whose defensive snapshot re-applies the first one's effect,
+/// then run plain `doover undo <first>` AGAIN. Pre-fix, the CLI answered
+/// "cannot be undone: status is Undone" and exited non-zero while the snapshot
+/// sat intact in the store — the product promise inverting.
+///
+/// The engine has a unit test for this (`trial_regressions.rs`); this pins the
+/// FULL path the user actually hit: the real hooks, the real filesystem, and the
+/// real `undo` command's exit code and recovery (an InForce re-undo, exit 0).
+/// The idempotent-no-op branch (`already_satisfied`) is covered separately by
+/// `cli_re_undoing_an_already_undone_action_is_a_clean_noop`.
+#[test]
+fn cli_force_undo_of_a_later_action_does_not_strand_the_earlier_ones_data() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(proj.join("photos")).unwrap();
+    std::fs::write(proj.join("photos/wedding.jpg"), "irreplaceable").unwrap();
+    std::fs::write(proj.join("mystery.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+
+    // Drive a real pre-hook, run the command for real, then a real post-hook.
+    let drive = |tool: &str, cmd: &str, run: &dyn Fn()| {
+        let ev = |event: &str| {
+            let mut v = serde_json::json!({
+                "session_id": "s", "cwd": proj.to_string_lossy(),
+                "hook_event_name": event, "tool_name": "Bash",
+                "tool_use_id": tool, "tool_input": { "command": cmd }
+            });
+            if event == "PostToolUse" {
+                v["duration_ms"] = serde_json::json!(1);
+                v["tool_response"] =
+                    serde_json::json!({"stdout":"","stderr":"","interrupted":false});
+            }
+            v.to_string()
+        };
+        hook_cmd(&dh, "pre")
+            .write_stdin(ev("PreToolUse"))
+            .assert()
+            .success();
+        run();
+        hook_cmd(&dh, "post")
+            .write_stdin(ev("PostToolUse"))
+            .assert()
+            .success();
+    };
+
+    let photo = proj.join("photos/wedding.jpg");
+    // #1: the recoverable rm.
+    drive("t1", "rm -rf photos", &|| {
+        std::fs::remove_dir_all(proj.join("photos")).unwrap()
+    });
+    // #2: an opaque command -> defensive whole-cwd snapshot (taken AFTER the rm,
+    // so its pre-state has no photos/).
+    drive("t2", "./mystery.sh", &|| {});
+
+    let undo = |args: &[&str]| {
+        Command::cargo_bin("doover")
+            .unwrap()
+            .args(args)
+            .current_dir(&proj)
+            .env("DOOVER_HOME", &dh)
+            .assert()
+    };
+
+    undo(&["undo", "1"]).success();
+    assert_eq!(std::fs::read_to_string(&photo).unwrap(), "irreplaceable");
+
+    // Force-undo #2: restores the pre-mystery cwd, which has no photos/, so the
+    // rm's effect is back in force while #1's row still reads "undone".
+    undo(&["undo", "2", "--force"]).success();
+    assert!(
+        !photo.exists(),
+        "precondition: the forced undo re-deleted photos"
+    );
+
+    // THE BUG. Plain `doover undo 1` must succeed (exit 0) and bring the data
+    // back — not refuse on the stale "status is Undone".
+    undo(&["undo", "1"]).success();
+    assert_eq!(
+        std::fs::read_to_string(&photo).unwrap(),
+        "irreplaceable",
+        "the photos came back from the snapshot that was never lost"
+    );
+}
+
+/// End-to-end coverage of the `already_satisfied` no-op CLI branch (round-3
+/// audit found it untested through the binary). Undo an rm (restores the file),
+/// then run `doover undo <id>` AGAIN while the world already matches the
+/// pre-state: the binary must print a clean "already undone / nothing to do"
+/// and exit 0 — NOT a scary conflict, and NOT a bogus "0 path(s) restored".
+#[test]
+fn cli_re_undoing_an_already_undone_action_is_a_clean_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dh = tmp.path().join("dh");
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("data.txt"), "precious").unwrap();
+
+    let ev = |event: &str| {
+        let mut v = serde_json::json!({
+            "session_id": "s", "cwd": proj.to_string_lossy(),
+            "hook_event_name": event, "tool_name": "Bash", "tool_use_id": "t",
+            "tool_input": { "command": "rm data.txt" }
+        });
+        if event == "PostToolUse" {
+            v["duration_ms"] = serde_json::json!(1);
+            v["tool_response"] = serde_json::json!({"stdout":"","stderr":"","interrupted":false});
+        }
+        v.to_string()
+    };
+    hook_cmd(&dh, "pre")
+        .write_stdin(ev("PreToolUse"))
+        .assert()
+        .success();
+    std::fs::remove_file(proj.join("data.txt")).unwrap();
+    hook_cmd(&dh, "post")
+        .write_stdin(ev("PostToolUse"))
+        .assert()
+        .success();
+
+    let undo = || {
+        Command::cargo_bin("doover")
+            .unwrap()
+            .args(["undo", "1"])
+            .current_dir(&proj)
+            .env("DOOVER_HOME", &dh)
+            .assert()
+    };
+    undo().success(); // restores data.txt
+    assert_eq!(
+        std::fs::read_to_string(proj.join("data.txt")).unwrap(),
+        "precious"
+    );
+    // second undo of the same action: world == PRE → clean no-op, exit 0.
+    undo().success().stdout(
+        predicate::str::contains("already undone")
+            .and(predicate::str::contains("path(s) restored").not()),
+    );
+    // and the file is untouched.
+    assert_eq!(
+        std::fs::read_to_string(proj.join("data.txt")).unwrap(),
+        "precious"
+    );
 }

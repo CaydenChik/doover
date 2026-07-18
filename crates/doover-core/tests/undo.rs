@@ -239,8 +239,19 @@ fn undo_of_a_safe_action_has_nothing_to_restore() {
     );
 }
 
+/// Undoing the same action twice is a NO-OP, not an error (user-#1 trial).
+///
+/// This test used to assert a refusal. The refusal was the same status check
+/// that, in a slightly different sequence, told a real user their files were
+/// unrecoverable while the snapshot sat in the store — so it is gone, and undo
+/// now asks the filesystem instead of the status column.
+///
+/// The property that actually mattered here was never "it errors": it was
+/// "doover does not record a duplicate undo or touch anything". That is
+/// asserted directly now, which is strictly stronger than what the old
+/// assertion implied.
 #[test]
-fn double_undo_of_the_same_action_is_refused() {
+fn double_undo_of_the_same_action_is_a_noop_and_records_nothing() {
     let r = rig();
     fs::write(r.cwd.join("f.txt"), "x").unwrap();
     let id = r.run("s1", "t1", "rm f.txt");
@@ -248,14 +259,34 @@ fn double_undo_of_the_same_action_is_refused() {
     engine(&j, &s)
         .undo(Selector::Action(id), false, false)
         .unwrap();
-    let j2 = r.journal();
-    let err = engine(&j2, &s)
-        .undo(Selector::Action(id), false, false)
-        .unwrap_err();
-    assert!(
-        matches!(err, UndoError::NotUndoable { .. } | UndoError::Journal(_)),
-        "got {err:?}"
+    assert_eq!(
+        r.read("f.txt").as_deref(),
+        Some("x"),
+        "first undo restored it"
     );
+
+    let j2 = r.journal();
+    let rep = engine(&j2, &s)
+        .undo(Selector::Action(id), false, false)
+        .expect("a second undo is a no-op, not a failure");
+
+    assert!(rep.already_satisfied, "reported as already-undone");
+    assert_eq!(rep.paths_restored, 0, "nothing was restored again");
+    assert!(rep.recorded_as.is_none(), "and NOTHING was journaled");
+    assert_eq!(
+        r.read("f.txt").as_deref(),
+        Some("x"),
+        "the file is untouched"
+    );
+
+    // the guard that the old refusal was really protecting: exactly one undo row
+    let undos = j2
+        .session_actions("s1")
+        .unwrap()
+        .into_iter()
+        .filter(|a| a.kind == doover_core::journal::ActionKind::Undo)
+        .count();
+    assert_eq!(undos, 1, "a second undo row must never be appended");
 }
 
 #[test]

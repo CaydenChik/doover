@@ -207,7 +207,7 @@ fn gc_prunes_old_journal_rows_but_never_referenced_or_pinned_ones() {
     r.journal.set_pinned(old_pinned, true).unwrap();
     // an old action that a (recent) undo references must survive pruning
     let (old_undone, _) = r.action_at("undone.txt", "z", base, "t3");
-    let undo_id = r.journal.record_undo("s1", old_undone).unwrap();
+    let undo_id = r.journal.record_undo("s1", old_undone, false).unwrap();
     // the undo row itself is recent
     r.journal
         .set_started_at_for_test(undo_id, base + 10 * DAY_MS)
@@ -424,7 +424,7 @@ fn dry_run_session_estimate_equals_real_deletion_exactly() {
         .unwrap();
     r.journal.complete_by_tool_use("B", "b-cmd", 1).unwrap();
     r.journal.set_started_at_for_test(cmd, old).unwrap();
-    let undo = r.journal.record_undo("B", cmd).unwrap();
+    let undo = r.journal.record_undo("B", cmd, false).unwrap();
     r.journal.set_started_at_for_test(undo, old).unwrap();
 
     // session C: a pending (in-flight) action -> kept

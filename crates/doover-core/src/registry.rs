@@ -123,6 +123,7 @@ const SHIPPED: &[(&str, &str)] = &[
     ("git.yaml", include_str!("../registry/git.yaml")),
     ("net.yaml", include_str!("../registry/net.yaml")),
     ("posix.yaml", include_str!("../registry/posix.yaml")),
+    ("readonly.yaml", include_str!("../registry/readonly.yaml")),
     ("services.yaml", include_str!("../registry/services.yaml")),
 ];
 

@@ -373,7 +373,7 @@ fn undo_is_an_action_and_undo_of_undo_is_redo() {
     j.complete_by_tool_use("s1", "t1", 5).unwrap();
 
     // undo: a new journaled action, target marked undone
-    let u = j.record_undo("s1", a).unwrap();
+    let u = j.record_undo("s1", a, false).unwrap();
     let u_rec = j.action(u).unwrap();
     assert_eq!(u_rec.kind, ActionKind::Undo);
     assert_eq!(u_rec.target_action_id, Some(a));
@@ -385,7 +385,7 @@ fn undo_is_an_action_and_undo_of_undo_is_redo() {
     );
 
     // redo: undoing the undo flips the original back
-    let r = j.record_undo("s1", u).unwrap();
+    let r = j.record_undo("s1", u, false).unwrap();
     assert_eq!(j.action(u).unwrap().status, ActionStatus::Undone);
     assert_eq!(
         j.action(a).unwrap().status,
@@ -405,9 +405,9 @@ fn double_undo_is_refused() {
         .start_action(&new_action("s1", "rm x", Some("t1")))
         .unwrap();
     j.complete_by_tool_use("s1", "t1", 1).unwrap();
-    j.record_undo("s1", a).unwrap();
+    j.record_undo("s1", a, false).unwrap();
     assert!(
-        j.record_undo("s1", a).is_err(),
+        j.record_undo("s1", a, false).is_err(),
         "undoing an undone action must be refused (redo targets the undo, not the original)"
     );
 }
@@ -429,10 +429,10 @@ fn concurrent_double_undo_admits_exactly_one() {
     let h = std::thread::spawn(move || {
         let j2 = Journal::open(&db2).unwrap();
         b2.wait();
-        j2.record_undo("s1", a).is_ok()
+        j2.record_undo("s1", a, false).is_ok()
     });
     barrier.wait();
-    let r1 = j.record_undo("s1", a).is_ok();
+    let r1 = j.record_undo("s1", a, false).is_ok();
     let r2 = h.join().unwrap();
     assert!(r1 ^ r2, "exactly one racer may win, got r1={r1} r2={r2}");
     let undo_rows = j
@@ -455,7 +455,7 @@ fn redo_restores_prior_status_not_a_fabricated_completed() {
         .unwrap();
     j.end_session("s1").unwrap(); // a -> abandoned (no post ever came)
 
-    let u = j.record_undo("s1", a).unwrap();
+    let u = j.record_undo("s1", a, false).unwrap();
     assert_eq!(j.action(a).unwrap().status, ActionStatus::Undone);
     assert_eq!(
         j.action(u).unwrap().target_prior_status,
@@ -463,7 +463,7 @@ fn redo_restores_prior_status_not_a_fabricated_completed() {
         "the undo row must remember what it undid"
     );
 
-    j.record_undo("s1", u).unwrap(); // redo
+    j.record_undo("s1", u, false).unwrap(); // redo
     assert_eq!(
         j.action(a).unwrap().status,
         ActionStatus::Abandoned,
@@ -501,7 +501,7 @@ fn undoing_a_pending_action_is_refused() {
     j.begin_session("s1", "claude-code", "/p").unwrap();
     let a = j.start_action(&new_action("s1", "rm x", None)).unwrap();
     assert!(
-        j.record_undo("s1", a).is_err(),
+        j.record_undo("s1", a, false).is_err(),
         "cannot undo an in-flight action"
     );
 }
@@ -519,10 +519,10 @@ fn undo_of_a_redo_is_refused_with_pointer_to_the_original() {
         .start_action(&new_action("s1", "rm x", Some("t1")))
         .unwrap();
     j.complete_by_tool_use("s1", "t1", 1).unwrap();
-    let u1 = j.record_undo("s1", a).unwrap();
-    let r1 = j.record_undo("s1", u1).unwrap(); // redo — allowed
+    let u1 = j.record_undo("s1", a, false).unwrap();
+    let r1 = j.record_undo("s1", u1, false).unwrap(); // redo — allowed
 
-    let err = j.record_undo("s1", r1).unwrap_err();
+    let err = j.record_undo("s1", r1, false).unwrap_err();
     assert!(
         err.to_string().contains(&format!("original action {a}")),
         "refusal must point at the original, got: {err}"
@@ -533,7 +533,7 @@ fn undo_of_a_redo_is_refused_with_pointer_to_the_original() {
     assert_eq!(j.action(r1).unwrap().status, ActionStatus::Completed);
 
     // the sanctioned path still works: undo the original again
-    let u2 = j.record_undo("s1", a).unwrap();
+    let u2 = j.record_undo("s1", a, false).unwrap();
     assert_eq!(j.action(a).unwrap().status, ActionStatus::Undone);
     assert_eq!(j.action(u2).unwrap().status, ActionStatus::Completed);
 }
@@ -639,7 +639,7 @@ mod small_model {
                 return Ok(()); // target doesn't exist yet in this sequence; skip
             }
             let expect_ok = model_apply(&mut model, t);
-            let got = j.record_undo("s1", ids[t]);
+            let got = j.record_undo("s1", ids[t], false);
             if expect_ok != got.is_ok() {
                 return Err(format!(
                     "seq {seq:?} step {step}: model says ok={expect_ok}, journal says {got:?}"

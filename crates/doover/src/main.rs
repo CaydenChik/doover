@@ -150,6 +150,14 @@ fn run_undo_redo(verb: Verb, id: Option<i64>, force: bool, dry_run: bool) {
     };
     match result {
         Ok(report) => {
+            if report.already_satisfied {
+                println!(
+                    "action #{} is already undone: your files already match the state \
+                     before that command. Nothing to do.",
+                    report.target_action
+                );
+                return;
+            }
             if report.dry_run {
                 println!("would {verb_str} action #{}:", report.target_action);
             } else {
@@ -702,19 +710,55 @@ fn run_status() -> i32 {
     let budget = doover_core::maintenance::MaintenanceBudget::from_env();
     match (store.total_bytes(), budget.cap_bytes) {
         (Ok(size), Some(cap)) => println!(
-            "store size:   {} MiB / cap {} MiB{}",
-            size / (1024 * 1024),
-            cap / (1024 * 1024),
+            "store size:   {} / cap {}{}",
+            human_bytes(size),
+            human_bytes(cap),
             if size > cap {
                 "  (OVER — run `doover gc`)"
             } else {
                 ""
             }
         ),
-        (Ok(size), None) => println!("store size:   {} MiB (no cap)", size / (1024 * 1024)),
+        (Ok(size), None) => println!("store size:   {} (no cap)", human_bytes(size)),
         (Err(e), _) => println!("store size:   unreadable ({e})"),
     }
+    // The journal is NOT part of the store and is NOT subject to the cap, and
+    // at ~31 KB per action it was the largest thing in DOOVER_HOME during the
+    // user-#1 trial while `status` reported the store as "0 MiB". Reporting a
+    // component of your disk usage as absent is how a tool loses trust.
+    match std::fs::metadata(dh.join("journal.db")) {
+        Ok(m) => println!(
+            "journal:      {} (not capped; pruned by `doover gc`)",
+            human_bytes(m.len())
+        ),
+        Err(_) => println!("journal:      none yet"),
+    }
     0
+}
+
+/// Sizes a human can act on. Integer MiB reported a 764 KB store as "0 MiB" in
+/// the user-#1 trial, which reads as "doover is using nothing" — the one thing
+/// it definitely was not doing.
+fn human_bytes(n: u64) -> String {
+    // Choose the unit from the ROUNDED mantissa, not raw bytes: 1_048_575 is
+    // 1023.999 KiB, which the `{:.1}` format rounds to "1024.0 KiB" — the exact
+    // "misleading size" this function exists to avoid (adversarial review,
+    // finding 15). Promote to the next unit when the mantissa would round to
+    // 1024 at the displayed precision.
+    const K: f64 = 1024.0;
+    let units = [("B", 0usize), ("KiB", 1), ("MiB", 1), ("GiB", 2)];
+    let round_to = |v: f64, prec: usize| {
+        let f = 10f64.powi(prec as i32);
+        (v * f).round() / f
+    };
+    let mut val = n as f64;
+    let mut i = 0;
+    while i + 1 < units.len() && round_to(val, units[i].1) >= K {
+        val /= K;
+        i += 1;
+    }
+    let (unit, prec) = units[i];
+    format!("{val:.prec$} {unit}")
 }
 
 /// Smallest `timeout` (seconds) among installed doover hook entries; None if
@@ -914,4 +958,27 @@ fn run_hook(kind: HookCommand) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod human_bytes_tests {
+    use super::human_bytes;
+
+    #[test]
+    fn small_values_are_not_reported_as_zero() {
+        // the user-#1 trial bug: 764 KB rendered as "0 MiB"
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(764 * 1024), "764.0 KiB");
+    }
+
+    #[test]
+    fn band_tops_promote_instead_of_rendering_1024() {
+        // adversarial-review finding 15: 1_048_575 B must not render "1024.0 KiB"
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1.0 MiB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024 - 1), "1.00 GiB");
+        // and exact boundaries read naturally
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(1023), "1023 B");
+    }
 }

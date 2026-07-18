@@ -47,6 +47,234 @@ confirm green → only then claim done. Build order and per-step test gates are 
   (64 not-implemented is retired — every subcommand is implemented as of
   step 8.)
 
+## The user-#1 trial (2026-07-14) — read this before writing another audit
+
+Twenty-one adversarial audit rounds, a clean 15/15 mutation campaign, and a green
+gate. Then ONE live agent used doover on a real machine for ten minutes and found
+four bugs, two of them serious. The audits were not sloppy — they were looking in
+the wrong place. **Correctness of the parts was never the bottleneck; contact with
+reality was.** Prefer one real trial to another audit round.
+
+The headline bug is the one to remember: `doover undo` REFUSED to restore a user's
+files ("cannot be undone: status is Undone") while the snapshot sat intact in the
+store. A `--force` undo of a LATER action had restored a world state that
+re-applied an earlier action's effect, so the row said `Undone` while the files
+were gone again. Both directions refused; the user was told their data was
+unrecoverable when it was not.
+
+**The lesson, and the rule: the status column records what doover DID. Only the
+filesystem knows what is TRUE.** Any gate that refuses recovery must be answered by
+the conflict oracle against the live filesystem, never by bookkeeping. If you find
+yourself writing `if status == X { return Err(...) }` on a recovery path, stop.
+
+- **DONE (trial): the `Undone` refusal is gone** (undo.rs `select_undo_target`).
+  Undo of an undone action defers to the oracle: world == POST → the effect is back
+  in force, restore it; world == PRE → genuinely already undone, a clean no-op
+  (`UndoReport::already_satisfied`, exit 0, nothing journaled); anything else → a
+  real conflict. `record_undo` keeps its in-transaction race guard by default and
+  takes `allow_reundo`, which ONLY the engine sets, and only after proving the world
+  no longer matches PRE. Two concurrent re-undos would both be admitted and write a
+  redundant undo row — benign (restores are idempotent) and vastly preferable to
+  stranding a user's data. Pinned by `tests/trial_regressions.rs`.
+- **DONE (trial): bare `doover undo` picked a command that changed nothing.** It was
+  a SQL `LIMIT 1` on "newest row with a pre-manifest", so it landed on a read-only
+  command that had merely been given a defensive cwd snapshot. Now
+  `pick_latest_undoable` skips actions whose POST == PRE (changed nothing) and whose
+  PRE already matches the live filesystem (nothing to restore). Both predicates are
+  about REALITY, not status — which is what lets a KILLED destructive command still
+  be found while a killed read-only one is skipped.
+- **DONE (trial): redaction moved to WRITE time** (hooks.rs). `doover show` printed
+  `Authorization: [redacted]` while journal.db held the bearer token in plaintext,
+  findable with `strings`. It was documented — and documenting it did not help,
+  because a mask on screen is a promise. **Showing a mask while storing the secret is
+  worse than no redaction: it buys false confidence.** Nothing functional reads
+  `raw_command` back (undo restores from manifests), so redacting it costs nothing.
+  Display still redacts: older journals exist and `redact` is idempotent. Pinned by a
+  test that greps the BYTES of every file under DOOVER_HOME, which is how the trial
+  found it — checking the deserialized row alone misses the WAL.
+- **DONE (trial): the unknown rate.** 43 of 62 commands classified `unknown`, so
+  doover walked and snapshotted the whole working directory for ~70% of everything
+  the agent ran — `doover log` included. `registry/readonly.yaml` adds 71 provably
+  read-only rules; the rate fell to 10% on the same command mix. THIS FILE IS
+  DANGEROUS: `safe` means DO NOT SNAPSHOT, so one wrong entry is silent data loss
+  with no fallback. Admission rule: the command must not be able to write a file BY
+  ITSELF. Redirects don't count (shell.redirect-* captures those independently).
+  Deliberately excluded, and DO NOT add them: command WRAPPERS (env, command, sudo,
+  xargs, nohup, timeout, nice, watch — `env rm -rf /` would inherit `safe` and
+  snapshot NOTHING) and commands taking an output positional or flag (uniq, xxd,
+  tree, sort -o). Both exclusions are pinned by mirror tests in trial_regressions.rs.
+- **NOT A BUG (trial): "it does not skip build directories."** The trial's `target/`
+  was not gitignored, so doover captured it — the gitignore gate being conservative
+  exactly as designed. Verified: a real cargo project (whose `.gitignore` has
+  `/target`) skips it, 76 KB store, ~580 ms. Do not "fix" this into a name-only skip;
+  that is the data-loss path (source in a folder called `build/`) the gate exists to
+  prevent.
+
+## The 0.2.0 adversarial review (2026-07-14, round 2) — the safe-rule trap
+
+The trial fixes went through a multi-lens adversarial review before shipping.
+It found 15 verified defects, EIGHT of them in `readonly.yaml`, the file added
+an hour earlier to reduce over-snapshotting. Every one was a command that reads
+by default but WRITES A FILE via a flag — the exact class the file's own header
+claimed to exclude. The lesson, now a rule:
+
+**A `safe` rule is a promise NOT to snapshot. Admitting one is as dangerous as
+any code change, and reading the man page is not the same as running the command
+on both BSD and GNU.** Before marking a command safe, ask: does ANY flag make it
+write, truncate, or exec? Output flags (`-o`/`--output`/`-O`), output positionals
+(`uniq in out`), in-place (`-i`), compile (`-C`), and pager/exec hooks
+(`git grep -O` runs its argument as a shell command) all disqualify the bare
+form. Verify by executing, not by reading docs.
+
+- **DONE (review): the output-flag family.** `git grep -O` (arbitrary exec, was
+  SAFE → arbitrary `rm`), `base64 -o/--output`, `git log/diff/show/blame/
+  diff-tree/rev-list/shortlog --output=<file>` (all truncate the named file),
+  and `file -C` (writes `<magic>.mgc`) were all classified safe. Fix: companion
+  rules that outrank the safe base rule when the dangerous flag is present. The
+  `--output`/`-o` ones capture the file via `path_flags`; `git grep -O` declares
+  `-O` value-taking in `flag_args` (so the attached-short form matches) and drops
+  the value (it is a command, not a path) → zero captured paths → the
+  destructive-with-no-paths fallback marks it unknown → cwd snapshot. Finding 7
+  was PRE-EXISTING: `git.log`/`git.diff`/`git.show` in git.yaml had the same
+  `--output` hole before readonly.yaml existed. All verified end-to-end:
+  classified destructive AND recovered byte-identical against the 0.2.0 binary.
+- **DONE (review): write-time redaction ate the command tail.** The
+  Authorization/X-API-Key patterns matched `[^"'\\]+` — to the next quote or END
+  OF STRING. For an unquoted header value (legal curl) that was the whole rest of
+  the command, so redacting at WRITE time (the trial fix) permanently destroyed
+  the destructive tail (`... && rm -rf ./build`). Fix: bound the value at
+  whitespace, with an optional scheme word (`Bearer `/`Basic `/…) so a
+  space-bearing token still fully masks. Redaction now never crosses into a
+  following argument or command separator. redact() idempotence pinned.
+- **DONE (review): two bare-`doover undo` selection bugs.** (8) `world_matches`
+  propagated a `state_matches` IO error, so one unreadable file in a candidate's
+  snapshot aborted the whole scan with a cryptic `io error … Permission denied`
+  while a recoverable action sat one candidate deeper. Now an unreadable or
+  truncated candidate is `Indeterminate` → skipped, never propagated. (9) the
+  "nothing to restore" check used content-only `state_matches`, so a
+  metadata-only destructive command (`chmod -R 777` exposing a key) looked
+  already-undone and bare undo said "nothing to undo". New `state_matches_mode`
+  (content + mode) is used ONLY by selection; the conflict oracle stays
+  content-only on purpose. `Restorability` {InForce, AlreadyDone, Indeterminate}
+  makes the three cases explicit.
+- **DONE (review, low): the loop-refusal message named a non-working id for redo
+  rows** (walk to the ultimate command action now); the "no snapshot found"
+  message denied snapshots that the 128-scan cap merely hid (reworded); and
+  `human_bytes` rendered `1024.0 KiB` at band tops (promote on rounded mantissa).
+- **REFUTED by verifiers (do not re-add): `less`/`more` `-o`/`-O` (log file is
+  interactive-only), and several undo-state-machine claims that the conflict
+  oracle already handles.** The verify pass killed 6 of 21 raw findings; trust it
+  but confirm anything that touches a snapshot decision.
+- **TEST GAP the review exposed: `path_flag_rules_resist_all_value_forms` built
+  its synthetic command WITHOUT the subcommand,** so it silently tested nothing
+  for subcommand-scoped rules. Now subcommand-aware — it would have caught a
+  broken `git … --output` rule.
+
+## Round-2 re-audit (2026-07-14) — findings fixed, and two flagged
+
+A second comprehensive adversarial audit of the 0.2.0 diff (plus my own
+independent sweep) fixed seven more issues and flagged two niche ones. Every fix
+was verified red-first by reverting it in a worktree and watching its test fail.
+
+- **DONE: `find` write-primaries were classified safe** (posix.yaml). Found by
+  the exhaustive re-audit AND independently by the review lens. `find -fprint /
+  -fprint0 / -fprintf / -fls <FILE>` truncate FILE (confirmed on BSD find). The
+  bare `posix.find` rule is safe and only `-delete`/`-exec` were companioned.
+  New `posix.find-fprint` captures the target via `path_flags`; verified
+  destructive + recovered byte-identical. The SAME write-via-flag class as the
+  readonly.yaml holes, hiding in a pre-existing rule — so re-audit EVERY safe
+  rule when adding neighbours, not just the new file.
+- **DONE: resolver path-flag consume was "sticky"** (resolver.rs). `--output
+  -weird` set a pending Path-consume that a flag-shaped value (`-weird`) did not
+  claim, so it latched onto a LATER positional — capturing the wrong file and,
+  because a (bogus) path WAS captured, defeating the destructive-with-no-paths
+  cwd fallback. The real write target went unprotected. Fixed by honoring a
+  pending consume at the top of the token loop (a value claims the next token
+  even if flag-shaped). This was a GENERAL bug affecting every path_flags rule.
+- **DONE: redaction had unbounded siblings of the finding-10 fix** (redact.rs).
+  The finding-10 fix bounded the Authorization rules but left the secret-flag,
+  `-u` basic-auth, and unquoted-header value captures using `\S+`/`[^"'\\\s]+`,
+  which (a) ate a chained `&&rm`/`|tee`/`;rm` into the mask (audit-record loss)
+  and (b) leaked a token after a backslash-escaped space
+  (`Authorization:Bearer\ TOK`). Introduced one shared `CRED_VALUE` class
+  (escape-aware, stops at shell metacharacters `\s"'\\$&|;<>()\``) used by every
+  credential-value capture, reordered the bearer rule before the header rules,
+  and added URL-query masking (`?api_key=`/`&token=`). NOTE: redaction bugs are
+  never a data-loss or recovery risk — `resolve()` runs on the RAW command, so
+  the snapshot/effect/rule_id/manifest are all raw-derived; the stakes are a
+  persisted secret or a mangled audit string only. Do not over-invest, but keep
+  every value bounded.
+- **FLAGGED (not fixed) — ownership is not captured (F3b).** `EntryKind` stores
+  content/mode/mtime/xattrs but NOT uid/gid. So `chown`/`chgrp` (destructive,
+  snapshot-restore) captures content but cannot restore ownership, and an
+  ownership-only change has PRE==POST manifests so bare `doover undo` skips it.
+  DATA is always safe (content captured). Fixing needs a manifest-schema change
+  (add uid/gid) plus a privilege-sensitive best-effort restore chown — deferred
+  as niche (mostly root containers). Documented in README "What doover is not".
+  If you add it: gate the uid/gid comparison on manifest schema version so old
+  manifests (default 0) don't cause false conflicts, and make restore's chown
+  best-effort (EPERM as non-root is expected, warn don't fail).
+- **FLAGGED (not fixed) — bare undo skips an xattr/mtime-only change (F3a).**
+  The selection oracle (`state_matches_mode`) compares content+mode; xattr and
+  mtime are captured and ARE reverted by targeted `doover undo <id>`, but a
+  change in only those fields isn't auto-selected by bare undo. mtime
+  deliberately cannot join the selection oracle (nearly every command bumps it →
+  bare undo would target the wrong action constantly); xattr-only changes
+  (setfattr) are vanishingly rare and fully recoverable by explicit id. Left as
+  a documented, content-safe UX gap.
+- **REFUTED by verifiers (confirmed, do not re-add):** `less`/`more` `-o`/`-O`
+  (does not write non-interactively — verified: left the target untouched),
+  `column -o` (sets an output SEPARATOR string, not a file). Reading a man page
+  suggested a write; running the command proved otherwise.
+
+## Round-3 audit (2026-07-14) — trial-fix verification + new regressions
+
+A third audit verified every ORIGINAL trial finding (T1-T8) still holds end-to-
+end through the real binary, and found more issues (two I had just introduced).
+All fixes verified red-first by reverting in a worktree.
+
+- **DONE: `find -okdir` classified safe** (posix.yaml). The exec companion listed
+  -exec/-execdir/-ok but missed -okdir (the -execdir variant with a prompt), so
+  `find … -okdir rm {} ;` classified safe → no snapshot. Added -okdir. Two lenses
+  found this independently.
+- **DONE: a TRUNCATED destructive snapshot was skipped by bare `doover undo`**
+  (undo.rs). A regression I introduced with the finding-8 fix: `restorability`
+  short-circuited `truncated → Indeterminate`, and bare undo skips Indeterminate
+  — so a large `rm -rf` whose snapshot hit the file/time limit made bare undo
+  report "nothing to undo". Fix: truncated → InForce (never AlreadyDone, since
+  the uncaptured part is unknown; offer it and let undo() apply the round-18
+  refuse-by-default). Indeterminate is now ONLY a read error.
+- **DONE: redaction leaked Proxy-Authorization / -H-glued / X-Amz-Security-Token
+  / Cookie / Basic** (redact.rs). Pre-existing gaps, but common: broadened the
+  header-name pattern to `(?:proxy-)?authorization|cookie|x-…-(key|token|secret)`,
+  dropped the `\b` (so `-HAuthorization:` glued form is caught), and added Basic
+  to the bearer rule. Redaction is hygiene not DLP and never affects recovery
+  (resolve uses the raw command), but a write-time leak persists on disk.
+- **DONE: `cp -t/--target-directory` captured a source, not the destination**
+  (coreutils.yaml). cp used `paths: positional-last`; with -t the dest is a flag
+  value and positionals are sources, so it snapshotted a source and missed the
+  overwritten target. Added the flag as a path_flag. (mv/install use `paths:
+  positional`, so their -t value is already captured — only cp needed it.)
+- **DONE: added the MISSING tests the audit named.** (a) the headline T2 trap now
+  has an END-TO-END CLI test through the real binary (`cli_force_undo_…`), not
+  just the engine unit test. (b) the `already_satisfied` no-op CLI branch is
+  covered (`cli_re_undoing_…`). (c) the finding-8 test had gone partly VACUOUS —
+  the finding-9 mode-aware change made `chmod 000` resolve via the mode mismatch
+  before reaching the read-error that yields Indeterminate, so that branch was no
+  longer exercised. New macOS-gated test constructs a genuine Indeterminate (a
+  deny-read ACL keeps mode bits but blocks read) and pins continue-past-it.
+- **FLAGGED (pathological, not fixed): a file literally named `--`.** `sort -o --
+  input` / `git log --output -- x` — the shell/arg `--` terminator interacts with
+  path-flag capture so the real target `--` isn't captured. A file named `--` is
+  bizarre and the fix (teach the tokenizer that `--` after a path-flag is a value,
+  not a terminator) is complex for zero real-world benefit. Left as a known LOW
+  limitation.
+- **NOTED (not a defect): `redaction_does_not_leak_nonstandard_auth_schemes` also
+  passes on the 0.1.2 baseline.** It is red-first against the BROKEN intermediate
+  (scheme-list) commit — which is what matters — and correctly green on both the
+  old-correct and new-correct code. A regression test passing on old-correct code
+  is right, not dishonest.
+
 ## Carried-forward design risks (address at the step noted; do not forget)
 
 - **DONE (D4): data-at-rest lockdown.** `ensure_private_home()` (hooks.rs)

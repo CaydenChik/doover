@@ -419,6 +419,24 @@ impl Walker<'_> {
         let mut flag_paths: Vec<Word> = Vec::new();
         let mut consume: Consume = Consume::No;
         for tok in &tokens {
+            // A pending value-consume (set by a `path_flags`/`flag_args` flag on
+            // the previous iteration) claims THIS token as its value, even when
+            // the token is flag-shaped: `--output -weird` writes to a file
+            // literally named `-weird`. Without honoring the pending consume
+            // here, it stayed "sticky" across the flag-shaped value and latched
+            // onto a LATER positional, capturing the wrong path and leaving the
+            // real write target unprotected (round-2 audit F4a).
+            match std::mem::replace(&mut consume, Consume::No) {
+                Consume::Path => {
+                    let w = match tok {
+                        Tok::Flag(w) | Tok::Pos(w) => w,
+                    };
+                    flag_paths.push(w.clone());
+                    continue;
+                }
+                Consume::Drop => continue,
+                Consume::No => {}
+            }
             match tok {
                 Tok::Flag(w) => {
                     let t = w.text();
@@ -442,11 +460,9 @@ impl Walker<'_> {
                         // attached non-path value: nothing to capture or drop
                     }
                 }
-                Tok::Pos(w) => match std::mem::replace(&mut consume, Consume::No) {
-                    Consume::Path => flag_paths.push(w.clone()),
-                    Consume::Drop => {}
-                    Consume::No => positionals.push(w.clone()),
-                },
+                // consume is handled at the top of the loop; a plain positional
+                // that reaches here is a scope positional.
+                Tok::Pos(w) => positionals.push(w.clone()),
             }
         }
 

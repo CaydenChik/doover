@@ -324,10 +324,25 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
     };
     let r = resolve(&ev.command, &registry, &ctx);
 
+    // Redact BEFORE the secret ever reaches the disk (user-#1 trial).
+    //
+    // doover used to store the command verbatim and mask it only at display
+    // time. That printed `Authorization: [redacted]` while `journal.db` held
+    // the bearer token in plaintext — the trial found it with `strings`. It was
+    // documented, but documenting it does not fix it: showing a mask while
+    // keeping the secret manufactures false confidence, and false confidence is
+    // worse than no redaction at all.
+    //
+    // Nothing functional reads the command back — undo restores from manifests,
+    // the resolver runs here on `ev.command` before this point. The stored
+    // string is display and audit metadata, so the redacted form loses nothing.
+    // (Display still redacts too: journals written by older versions exist, and
+    // `redact` is idempotent.)
+    let journal_command = crate::redact::redact(&ev.command);
     let action = journal.start_action(&NewAction {
         session_id: &ev.session_id,
         tool_use_id: Some(&ev.tool_use_id),
-        raw_command: &ev.command,
+        raw_command: &journal_command,
         effect: r.severity.as_str(),
         rule_id: r.rule_id.as_deref(),
         has_unknown: r.has_unknown,

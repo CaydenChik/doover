@@ -1,0 +1,387 @@
+# doover reversibility registry — read-only commands (data: CC0-1.0)
+#
+# Why this file exists: in the first real-agent trial, 43 of 62 commands
+# classified `unknown`, so doover defensively snapshotted the entire working
+# directory for ~70% of everything the agent ran — including for `doover log`
+# itself. The unknown→snapshot-cwd fallback is the right safety floor, but it is
+# a floor, not a resting place. Every command that is *provably* read-only and
+# is not here costs a full tree walk, every time it runs.
+#
+# ADMISSION RULE, and it is strict: a command belongs here only if it cannot
+# write a file BY ITSELF. Redirects (`cmd > f`) are somebody else's job — the
+# shell.redirect-* rules capture those targets independently of the command.
+#
+# Deliberately NOT here, and why (each of these would be a silent data-loss bug
+# of exactly the kind round 17 fixed for `wget -O` / `curl -o`):
+#
+#   env, command, sudo, doas, xargs, nohup, timeout, nice, watch, time, exec
+#       Wrappers. They RUN another command. `env rm -rf /` would inherit the
+#       wrapper's classification and snapshot NOTHING. They must stay unknown.
+#   uniq, xxd            Take an output file as a trailing POSITIONAL
+#                        (`uniq in out` truncates `out`).
+#   tree, sort           Have output flags (`-o`). `sort` is handled properly:
+#                        a safe base rule plus a destructive `posix.sort-o`
+#                        companion. `tree -o` has no companion yet, so `tree`
+#                        stays unknown rather than becoming a lie.
+#   awk, perl, python…   Can open files for writing from inside the script.
+#
+# When in doubt, leave it out: an unknown command costs a tree walk, a wrongly
+# `safe` command costs the user their data.
+
+rules:
+  # --- system and environment facts (no filesystem writes at all) ------------
+  - id: readonly.date
+    match: { command: date }
+    effect: safe
+    undo: none
+  - id: readonly.whoami
+    match: { command: whoami }
+    effect: safe
+    undo: none
+  - id: readonly.id
+    match: { command: id }
+    effect: safe
+    undo: none
+  - id: readonly.uname
+    match: { command: uname }
+    effect: safe
+    undo: none
+  - id: readonly.hostname
+    match: { command: hostname }
+    effect: safe
+    undo: none
+  - id: readonly.uptime
+    match: { command: uptime }
+    effect: safe
+    undo: none
+  - id: readonly.groups
+    match: { command: groups }
+    effect: safe
+    undo: none
+  - id: readonly.nproc
+    match: { command: nproc }
+    effect: safe
+    undo: none
+  - id: readonly.printenv
+    match: { command: printenv }
+    effect: safe
+    undo: none
+    notes: "prints only. `env` is NOT here: it can exec a command."
+  - id: readonly.ps
+    match: { command: ps }
+    effect: safe
+    undo: none
+  - id: readonly.df
+    match: { command: df }
+    effect: safe
+    undo: none
+  - id: readonly.sleep
+    match: { command: sleep }
+    effect: safe
+    undo: none
+  - id: readonly.true
+    match: { command: "true" }
+    effect: safe
+    undo: none
+  - id: readonly.false
+    match: { command: "false" }
+    effect: safe
+    undo: none
+  - id: readonly.test
+    match: { command: test }
+    effect: safe
+    undo: none
+  - id: readonly.expr
+    match: { command: expr }
+    effect: safe
+    undo: none
+  - id: readonly.seq
+    match: { command: seq }
+    effect: safe
+    undo: none
+  - id: readonly.printf
+    match: { command: printf }
+    effect: safe
+    undo: none
+    notes: "writes to stdout; a redirect target is captured by shell.redirect-*."
+
+  # --- path and name inspection ---------------------------------------------
+  - id: readonly.basename
+    match: { command: basename }
+    effect: safe
+    undo: none
+  - id: readonly.dirname
+    match: { command: dirname }
+    effect: safe
+    undo: none
+  - id: readonly.realpath
+    match: { command: realpath }
+    effect: safe
+    undo: none
+  - id: readonly.readlink
+    match: { command: readlink }
+    effect: safe
+    undo: none
+  - id: readonly.file
+    match: { command: file }
+    effect: safe
+    undo: none
+  - id: readonly.file-compile
+    match: { command: file, flags_any: ["-C", "--compile"] }
+    effect: destructive
+    undo: snapshot-restore
+    notes: "file -C writes <magicfile>.mgc into cwd. The target is named by no
+      flag, so this rule carries no scope on purpose: the destructive-with-no-
+      paths fallback marks it unknown and snapshots cwd, which captures the
+      .mgc the way it captures any other opaque write."
+  - id: readonly.type
+    match: { command: type }
+    effect: safe
+    undo: none
+  - id: readonly.whereis
+    match: { command: whereis }
+    effect: safe
+    undo: none
+
+  # --- content inspection (stdout only) -------------------------------------
+  - id: readonly.diff
+    match: { command: diff }
+    effect: safe
+    undo: none
+  - id: readonly.cmp
+    match: { command: cmp }
+    effect: safe
+    undo: none
+  - id: readonly.comm
+    match: { command: comm }
+    effect: safe
+    undo: none
+  - id: readonly.nl
+    match: { command: nl }
+    effect: safe
+    undo: none
+  - id: readonly.rev
+    match: { command: rev }
+    effect: safe
+    undo: none
+  - id: readonly.cut
+    match: { command: cut }
+    effect: safe
+    undo: none
+  - id: readonly.tr
+    match: { command: tr }
+    effect: safe
+    undo: none
+  - id: readonly.paste
+    match: { command: paste }
+    effect: safe
+    undo: none
+  - id: readonly.join
+    match: { command: join }
+    effect: safe
+    undo: none
+  - id: readonly.fold
+    match: { command: fold }
+    effect: safe
+    undo: none
+  - id: readonly.column
+    match: { command: column }
+    effect: safe
+    undo: none
+  - id: readonly.strings
+    match: { command: strings }
+    effect: safe
+    undo: none
+  - id: readonly.od
+    match: { command: od }
+    effect: safe
+    undo: none
+  - id: readonly.hexdump
+    match: { command: hexdump }
+    effect: safe
+    undo: none
+  - id: readonly.base64
+    match: { command: base64 }
+    effect: safe
+    undo: none
+  - id: readonly.base64-output
+    match: { command: base64, flags_any: ["-o", "--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-o", "--output"] }
+    undo: snapshot-restore
+    notes: "BSD/macOS base64 writes its output to -o/--output, truncating it."
+  - id: readonly.cksum
+    match: { command: cksum }
+    effect: safe
+    undo: none
+  - id: readonly.md5sum
+    match: { command: md5sum }
+    effect: safe
+    undo: none
+  - id: readonly.sha1sum
+    match: { command: sha1sum }
+    effect: safe
+    undo: none
+  - id: readonly.sha256sum
+    match: { command: sha256sum }
+    effect: safe
+    undo: none
+  - id: readonly.shasum
+    match: { command: shasum }
+    effect: safe
+    undo: none
+  - id: readonly.less
+    match: { command: less }
+    effect: safe
+    undo: none
+  - id: readonly.more
+    match: { command: more }
+    effect: safe
+    undo: none
+  - id: readonly.jq
+    match: { command: jq }
+    effect: safe
+    undo: none
+    notes: "no in-place mode; output goes to stdout."
+
+  # --- network lookups (read-only) ------------------------------------------
+  - id: readonly.ping
+    match: { command: ping }
+    effect: safe
+    undo: none
+  - id: readonly.dig
+    match: { command: dig }
+    effect: safe
+    undo: none
+  - id: readonly.nslookup
+    match: { command: nslookup }
+    effect: safe
+    undo: none
+  - id: readonly.host
+    match: { command: host }
+    effect: safe
+    undo: none
+
+  # --- git subcommands that only read -----------------------------------------
+  # Deliberately absent: branch, tag, remote, config, stash, reflog. Each has a
+  # form that deletes or rewrites refs, and rule matching is per-subcommand, so
+  # marking the subcommand safe would cover its destructive flags too.
+  - id: git.rev-parse
+    match: { command: git, subcommand: rev-parse }
+    effect: safe
+    undo: none
+  - id: git.ls-files
+    match: { command: git, subcommand: ls-files }
+    effect: safe
+    undo: none
+  - id: git.ls-tree
+    match: { command: git, subcommand: ls-tree }
+    effect: safe
+    undo: none
+  - id: git.cat-file
+    match: { command: git, subcommand: cat-file }
+    effect: safe
+    undo: none
+  - id: git.rev-list
+    match: { command: git, subcommand: rev-list }
+    effect: safe
+    undo: none
+  - id: git.blame
+    match: { command: git, subcommand: blame }
+    effect: safe
+    undo: none
+  - id: git.grep
+    match: { command: git, subcommand: grep }
+    effect: safe
+    undo: none
+  - id: git.describe
+    match: { command: git, subcommand: describe }
+    effect: safe
+    undo: none
+  - id: git.shortlog
+    match: { command: git, subcommand: shortlog }
+    effect: safe
+    undo: none
+  - id: git.merge-base
+    match: { command: git, subcommand: merge-base }
+    effect: safe
+    undo: none
+  - id: git.check-ignore
+    match: { command: git, subcommand: check-ignore }
+    effect: safe
+    undo: none
+  - id: git.for-each-ref
+    match: { command: git, subcommand: for-each-ref }
+    effect: safe
+    undo: none
+  - id: git.diff-tree
+    match: { command: git, subcommand: diff-tree }
+    effect: safe
+    undo: none
+  - id: git.count-objects
+    match: { command: git, subcommand: count-objects }
+    effect: safe
+    undo: none
+
+  # --- the output-flag traps (adversarial review, 2026-07-14) ----------------
+  # `--output=<file>` is a git diff-generation option honored by every command
+  # that emits diff output; it TRUNCATES the named file. And `git grep -O<cmd>`
+  # runs <cmd> as a pager on the matched files, i.e. arbitrary execution -- a
+  # command wrapper exactly like env/xargs, which readonly.yaml's own header
+  # says it excludes. These companion rules outrank the safe base rule whenever
+  # the dangerous flag is present, and leave the read-only forms untouched.
+  - id: git.grep-open-pager
+    match: { command: git, subcommand: grep, flags_any: ["-O", "--open-files-in-pager"] }
+    effect: destructive
+    scope: { paths: none, flag_args: ["-O", "--open-files-in-pager"] }
+    undo: snapshot-restore
+    notes: "git grep -O runs its argument as a shell command (arbitrary exec).
+      flag_args both lets the attached-short `-Osh` form match and drops the
+      pager value (it is a command, not a path). With no captured path the
+      destructive-with-no-paths fallback marks it unknown -> cwd snapshot."
+  - id: git.rev-list-output
+    match: { command: git, subcommand: rev-list, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore
+  - id: git.blame-output
+    match: { command: git, subcommand: blame, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore
+  - id: git.shortlog-output
+    match: { command: git, subcommand: shortlog, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore
+  - id: git.diff-tree-output
+    match: { command: git, subcommand: diff-tree, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore
+
+  # --- doover inspecting itself ---------------------------------------------
+  # `doover log` triggering a full working-directory snapshot is absurd, and it
+  # happened on every invocation during the trial. Only the read-only
+  # subcommands are listed: `undo`, `redo` and `gc` genuinely change files, so
+  # they stay unknown and keep their defensive snapshot.
+  - id: doover.log
+    match: { command: doover, subcommand: log }
+    effect: safe
+    undo: none
+  - id: doover.status
+    match: { command: doover, subcommand: status }
+    effect: safe
+    undo: none
+  - id: doover.show
+    match: { command: doover, subcommand: show }
+    effect: safe
+    undo: none
+  - id: doover.diff
+    match: { command: doover, subcommand: diff }
+    effect: safe
+    undo: none
+  - id: doover.doctor
+    match: { command: doover, subcommand: doctor }
+    effect: safe
+    undo: none

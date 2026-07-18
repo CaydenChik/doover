@@ -140,12 +140,29 @@ fn path_flag_rules_resist_all_value_forms() {
         let Some(cmd) = rule.matcher.command.as_deref() else {
             continue;
         };
+        // Include the subcommand: a rule scoped to `git log --output` only
+        // matches when `log` is present, and the synthesized line must exercise
+        // the full matcher or it silently tests nothing (adversarial review:
+        // the git `--output` companion rules are subcommand-scoped).
+        let cmd = match rule.matcher.subcommand.as_deref() {
+            Some(sub) => format!("{cmd} {sub}"),
+            None => cmd.to_string(),
+        };
+        let cmd = cmd.as_str();
         let Some(scope) = &rule.scope else { continue };
         for flag in &scope.path_flags {
+            // Mirror the resolver's `is_short` rule: an attached value form
+            // exists only for `--long=v` and for GENUINE 2-char short flags
+            // (`-ov`). A single-dash long flag (`find -fprint`) has no attached
+            // form — `-fprintv` is not `-fprint v`, it is an unknown predicate —
+            // so synthesizing it would demand the resolver defend against a
+            // command that cannot occur.
             let forms = if flag.starts_with("--") {
                 vec![format!("{flag} tgt.txt"), format!("{flag}=tgt.txt")]
-            } else {
+            } else if flag.len() == 2 {
                 vec![format!("{flag} tgt.txt"), format!("{flag}tgt.txt")]
+            } else {
+                vec![format!("{flag} tgt.txt")]
             };
             for form in forms {
                 checked += 1;

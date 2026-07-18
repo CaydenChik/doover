@@ -81,8 +81,21 @@ rules:
     notes: "Targets are computed at runtime; zero extractable paths → unknown policy."
 
   - id: posix.find-exec
-    match: { command: find, flags_any: ["-exec", "-execdir", "-ok"] }
+    match: { command: find, flags_any: ["-exec", "-execdir", "-ok", "-okdir"] }
     effect: destructive
     scope: { paths: none }
     undo: snapshot-restore
-    notes: "Arbitrary command over computed targets; unknown policy applies."
+    notes: "Arbitrary command over computed targets; unknown policy applies.
+      -okdir is -execdir with a prompt — same exec class (round-3 audit found it
+      missing here, so `find -okdir rm {} ;` was classifying safe)."
+
+  - id: posix.find-fprint
+    match: { command: find, flags_any: ["-fprint", "-fprint0", "-fprintf", "-fls"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-fprint", "-fprint0", "-fprintf", "-fls"] }
+    undo: snapshot-restore
+    notes: "find's WRITE predicates: -fprint/-fprint0/-fprintf/-fls take a FILE
+      argument and TRUNCATE it (confirmed on BSD find: `find . -fprint x`
+      overwrote x with the listing). Capture that file. The bare posix.find rule
+      is safe/no-snapshot, so without this the write is unrecoverable — the same
+      write-via-flag class the 2026-07-14 review found across readonly.yaml."

@@ -68,3 +68,22 @@ rules:
     match: { command: git, subcommand: show }
     effect: safe
     undo: none
+
+  # `--output=<file>` is a diff-generation option on all three: it truncates the
+  # named file. Pre-existing hole surfaced by the 2026-07-14 adversarial review
+  # (finding 7); the safe rules above cover only the common stdout forms.
+  - id: git.log-output
+    match: { command: git, subcommand: log, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore
+  - id: git.diff-output
+    match: { command: git, subcommand: diff, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore
+  - id: git.show-output
+    match: { command: git, subcommand: show, flags_any: ["--output"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["--output"] }
+    undo: snapshot-restore

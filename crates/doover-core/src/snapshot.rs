@@ -234,6 +234,39 @@ pub struct Manifest {
     pub skipped_dirs: Vec<PathBuf>,
 }
 
+impl Manifest {
+    /// Do these two manifests describe the same filesystem state?
+    ///
+    /// Used to tell a command that changed something from one that did not: a
+    /// read-only command given a defensive working-directory snapshot has a
+    /// POST manifest identical to its PRE, and must never become the default
+    /// target of `doover undo` (user-#1 trial).
+    ///
+    /// Answers `false` whenever it cannot *prove* sameness — a truncated
+    /// capture describes only part of a tree, so two truncated manifests say
+    /// nothing about the parts they missed. The caller treats "not provably
+    /// unchanged" as "still worth undoing", which is the safe direction: the
+    /// cost of a false `false` is offering the user an undo they don't need,
+    /// and the cost of a false `true` is hiding one they do.
+    pub fn describes_same_state(&self, other: &Manifest) -> bool {
+        if self.path != other.path || self.root != other.root {
+            return false;
+        }
+        if self.truncated || other.truncated {
+            return false;
+        }
+        if self.entries.len() != other.entries.len() {
+            return false;
+        }
+        let key = |e: &Entry| e.rel.clone();
+        let mut a: Vec<&Entry> = self.entries.iter().collect();
+        let mut b: Vec<&Entry> = other.entries.iter().collect();
+        a.sort_by_key(|e| key(e));
+        b.sort_by_key(|e| key(e));
+        a.iter().zip(b.iter()).all(|(x, y)| x == y)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RestoreReport {
     pub files_restored: u64,
@@ -769,6 +802,21 @@ impl Store {
     /// mismatches, except under a truncated manifest, which compares only
     /// what it captured (weaker evidence — callers should warn).
     pub fn state_matches(&self, manifest: &Manifest) -> Result<bool, SnapshotError> {
+        self.compare_state(manifest, false)
+    }
+
+    /// Like [`state_matches`](Self::state_matches) but also compares file and
+    /// directory MODE. Used by bare `doover undo` to decide whether an action's
+    /// effect is still in force: a `chmod -R` changes no content, so a
+    /// content-only check wrongly reported "nothing to restore" and hid the one
+    /// destructive action doover had snapshotted (adversarial review, finding
+    /// 9). NOT used by the conflict oracle, which intentionally treats
+    /// metadata-only drift as non-conflicting.
+    pub fn state_matches_mode(&self, manifest: &Manifest) -> Result<bool, SnapshotError> {
+        self.compare_state(manifest, true)
+    }
+
+    fn compare_state(&self, manifest: &Manifest, check_mode: bool) -> Result<bool, SnapshotError> {
         use std::collections::BTreeMap;
         let root = &manifest.path;
         if manifest.root == Root::Absent {
@@ -788,6 +836,7 @@ impl Store {
         // node_modules/. Prune them here too: compare like with like.
         let skipped: std::collections::BTreeSet<&Path> =
             manifest.skipped_dirs.iter().map(|p| p.as_path()).collect();
+        let mode_of = |meta: &fs::Metadata| meta.permissions().mode() & 0o7777;
         let mut seen = 0usize;
         let mut walker = walkdir::WalkDir::new(root).sort_by_file_name().into_iter();
         while let Some(item) = walker.next() {
@@ -811,14 +860,23 @@ impl Store {
             seen += 1;
             let ft = meta.file_type();
             let matches = match kind {
-                EntryKind::Dir { .. } => ft.is_dir() && !ft.is_symlink(),
+                EntryKind::Dir { mode } => {
+                    ft.is_dir() && !ft.is_symlink() && (!check_mode || mode_of(&meta) == *mode)
+                }
                 EntryKind::Symlink { target } => {
+                    // symlink mode is not meaningful / not restored; content only
                     ft.is_symlink() && fs::read_link(item.path()).is_ok_and(|t| &t == target)
                 }
-                EntryKind::Fifo { .. } => std::os::unix::fs::FileTypeExt::is_fifo(&ft),
-                EntryKind::File { hash, len, .. } => {
+                EntryKind::Fifo { mode } => {
+                    std::os::unix::fs::FileTypeExt::is_fifo(&ft)
+                        && (!check_mode || mode_of(&meta) == *mode)
+                }
+                EntryKind::File {
+                    hash, len, mode, ..
+                } => {
                     ft.is_file()
                         && !ft.is_symlink()
+                        && (!check_mode || mode_of(&meta) == *mode)
                         && meta.len() == *len
                         && hash_file(item.path())? == *hash
                 }

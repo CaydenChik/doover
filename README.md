@@ -106,6 +106,13 @@ A few behaviors worth knowing:
   you why. `--force` proceeds anyway; `--dry-run` shows the plan first.
 - **Undo is itself journaled.** Undoing an undo is how `redo` works. History
   is append-only; nothing is ever silently rewritten.
+- **`doover undo` targets the last command that actually changed something.**
+  Read-only commands are skipped, even when doover snapshotted around them.
+- **Undo is idempotent, and it trusts your disk over its own records.** Undo
+  the same action twice and the second is a no-op. But if something puts an
+  action's effect *back* (a forced undo of a later action can), doover will
+  undo it again rather than tell you it already did. Whether your files are
+  there is a question about your files, not about doover's bookkeeping.
 - **Restoring a whole directory replaces it.** If your shell is sitting
   inside that directory, run `cd .` afterwards to refresh it. doover tells
   you when this happens.
@@ -146,10 +153,13 @@ The interesting parts:
   through `&&` chains, pipes, redirects, globs, and quoting. Anything it
   can't fully account for (command substitution, `eval`, unknown tools) is
   treated as potentially destructive, never assumed safe.
-- **A reversibility registry** of 66 [CC0-licensed](crates/doover-core/registry/)
+- **A reversibility registry** of 137 [CC0-licensed](crates/doover-core/registry/)
   YAML rules classifying the commands agents actually run, from `safe` to
   `irreversible`: what `rm`, `mv`, `git checkout`, `rsync --delete`, `gzip`,
-  `wget -O` put at risk, and which paths to capture.
+  `wget -O` put at risk, and which paths to capture. Commands proven read-only
+  are classified as such so they cost nothing; the interesting entries are the
+  ones that *look* harmless and aren't, like `sort -o` quietly truncating its
+  output file.
 - **Copy-on-write snapshots.** On APFS/Btrfs/XFS, "copying" a file before
   deletion shares its disk blocks, so snapshotting a 1 GB directory costs
   almost nothing until the original actually changes. Files are stored
@@ -216,11 +226,19 @@ Worth being direct about:
   lives on the same disk. Keep real backups.
 - **Not able to undo remote effects.** Dropped databases, deleted pods,
   force-pushed branches: doover tells you it happened; it can't reverse it.
-- **Not encrypted at rest.** The journal stores the commands your agent ran
-  in plaintext, and snapshots are copies of your files. Everything is
-  readable only by your user account (`0700`/`0600`), and `log`/`show` mask
-  things that look like credentials. But anyone with your account or root
-  can read the raw data, and secrets remain until retention prunes them.
+- **Not encrypted at rest.** Snapshots are copies of your files, readable only
+  by your user account (`0700`/`0600`). Anyone with your account, or root, can
+  read them. Commands are redacted *before* they are written to the journal,
+  so credentials doover recognizes never reach the disk, but the matching is
+  pattern-based hygiene, not a DLP engine: an exotic enough secret gets
+  through. Keep treating your snapshot store as sensitive as the files in it.
+- **File content, not ownership.** A snapshot restores a file's contents,
+  permissions (mode), timestamps, and extended attributes. It does **not**
+  capture or restore ownership (uid/gid): undoing a `chown`/`chgrp` brings the
+  data back but not the owner, and an ownership-only change isn't auto-selected
+  by a bare `doover undo` (name it explicitly with `doover undo <id>`). Your
+  data is always safe; the owner field is the one thing a restore leaves as it
+  finds it.
 - **Not a replacement for git, checkpoints, or sandboxes.** It's the layer
   they all leave open. Keep using all three.
 

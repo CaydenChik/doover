@@ -29,12 +29,55 @@ rules:
     undo: snapshot-restore
     notes: "Destination overwrite and source relocation both need pre-state."
 
+  - id: coreutils.mv-target-dir
+    match: { command: mv, flags_any: ["-t", "--target-directory"] }
+    effect: destructive
+    scope: { paths: positional, path_flags: ["-t", "--target-directory"] }
+    undo: snapshot-restore
+    notes: "The separate `-t /dest` form is already captured as a positional by
+      the base rule, but the ATTACHED `--target-directory=/dest` form hides the
+      dest inside a flag token and misses it (round-4 audit). path_flags captures
+      it in both forms; positional still captures the removed sources."
+
+  - id: coreutils.ln-target-dir
+    match: { command: ln, flags_any: ["-t", "--target-directory"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-t", "--target-directory"] }
+    undo: snapshot-restore
+    notes: "ln uses positional-last, so `ln -t /dest a b` captured a SOURCE and
+      missed /dest — `ln -sf -t /dest a` silently replaces links in /dest with no
+      snapshot (round-4 audit, same class as cp -t). Sources are not modified, so
+      capture only the target directory."
+
+  - id: coreutils.install-target-dir
+    match: { command: install, flags_any: ["-t", "--target-directory"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-t", "--target-directory"] }
+    undo: snapshot-restore
+    notes: "Base install (paths: positional) captures the separate `-t /dest`
+      form, but the ATTACHED `--target-directory=/dest` form hides the dest in a
+      flag token and misses it (round-4 audit). Sources are read-only; capture the
+      target directory via path_flags in both forms."
+
   - id: coreutils.cp
     match: { command: cp }
     effect: destructive
     scope: { paths: positional-last }
     undo: snapshot-restore
     notes: "Only the destination is at risk; snapshot the last positional."
+
+  - id: coreutils.cp-target-dir
+    match: { command: cp, flags_any: ["-t", "--target-directory"] }
+    effect: destructive
+    scope: { paths: none, path_flags: ["-t", "--target-directory"] }
+    undo: snapshot-restore
+    notes: "With -t/--target-directory the destination is a FLAG value and the
+      positionals are all SOURCES, so the base rule's positional-last would
+      capture a source and MISS the real write target. Capture the target
+      directory instead (round-3 audit). Companion rather than path_flags on the
+      base rule, so the `path_flags ⊆ flags_any` invariant holds. (mv/install use
+      `paths: positional`, so their -t value is already captured; only cp needed
+      this.)"
 
   - id: coreutils.dd
     match: { command: dd }
