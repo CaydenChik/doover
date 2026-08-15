@@ -809,3 +809,101 @@ fn oracle_filters_home_entries_on_the_expected_side_too() {
          permanent conflict"
     );
 }
+
+// --- dive round 2 (2026-08-15): racing restores ----------------------------
+
+/// Round-2 racing probe (reproduced live): two concurrent restores interleave
+/// the carry machinery destructively — racer B sees live skipped dirs absent
+/// (they sit in A's staging), carries nothing, and swap-deletes A's restored
+/// tree, live dirs included. Restores now take a non-blocking cross-process
+/// flock: while one holds it, a second errors clearly instead of mutating.
+#[test]
+fn concurrent_restores_are_mutually_excluded() {
+    let jail = tempfile::tempdir().unwrap();
+    let store = Store::open(jail.path().join("store-home/store")).unwrap();
+    let _held = store.lock_restores().expect("first lock acquires");
+    // a second handle on the same store (another process, in real life)
+    let store2 = Store::open(jail.path().join("store-home/store")).unwrap();
+    let err = store2.lock_restores().unwrap_err();
+    assert!(
+        matches!(err, SnapshotError::RestoreInProgress),
+        "the loser must get the clear in-progress refusal, got: {err}"
+    );
+    drop(_held);
+    store2
+        .lock_restores()
+        .expect("the lock releases with its holder");
+}
+
+/// Round-2 perf F1: BOTH hooks walk the full cwd for unknown commands, and
+/// `.git` was included — 131 of 231 walked files in a 100-file project,
+/// making the unknown tax ~2x the documented model. `.git` is now always
+/// walked past (and carried live across restore swaps, like build dirs);
+/// a DIRECTLY TARGETED `.git` is still captured in full (root never skipped).
+#[test]
+fn dot_git_is_walked_past_but_captured_when_targeted() {
+    let jail = tempfile::tempdir().unwrap();
+    let store = Store::open(jail.path().join("store-home/store")).unwrap();
+    let proj = jail.path().join("proj");
+    fs::create_dir_all(proj.join("src")).unwrap();
+    fs::write(proj.join("src/main.rs"), "code").unwrap();
+    fs::create_dir_all(proj.join(".git/objects/ab")).unwrap();
+    fs::write(proj.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+    fs::write(proj.join(".git/objects/ab/cdef"), "blob").unwrap();
+
+    // tree walk (the unknown-command cwd fallback shape)
+    let m = store
+        .snapshot_scoped(&proj, None, &[], &doover_core::snapshot::SkipPolicy::none())
+        .unwrap();
+    assert!(
+        m.entries.iter().all(|e| !e.rel.starts_with(".git")),
+        "the walk must not descend .git: {:?}",
+        m.entries.iter().map(|e| &e.rel).collect::<Vec<_>>()
+    );
+    assert!(
+        m.skipped_dirs.iter().any(|p| p.ends_with(".git")),
+        ".git must be recorded as a skipped (carried) dir"
+    );
+    assert!(
+        m.entries
+            .iter()
+            .any(|e| e.rel.to_string_lossy().contains("main.rs")),
+        "the working tree is still captured"
+    );
+
+    // a direct target is the ROOT — never skipped, captured in full
+    let direct = store.snapshot(&proj.join(".git"), None).unwrap();
+    assert!(
+        direct
+            .entries
+            .iter()
+            .any(|e| e.rel.to_string_lossy().contains("HEAD")),
+        "an explicitly targeted .git must be captured in full"
+    );
+}
+
+/// Round-2 review GS1: skipped dirs are part of the described state. PRE
+/// skipping .git (it existed) vs POST not skipping it (the command DELETED
+/// it) must NOT read as "changed nothing" — that hid opaque `rm -rf .git`
+/// from bare undo entirely. Closes the long-standing phase-1 risk note.
+#[test]
+fn skipped_dir_deletion_is_a_state_change() {
+    let jail = tempfile::tempdir().unwrap();
+    let store = Store::open(jail.path().join("store-home/store")).unwrap();
+    let proj = jail.path().join("proj");
+    fs::create_dir_all(proj.join(".git")).unwrap();
+    fs::write(proj.join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+    fs::write(proj.join("f.txt"), "data").unwrap();
+    let skips = doover_core::snapshot::SkipPolicy::none();
+
+    let pre = store.snapshot_scoped(&proj, None, &[], &skips).unwrap();
+    assert!(pre.skipped_dirs.iter().any(|p| p.ends_with(".git")));
+    fs::remove_dir_all(proj.join(".git")).unwrap();
+    let post = store.snapshot_scoped(&proj, None, &[], &skips).unwrap();
+    assert!(post.skipped_dirs.is_empty());
+    assert!(
+        !pre.describes_same_state(&post),
+        "deleting a skipped dir must read as a change, or opaque `rm -rf .git` \
+         is invisible to bare undo"
+    );
+}

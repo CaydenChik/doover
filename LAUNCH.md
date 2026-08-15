@@ -25,7 +25,7 @@ macOS (arm64/x86_64) and Linux (x86_64/arm64).
 4. Update the tap: edit `Formula/doover.rb` in
    [homebrew-doover](https://github.com/CaydenChik/homebrew-doover) with the
    new version and the four sha256 values from the release's `SHA256SUMS`.
-5. Sanity-check one install path (`cargo install doover --force` or
+5. Sanity-check one install path (`cargo install doover --force --locked` or
    `brew upgrade doover`) and run `doover doctor`.
 
 ## Standing decisions

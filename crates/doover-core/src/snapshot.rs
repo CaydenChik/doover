@@ -67,6 +67,19 @@ pub enum SnapshotError {
          and re-run"
     )]
     RestoreWouldDeleteHome { path: PathBuf },
+    #[error(
+        "another doover restore is already in progress on this store; \
+         wait for it to finish and re-run"
+    )]
+    RestoreInProgress,
+}
+
+/// RAII guard for [`Store::lock_restores`]: the flock releases on drop (or on
+/// process death — the kernel owns it, so a SIGKILL can never leave a stale
+/// lock behind).
+#[derive(Debug)]
+pub struct RestoreLock {
+    _file: fs::File,
 }
 
 /// A manifest `rel` must stay inside the restore root: relative, with only
@@ -153,6 +166,24 @@ impl SkipPolicy {
     }
 
     fn skips(&self, dir: &Path, name: &str) -> bool {
+        // `.git` is ALWAYS walked past (and, like every skipped dir, carried
+        // live across restore swaps). Three reasons (dive round 2): it is
+        // enormous relative to working trees (131 of 231 walked files in a
+        // 100-file project — the unknown-command tax was 2x the documented
+        // model); git guards its own state better than a byte-rewind behind
+        // its back would; and undoing a working-tree change should not
+        // silently rewind repository history — while the oracle ignoring
+        // .git kills a class of false conflicts (`git status` mutates it).
+        // An explicitly TARGETED `.git` (`rm -rf .git`) is still captured in
+        // full: the snapshot root is never skipped.
+        if name == ".git" && dir.join("HEAD").exists() {
+            // ...and only when it LOOKS like a real git dir (HEAD present):
+            // a data directory coincidentally named .git in a non-git tree
+            // must keep the capture the gitignore-agreement gate exists to
+            // protect (round-2 review GS5). Submodule `.git` FILES never
+            // reach here (skips() is consulted for directories only).
+            return true;
+        }
         if !self.names.iter().any(|n| n == name) {
             return false;
         }
@@ -280,6 +311,20 @@ impl Manifest {
         if self.truncated || other.truncated {
             return false;
         }
+        // skipped dirs are part of the described state: a dir skipped in PRE
+        // but absent from POST's skip list means the command DELETED it —
+        // ignoring the lists here read `rm -rf .git` (opaque form) as
+        // "changed nothing" and hid it from bare undo (round-2 review GS1,
+        // closing the long-standing phase-1 risk note)
+        {
+            let mut a: Vec<&PathBuf> = self.skipped_dirs.iter().collect();
+            let mut b: Vec<&PathBuf> = other.skipped_dirs.iter().collect();
+            a.sort();
+            b.sort();
+            if a != b {
+                return false;
+            }
+        }
         if self.entries.len() != other.entries.len() {
             return false;
         }
@@ -364,6 +409,47 @@ impl Store {
         limits: Option<&Limits>,
     ) -> Result<Manifest, SnapshotError> {
         self.snapshot_scoped(path, limits, &[], &SkipPolicy::none())
+    }
+
+    /// Cross-process exclusion for restores. Two concurrent restores of
+    /// overlapping trees interleave the carry machinery destructively: racer
+    /// B sees the live skipped dirs ABSENT (they sit in racer A's staging),
+    /// carries nothing, then swap-deletes A's freshly restored tree — live
+    /// never-captured dirs included (dive round 2, reproduced live, 2026-08-15).
+    /// record_undo's transaction guard runs AFTER all filesystem mutation, so
+    /// it cannot help. flock on a file in the store root: works on macOS and
+    /// Linux, releases automatically on process death (no stale-lock cleanup),
+    /// and non-blocking — a second restore errors clearly instead of queueing
+    /// behind an operation that will change the world under its feet.
+    pub fn lock_restores(&self) -> Result<RestoreLock, SnapshotError> {
+        let Some(root) = self.objects.parent() else {
+            return Err(SnapshotError::Io {
+                path: self.objects.display().to_string(),
+                source: io::Error::other("store root has no parent"),
+            });
+        };
+        let path = root.join(".restore-lock");
+        let file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
+        let rc = unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if rc != 0 {
+            // ONLY contention means another restore is running; anything else
+            // (ENOTSUP/ENOLCK on network/FUSE mounts) must surface as the real
+            // error — a recovery tool refusing recovery with a false "wait for
+            // the other restore" diagnosis is the trial's headline defect
+            // class (round-2 review RL-2)
+            let e = io::Error::last_os_error();
+            return Err(if e.kind() == io::ErrorKind::WouldBlock {
+                SnapshotError::RestoreInProgress
+            } else {
+                io_err(&path, e)
+            });
+        }
+        Ok(RestoreLock { _file: file })
     }
 
     /// Rollback capture for the undo engine: like [`snapshot`](Self::snapshot)
@@ -841,16 +927,37 @@ impl Store {
             let Ok(rel) = skipped.strip_prefix(target_root) else {
                 continue;
             };
-            if !rel_is_safe(rel) || !skipped.exists() {
+            if !rel_is_safe(rel) {
+                continue;
+            }
+            if !skipped.exists() {
+                // the skipped dir existed at capture time but is GONE now:
+                // the command (or something later) deleted it, and doover
+                // never captured it. Restore cannot bring it back — say so
+                // loudly instead of silently restoring a tree without it
+                // (round-2 review GS1: `rm -rf .git` via an opaque script)
+                report.warnings.push(format!(
+                    "{}: existed at capture time but was never captured (skipped) and                      no longer exists — restore CANNOT bring it back{}",
+                    rel.display(),
+                    if rel.as_os_str() == ".git" {
+                        "; recover repository state from git reflog/remotes/backups"
+                    } else {
+                        ""
+                    }
+                ));
                 continue;
             }
             if let Err(e) = carry(skipped, &staging.join(rel), &mut carried) {
                 return Err(self.rescue(&staging, &carried, target_root, false, e));
             }
-            report.warnings.push(format!(
-                "{}: not captured (regenerable); left as it is now",
-                rel.display()
-            ));
+            report.warnings.push(if rel.as_os_str() == ".git" {
+                format!("{}: left to git (never captured)", rel.display())
+            } else {
+                format!(
+                    "{}: not captured (regenerable); left as it is now",
+                    rel.display()
+                )
+            });
         }
 
         if let Err(e) = remove_any(target_root) {

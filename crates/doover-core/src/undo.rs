@@ -424,6 +424,16 @@ impl<'a> UndoEngine<'a> {
         force: bool,
         dry_run: bool,
     ) -> Result<UndoReport, UndoError> {
+        // Cross-process exclusion is taken BEFORE the conflict oracle runs
+        // (round-2 review RL-1): a verdict computed outside the lock can be
+        // stale by mutation time — a racer's finished restore would be
+        // silently overwritten where sequential execution would have refused
+        // with a conflict. Dry-run never mutates and takes no lock.
+        let _restore_lock = if dry_run {
+            None
+        } else {
+            Some(self.store.lock_restores()?)
+        };
         let mut warnings = Vec::new();
         let mut conflicts = Vec::new();
         for m in restore_set {

@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.2.3 — 2026-08-15
+
+The trust release: findings from dive round 2's supply-chain, licensing,
+performance, and concurrency lenses — run against the PUBLISHED artifacts
+and the released binary, with a live-reproduced concurrency defect.
+
+### Fixed
+
+- **Concurrent restores are mutually excluded.** Two racing `doover undo`
+  processes could interleave the carry machinery destructively (reproduced
+  live: one racer swap-deleted the other's freshly restored tree, carried
+  live directories included) and made double-fired bare undo revert a
+  nondeterministic number of actions. Restores now take a non-blocking
+  cross-process lock; the loser gets "another restore is in progress"
+  instead of mutating. The kernel owns the lock, so no crash leaves it
+  stale.
+- **`.git` is walked past in whole-tree snapshots** (and, like build dirs,
+  carried live across restore swaps). It was often larger than the working
+  tree it rode along with — the unknown-command overhead was ~2x the
+  documented model — and undo should never rewind repository history
+  behind git's back. A directly targeted `.git` is still captured in full,
+  and the conflict oracle ignoring it removes a class of false conflicts.
+- **The size cap now bounds the journal too.** journal.db is
+  manifest-heavy and measured many times the store's size on realistic
+  mixes; `DOOVER_MAX_STORE_BYTES` pressure now includes it, and over-cap
+  eviction (which prunes old rows) can actually relieve it.
+- The inline auto-gc pause no longer grows with retained manifest count
+  (missing index on the undo-chain column).
+
+### Licensing / supply chain
+
+- Published crates now contain the Apache-2.0 LICENSE and NOTICE texts
+  (they previously shipped only the SPDX identifier); doover-core's
+  license field is the precise `Apache-2.0 AND CC0-1.0`.
+- Binary release tarballs now include THIRD-PARTY-LICENSES.txt (statically
+  linked MIT/BSD dependencies require their license texts in binary
+  distributions).
+- NOTICE.md is now an actual notice file; the clean-room development
+  policy moved to docs/CLEANROOM.md (NOTICE propagates to every downstream
+  distribution and must carry attribution only).
+- README's install one-liner is now `cargo install doover --locked` — the
+  unlocked form resolved 49 dependencies off the audited set.
+- The release workflow runs cargo-audit before building tag artifacts
+  (previously only pushes were audited); CI gained an informational Linux
+  bench job (the first Linux performance numbers).
+
+
 ## 0.2.2 — 2026-08-15
 
 Built on the results of the second live-agent trial (run against released

@@ -218,7 +218,22 @@ pub fn gc(
     // never be subtracted from it (on CoW filesystems deleting a clone frees
     // ~0 physical blocks; the units simply differ), so no credit applies and
     // the dry-run deficit is an honest upper bound.
-    let apparent = store.total_bytes()?;
+    // reclaim pruned space BEFORE measuring pressure — without VACUUM the
+    // journal file never shrinks and cap pressure would be permanent
+    if !opts.dry_run && (report.actions_pruned > 0 || report.sessions_pruned > 0) {
+        let _ = journal.vacuum();
+    }
+    // journal bytes count toward the cap: the journal is manifest-heavy and
+    // measured 26x the store on realistic mixes (round 2: ~2 MB per 100
+    // commands) — a cap that ignored it bounded the small half. Over-cap
+    // eviction prunes old ROWS as well as objects, so the pressure it adds
+    // here is pressure it can actually relieve.
+    let journal_bytes: u64 = ["journal.db", "journal.db-wal"]
+        .iter()
+        .filter_map(|n| std::fs::metadata(doover_home.join(n)).ok())
+        .map(|m| m.len())
+        .sum();
+    let apparent = store.total_bytes()?.saturating_add(journal_bytes);
     let cap_credit = if opts.dry_run { report.bytes_freed } else { 0 };
     let over_cap = match opts.cap_bytes {
         Some(cap) => apparent.saturating_sub(cap_credit).saturating_sub(cap),
@@ -276,6 +291,11 @@ pub fn gc(
             report.still_over_budget = true;
             break;
         }
+    }
+    if report.cap_evicted_actions > 0 {
+        // the eviction loop pruned rows; shrink the file so the relief is
+        // real (see the vacuum above the pressure measurement)
+        let _ = journal.vacuum();
     }
     Ok(report)
 }

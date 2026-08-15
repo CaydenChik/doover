@@ -305,6 +305,14 @@ impl Journal {
             Err(_) => conn.execute_batch("ROLLBACK;").unwrap_or(()),
         }
         migrate?;
+        // idempotent, outside the versioned migration so EXISTING journals
+        // get it too: gc's live_hashes runs an EXISTS subquery on
+        // target_action_id at every auto-gc — unindexed, its inline post-hook
+        // pause grew with retained manifest count (round 2: 3ms -> 22.6ms at
+        // 1.5k realistic actions)
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_actions_target ON actions(target_action_id);",
+        )?;
         Ok(Self { conn })
     }
 
@@ -811,6 +819,20 @@ impl Journal {
             last = Some(row?);
         }
         Ok(last)
+    }
+
+    /// Reclaim file space after row pruning. SQLite DELETE only freelists
+    /// pages — the FILE never shrinks without VACUUM, so cap pressure from
+    /// journal bytes would otherwise become permanent once reached (round-2
+    /// review CIP-1: every auto-gc would evict all evictable history forever
+    /// while staying over budget). Also truncates the WAL so the pressure
+    /// measurement that follows sees the real footprint, not the prune's own
+    /// transaction inflation (CIP-3). Best-effort at call sites: a busy
+    /// database skips shrinking until the next pass.
+    pub fn vacuum(&self) -> Result<(), JournalError> {
+        self.conn.execute_batch("VACUUM;")?;
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+        Ok(())
     }
 
     /// Test support: flip this connection to query_only so every subsequent

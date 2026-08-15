@@ -39,8 +39,9 @@ confirm green → only then claim done. Build order and per-step test gates are 
 
 - E2E tests must never touch the real `$HOME`, `~/.claude`, `~/.doover`, or any
   user data. Fixture jails only.
-- NOTICE.md lists unlicensed repos (ccundo, DiffBack) we may study but must never
-  copy code from. Clean-room only.
+- docs/CLEANROOM.md lists unlicensed repos (ccundo, DiffBack) we may study but
+  must never copy code from. Clean-room only. (Moved out of NOTICE.md in round 2:
+  NOTICE propagates downstream and must carry attribution only.)
 - Unknown/opaque shell constructs must never classify as `safe` — `unknown` or
   stricter. This is a load-bearing safety invariant with property tests behind it.
 - Exit codes: 0 ok, 1 runtime error, 2 hook block decision, 3 undo conflict.
@@ -463,6 +464,83 @@ headlined by a HIGH design flaw in the first draft of the background fix.
   serious flaw in freshly written protection code (Phase A: 14, Phase C:
   27, Phase D: 14 findings). The review-before-commit rule has earned
   permanence.**
+
+## Dive round 2 (2026-08-15) — trust lenses on the SHIPPED artifacts → 0.2.3
+
+Four lenses (supply chain, licensing-of-artifacts, performance-under-load,
+racing undos) run against the published crates/tarballs and the released
+binary; 17 confirmed findings, 1 refuted. Full reports in the session
+scratchpad; upstream drafts in ../doover-upstream-*.md (maintainer files).
+
+- **DONE: restore cross-process flock** (Store::lock_restores, held across
+  the whole engine mutation sequence). Racing undos were REPRODUCED
+  destroying live carried dirs — racer B saw skipped dirs absent (in A's
+  staging), carried nothing, swap-deleted A's restored tree; also fixed the
+  nondeterministic double-undo depth lottery. Loser gets RestoreInProgress.
+  kernel-owned (no stale locks). Racing probe also VERIFIED live: the
+  round-1 'two concurrent re-undos benign' claim, and undo-vs-live-hook
+  safety (conflict refusal; forced mid-flight undo clean).
+- **DONE: .git always walked past** (SkipPolicy, before the name/gitignore
+  gate; root-targeted .git still captured). Unknown-command tax was 2x the
+  documented model with .git included; undo no longer rewinds git state
+  behind git's back; oracle ignores .git drift (false-conflict class gone).
+- **DONE: journal bytes count toward DOOVER_MAX_STORE_BYTES** (measured 26x
+  the store, ~2MB/100 commands, previously unbounded by any cap) and
+  idx_actions_target (created idempotently at open) flattens the inline
+  auto-gc pause that grew with retained manifests.
+- **DONE (licensing):** LICENSE+NOTICE now packaged in both crates
+  (published 0.2.x crates shipped NEITHER — Apache §4.1/4.4 gap);
+  doover-core license = 'Apache-2.0 AND CC0-1.0'; NOTICE.md rewritten as a
+  real notice (clean-room policy → docs/CLEANROOM.md; the untrue
+  binpash/try 'we vendor' claim corrected to future-tense-conditional);
+  THIRD-PARTY-LICENSES.txt generated (scripts/third_party_licenses.py,
+  178 packages) and shipped in binary tarballs.
+- **DONE (supply chain):** README installs --locked (unlocked drifted 49
+  deps off the audited set incl. build-script crate cc — verified by
+  running both installs); release.yml gained an audit gate (tags shipped
+  unaudited if an advisory landed after the last push); ci gained an
+  informational Linux bench job (F5: zero Linux numbers existed).
+- **UPSTREAM (maintainer to file):** tree-sitter-bash segfault report
+  (finally drafted) and brush-parser's accidental runtime `insta` dep
+  (build-surface + lockfile advisory exposure; linker dead-strips it).
+- **DONE (round-2 review of the 0.2.3 diff itself: 15 confirmed, 1 refuted;
+  the serious ones fixed pre-commit).** (a) GS1: describes_same_state now
+  compares skipped_dirs — PRE-skipped-but-POST-gone means the command
+  DELETED the dir; ignoring that read opaque `rm -rf .git` as "changed
+  nothing" (this also closes the original phase-1 risk note). Restore warns
+  loudly when a skipped dir no longer exists ("restore CANNOT bring it
+  back"). (b) CIP-1: journal-in-cap would have been PERMANENT pressure —
+  SQLite DELETE never shrinks files; gc now VACUUMs after pruning rows
+  (retention and cap arms) + wal_checkpoint(TRUNCATE), also fixing the
+  WAL-inflation measurement bias (CIP-3). status/gc wording matches the new
+  cap semantics (CIP-2). (c) RL-1: the restore lock is taken BEFORE the
+  conflict oracle (a verdict computed outside the lock could be stale by
+  mutation time — silent overwrite of a racer's finished restore). (d)
+  RL-2: only EWOULDBLOCK maps to RestoreInProgress; other flock errnos
+  (ENOTSUP/ENOLCK on network mounts) surface as real IO errors instead of a
+  phantom "wait for the other restore". (e) GS5: the .git skip requires
+  dir/HEAD to exist — a data dir coincidentally named .git keeps the
+  capture the gitignore gate protects. (f) messages: .git carry says "left
+  to git", never "(regenerable)". (g) THIRD-PARTY licenses script walks the
+  resolve graph (normal+build edges, per release target) — dev-deps and
+  foreign-platform crates no longer misattributed; a missing registry dir
+  is a loud error, not silent "(no license file)"; insta legitimately
+  remains until upstream fixes brush (see the draft issue). LAUNCH.md
+  sanity-check installs --locked.
+  ACCEPTED from this round (recorded, low): GS2 — .git's unversioned files
+  (config/hooks/info-exclude) lost their only net with the skip; the
+  documented tradeoff for the 2x walk tax, revisit if real losses appear.
+  GS3 — rollback capture skips .git so legacy-manifest undo restores .git
+  while a failed-undo rollback carries it (asymmetric but coherent). RL-4 —
+  gc row-eviction racing the restore-to-record window strands an
+  unrecorded-but-applied undo (narrow, loud). GS4(2) — undo of repo-scoped
+  git commands leaves tree/HEAD divergence to `git status`.
+- **ACCEPTED/known:** dedup flattens SPACE not TIME (unchanged-tree unknown
+  cost never amortizes — consequence of the round-2 gc-grace rename fix; do
+  not 'optimize' it away without reading that entry); loss-braid messages
+  from pre-lock races are moot with the lock; journal growth is bounded by
+  retention+cap now but remains manifest-dominated (compression is future
+  work).
 
 ## Carried-forward design risks (address at the step noted; do not forget)
 

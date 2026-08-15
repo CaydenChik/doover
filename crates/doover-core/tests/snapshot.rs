@@ -987,7 +987,10 @@ fn skipped_dirs_survive_the_restore_and_do_not_trip_the_conflict_oracle() {
 // --- the gitignore gate: name alone is a guess, git's ignore is a declaration --
 
 fn git_repo(root: &Path, gitignore: &str) {
-    fs::create_dir_all(root.join(".git")).unwrap(); // enough for repo-root detection
+    fs::create_dir_all(root.join(".git")).unwrap(); // repo-root detection
+    // HEAD makes the fixture a REAL-looking git dir: the .git walk-skip is
+    // gated on it (round-2 GS5 — a data dir merely NAMED .git is captured)
+    write(&root.join(".git/HEAD"), "ref: refs/heads/main");
     write(&root.join(".gitignore"), gitignore);
 }
 
@@ -1033,7 +1036,15 @@ fn a_build_named_dir_that_git_tracks_is_still_captured() {
         !has("node_modules/dep.js"),
         "gitignored + build name -> skipped"
     );
-    assert_eq!(m.skipped_dirs.len(), 2, "only target/ and node_modules/");
+    assert_eq!(
+        m.skipped_dirs.len(),
+        3,
+        "target/, node_modules/, and .git (always walked past since round 2)"
+    );
+    assert!(
+        m.skipped_dirs.iter().any(|p| p.ends_with(".git")),
+        ".git rides the skip/carry machinery"
+    );
 }
 
 /// The flagship case must survive the gate: `.env` is gitignored but is NOT a

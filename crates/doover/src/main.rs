@@ -730,7 +730,7 @@ fn run_gc(keep_days: Option<i64>, dry_run: bool) -> i32 {
             );
             if r.over_cap_bytes_before > 0 {
                 println!(
-                    "store over its size cap by {} KiB before this pass",
+                    "history (store + journal) over its size cap by {} KiB before this pass",
                     r.over_cap_bytes_before / 1024
                 );
             }
@@ -803,27 +803,37 @@ fn run_status() -> i32 {
     }
     println!("store objects: {objects}");
     let budget = doover_core::maintenance::MaintenanceBudget::from_env();
+    // journal bytes count toward the cap since round 2 — the OVER marker must
+    // measure what gc measures, or status contradicts the cap semantics
+    let journal_bytes: u64 = ["journal.db", "journal.db-wal"]
+        .iter()
+        .filter_map(|n| std::fs::metadata(dh.join(n)).ok())
+        .map(|m| m.len())
+        .sum();
     match (store.total_bytes(), budget.cap_bytes) {
-        (Ok(size), Some(cap)) => println!(
-            "store size:   {} / cap {}{}",
-            human_bytes(size),
-            human_bytes(cap),
-            if size > cap {
-                "  (OVER — run `doover gc`)"
-            } else {
-                ""
-            }
-        ),
+        (Ok(size), Some(cap)) => {
+            let total = size.saturating_add(journal_bytes);
+            println!(
+                "store size:   {}  (+ journal = {} / cap {}{})",
+                human_bytes(size),
+                human_bytes(total),
+                human_bytes(cap),
+                if total > cap {
+                    "  OVER — run `doover gc`"
+                } else {
+                    ""
+                }
+            );
+        }
         (Ok(size), None) => println!("store size:   {} (no cap)", human_bytes(size)),
         (Err(e), _) => println!("store size:   unreadable ({e})"),
     }
-    // The journal is NOT part of the store and is NOT subject to the cap, and
-    // at ~31 KB per action it was the largest thing in DOOVER_HOME during the
-    // user-#1 trial while `status` reported the store as "0 MiB". Reporting a
-    // component of your disk usage as absent is how a tool loses trust.
+    // Reported separately too: at ~31 KB per action the journal was the
+    // largest thing in DOOVER_HOME during the user-#1 trial while status
+    // said "0 MiB". It counts toward the cap (round 2) and gc prunes it.
     match std::fs::metadata(dh.join("journal.db")) {
         Ok(m) => println!(
-            "journal:      {} (not capped; pruned by `doover gc`)",
+            "journal:      {} (counted in the cap; pruned by `doover gc`)",
             human_bytes(m.len())
         ),
         Err(_) => println!("journal:      none yet"),

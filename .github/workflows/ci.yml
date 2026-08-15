@@ -80,3 +80,20 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov --workspace --summary-only
+
+  bench-linux:
+    # informational only (round 2, F5: zero Linux perf numbers existed);
+    # never gates merges — read the artifact for ext4 latency numbers
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked -p doover
+      - run: python3 bench/hook_latency.py | tee bench-linux.txt
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux
+          path: bench-linux.txt
+          if-no-files-found: ignore

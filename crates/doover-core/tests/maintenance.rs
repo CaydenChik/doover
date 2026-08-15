@@ -981,3 +981,54 @@ fn unpin_releases_an_action_back_to_gc() {
         "an unpinned action past retention must be collected by the next gc"
     );
 }
+
+/// Round-2 review CIP-1: SQLite DELETE never shrinks the file, so journal
+/// bytes in cap pressure would have been PERMANENT once reached — every
+/// auto-gc destroying all evictable history forever while staying over
+/// budget. gc must VACUUM after pruning rows so the relief is real.
+#[test]
+fn gc_vacuum_shrinks_the_journal_file() {
+    let r = rig();
+    let base = 1_000_000_000_000;
+    // bulk of old manifest-heavy rows, plus a recent anchor
+    for i in 0..40 {
+        r.action_at(
+            &format!("f{i}.txt"),
+            &"x".repeat(2000),
+            base + i,
+            &format!("t{i}"),
+        );
+    }
+    r.action_at("anchor.txt", "recent", base + 10 * DAY_MS, "t-anchor");
+    // WAL mode: writes land in the -wal sidecar until checkpoint, so the
+    // honest metric is the combined on-disk footprint
+    let footprint = || -> u64 {
+        ["journal.db", "journal.db-wal"]
+            .iter()
+            .filter_map(|n| std::fs::metadata(r.dh.join(n)).ok())
+            .map(|m| m.len())
+            .sum()
+    };
+    let before = footprint();
+
+    let report = maintenance::gc(
+        &r.journal,
+        &r.store,
+        &r.dh,
+        &GcOptions {
+            keep_days: 7,
+            dry_run: false,
+            cap_bytes: None,
+            min_free_bytes: None,
+            time_budget: None,
+        },
+    )
+    .unwrap();
+    assert!(report.actions_pruned >= 30, "rig sanity: old rows pruned");
+    let after = footprint();
+    assert!(
+        after < before,
+        "the journal footprint must shrink after pruning ({before} -> {after}); \
+         without VACUUM cap pressure is permanent"
+    );
+}

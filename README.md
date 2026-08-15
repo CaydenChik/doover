@@ -49,10 +49,11 @@ dangerous commands reversible instead.
 
 macOS or Linux (WSL works; native Windows doesn't).
 
-**Cargo** (needs Rust 1.85+):
+**Cargo** (needs Rust 1.85+; `--locked` installs the exact audited
+dependency set the release was built and tested with):
 
 ```console
-$ cargo install doover
+$ cargo install doover --locked
 ```
 
 **Homebrew:**
@@ -118,6 +119,10 @@ A few behaviors worth knowing:
 - **Restoring a whole directory replaces it.** If your shell is sitting
   inside that directory, run `cd .` afterwards to refresh it. doover tells
   you when this happens.
+- **`.git` is left to git.** Whole-tree snapshots walk past `.git` (it is
+  often larger than the working tree, and undo should never rewind
+  repository history behind git's back); undo leaves it exactly as it is.
+  Point a command straight at it (`rm -rf .git`) and it is captured in full.
 - **Build directories are skipped, but only if git agrees.** When doover
   snapshots a whole tree it walks past `target/`, `node_modules/`, `.venv/`
   and friends: a build recreates them, and capturing them would spend the
@@ -209,7 +214,7 @@ alone.
 | `DOOVER_MAX_GLOB_MS` | `2000` | Time limit for resolving one glob's scope (`0` = unlimited); past it the command is treated as unknown |
 | `DOOVER_MAX_FILES` | `100000` | Max files per snapshot |
 | `DOOVER_MAX_BYTES` | `5 GiB` | Max bytes per snapshot |
-| `DOOVER_MAX_STORE_BYTES` | `5 GiB` | Store size cap; oldest history is evicted past it (`0` = uncapped) |
+| `DOOVER_MAX_STORE_BYTES` | `5 GiB` | Size cap for the store **plus journal**; oldest history is evicted past it (`0` = uncapped) |
 | `DOOVER_KEEP_DAYS` | `7` | How long history is kept (`0` = forever) |
 | `DOOVER_GC_EVERY` | `50` | Auto-cleanup every N actions (`0` = manual `gc` only) |
 | `DOOVER_MIN_FREE_BYTES` | `1 GiB` | Warn when disk falls below this |

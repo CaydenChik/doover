@@ -12,7 +12,16 @@ permissions:
   contents: write
 
 jobs:
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo audit (a tag must not ship advisories CI never saw)
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
   build:
+    needs: audit
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +47,8 @@ jobs:
           NAME="doover-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir "$NAME"
           cp "target/${{ matrix.target }}/release/doover" "$NAME/"
-          cp README.md LICENSE NOTICE.md "$NAME/"
+          python3 scripts/third_party_licenses.py
+          cp README.md LICENSE NOTICE.md THIRD-PARTY-LICENSES.txt "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
