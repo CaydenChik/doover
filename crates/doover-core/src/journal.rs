@@ -792,6 +792,16 @@ impl Journal {
         Ok(last)
     }
 
+    /// Test support: flip this connection to query_only so every subsequent
+    /// write fails with SQLITE_READONLY — the shape of a journal that breaks
+    /// AFTER an action was started (dive 2026-08-15 mid-loop finding). Not
+    /// part of the product surface.
+    pub fn set_query_only_for_test(&self) {
+        self.conn
+            .execute_batch("PRAGMA query_only = ON")
+            .expect("PRAGMA query_only");
+    }
+
     /// Test support: rewrite an action's timestamp so retention tests can
     /// construct explicit timelines. Not part of the product surface.
     pub fn set_started_at_for_test(

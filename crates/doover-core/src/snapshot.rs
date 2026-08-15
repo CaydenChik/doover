@@ -1049,16 +1049,23 @@ impl Store {
         let hash = hash_file(tmp)?;
         let len = fs::metadata(tmp).map_err(|e| io_err(tmp, e))?.len();
         let object = self.object_path(&hash);
-        if object.exists() {
-            let _ = fs::remove_file(tmp);
-        } else {
-            let parent = object.parent().expect("object path has parent");
-            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-            fs::rename(tmp, &object).map_err(|e| io_err(&object, e))?;
-            // objects are immutable content AND copies of user files:
-            // owner-read only (D4), never world-readable
-            let _ = fs::set_permissions(&object, fs::Permissions::from_mode(0o400));
-        }
+        let parent = object.parent().expect("object path has parent");
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        // promote by rename EVEN when the object already exists (dedup).
+        // Renaming the fresh clone over the old object atomically leaves a
+        // YOUNG, known-good object: gc's grace window is mtime-based and the
+        // manifest row adopting this hash is journaled only after the walk,
+        // so an old mtime would let a racing gc reap the object out from
+        // under the pending action — and discarding the clone in favor of an
+        // unverified stored object would let silent corruption absorb new
+        // ingests at the one moment we hold provably good bytes. Residual
+        // race, accepted: a gc pass that stat'd the old mtime and is already
+        // between its age check and its unlink can still delete the object;
+        // closing that needs store-wide locking (dive 2026-08-15).
+        fs::rename(tmp, &object).map_err(|e| io_err(&object, e))?;
+        // objects are immutable content AND copies of user files:
+        // owner-read only (D4), never world-readable
+        let _ = fs::set_permissions(&object, fs::Permissions::from_mode(0o400));
         Ok((hash, len))
     }
 

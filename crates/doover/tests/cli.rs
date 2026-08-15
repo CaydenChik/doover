@@ -340,6 +340,69 @@ fn init_refuses_to_clobber_malformed_settings() {
         .stderr(predicate::str::contains("not valid JSON"));
 }
 
+/// Dive finding `init-clobbers-unreadable-settings` (2026-08-15): an
+/// UNREADABLE settings.json (EACCES) used to read as empty via
+/// unwrap_or_default() and get atomically replaced with a doover-only file —
+/// silently destroying the user's permissions/env/MCP config, un-undoable
+/// (init is not a hook path). An IO error on an existing file must refuse;
+/// only genuinely-missing may create. Round 12's rule generalized: an error
+/// must never read as success.
+#[test]
+fn init_refuses_to_replace_unreadable_settings() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    let path = tmp.path().join(".claude/settings.json");
+    let user_config = r#"{"model":"opus","permissions":{"allow":["Bash(ls:*)"]}}"#;
+    std::fs::write(&path, user_config).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("cannot read"));
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        user_config,
+        "init replaced a settings.json it could not read"
+    );
+}
+
+/// The same finding's doctor half: an unreadable settings file used to read
+/// as "hooks not found — run `doover init`", steering the user straight into
+/// the destroying command. Doctor must say what it could not check and must
+/// NOT recommend init over a file that exists.
+#[test]
+fn doctor_reports_unreadable_settings_instead_of_recommending_init() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    let path = tmp.path().join(".claude/settings.json");
+    std::fs::write(&path, "{}").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let assert = Command::cargo_bin("doover")
+        .unwrap()
+        .arg("doctor")
+        .current_dir(tmp.path())
+        .env("DOOVER_HOME", tmp.path().join("dh"))
+        .env_remove("HOME")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cannot read"));
+    let out = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        !out.contains("run `doover init`"),
+        "doctor recommended `doover init` over a settings file it could not read"
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
 #[test]
 fn status_and_gc_and_doctor_run_on_empty_home() {
     let tmp = tempfile::tempdir().unwrap();
@@ -962,5 +1025,63 @@ fn cli_re_undoing_an_already_undone_action_is_a_clean_noop() {
     assert_eq!(
         std::fs::read_to_string(proj.join("data.txt")).unwrap(),
         "precious"
+    );
+}
+
+/// Review of the dive fixes: read_to_string follows symlinks, so a DANGLING
+/// symlink at settings.json read as NotFound and init replaced the LINK with
+/// a regular file — destroying a dotfiles arrangement whose target was merely
+/// unmounted or not yet cloned. A link whose target is missing must refuse.
+#[test]
+fn init_refuses_to_replace_a_dangling_settings_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    let link = tmp.path().join(".claude/settings.json");
+    std::os::unix::fs::symlink(tmp.path().join("missing-target.json"), &link).unwrap();
+
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("symlink"));
+
+    let meta = std::fs::symlink_metadata(&link).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "init replaced a dangling settings symlink with a regular file"
+    );
+}
+
+/// The healthy-symlink half: merging into a symlinked settings.json must
+/// write THROUGH the link (dotfiles setups), not replace the link itself.
+#[test]
+fn init_writes_through_a_healthy_settings_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+    let real = tmp.path().join("dotfiles-settings.json");
+    std::fs::write(&real, r#"{"model":"opus"}"#).unwrap();
+    let link = tmp.path().join(".claude/settings.json");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["init", "--project"])
+        .current_dir(tmp.path())
+        .assert()
+        .success();
+
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "init replaced the settings symlink instead of writing through it"
+    );
+    let target = std::fs::read_to_string(&real).unwrap();
+    assert!(
+        target.contains("doover hook pre") && target.contains("opus"),
+        "the link target must receive the merged config"
     );
 }

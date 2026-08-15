@@ -260,7 +260,35 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
         }
     };
 
-    let existing = std::fs::read_to_string(&settings_path).unwrap_or_default();
+    // an IO error must never read as an empty file: EACCES/EIO here means a
+    // config EXISTS that we cannot see, and "merge" would really be "replace"
+    let existing = match std::fs::read_to_string(&settings_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // read_to_string follows symlinks, so a DANGLING link also reads
+            // NotFound — but a link exists, and the rename below would
+            // replace it with a regular file, silently destroying a dotfiles
+            // arrangement whose target is merely unmounted or not yet cloned
+            if settings_path.symlink_metadata().is_ok() {
+                eprintln!(
+                    "doover: {} is a symlink to a missing target; refusing to \
+                     replace the link — restore its target (or remove the link) \
+                     and re-run",
+                    settings_path.display()
+                );
+                return 1;
+            }
+            String::new()
+        }
+        Err(e) => {
+            eprintln!(
+                "doover: cannot read {} ({e}); refusing to replace a settings \
+                 file that exists but cannot be read — inspect it and re-run",
+                settings_path.display()
+            );
+            return 1;
+        }
+    };
     let mut root: serde_json::Value = if existing.trim().is_empty() {
         serde_json::json!({})
     } else {
@@ -310,7 +338,14 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
         println!("would write {} :\n{rendered}", settings_path.display());
         return 0;
     }
-    if let Some(parent) = settings_path.parent() {
+    // a healthy symlinked settings.json (dotfiles) must be written THROUGH,
+    // not replaced: resolve to the real file so the rename lands there and
+    // the user's link survives. canonicalize fails on a fresh install
+    // (nothing there yet) — fall back to the literal path.
+    let write_path = settings_path
+        .canonicalize()
+        .unwrap_or_else(|_| settings_path.clone());
+    if let Some(parent) = write_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("doover: cannot create {}: {e}", parent.display());
             return 1;
@@ -318,8 +353,8 @@ fn run_init(project: bool, dry_run: bool) -> i32 {
     }
     // atomic replace: settings.json is the USER'S config — a crash mid-write
     // must never leave it torn (write temp in the same dir, then rename)
-    if let Err(e) = write_atomic(&settings_path, &(rendered + "\n")) {
-        eprintln!("doover: cannot write {}: {e}", settings_path.display());
+    if let Err(e) = write_atomic(&write_path, &(rendered + "\n")) {
+        eprintln!("doover: cannot write {}: {e}", write_path.display());
         return 1;
     }
     println!(
@@ -857,11 +892,35 @@ fn run_doctor() -> i32 {
     // `init --project` is a first-class install (audit round 12)
     let mut candidates = vec![std::path::PathBuf::from(".claude/settings.json")];
     if let Some(h) = std::env::var_os("HOME") {
-        candidates.push(std::path::PathBuf::from(h).join(".claude/settings.json"));
+        let global = std::path::PathBuf::from(h).join(".claude/settings.json");
+        // run from $HOME, the relative and global spellings are the same
+        // file — don't check (or warn about) it twice
+        let same = std::path::absolute(&candidates[0]).is_ok_and(|rel| rel == global);
+        if !same {
+            candidates.push(global);
+        }
     }
+    // an unreadable candidate is NOT "not installed": hooks may sit right
+    // there, and recommending `doover init` would steer the user at a file
+    // init itself refuses to touch (dive 2026-08-15)
+    let mut unreadable: Vec<std::path::PathBuf> = Vec::new();
     let installed_at = candidates
         .iter()
-        .find(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains("doover hook pre")));
+        .find(|p| match std::fs::read_to_string(p) {
+            Ok(text) => text.contains("doover hook pre"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => {
+                unreadable.push((*p).clone());
+                false
+            }
+        });
+    for p in &unreadable {
+        println!(
+            "  [warn] cannot read {} — hooks may already be installed there; \
+             fix its permissions and re-run doctor",
+            p.display()
+        );
+    }
     match installed_at {
         Some(p) => {
             println!("  [ok]   Claude Code hooks installed ({})", p.display());
@@ -876,10 +935,12 @@ fn run_doctor() -> i32 {
                 const WRAP_UP_MARGIN_MS: u64 = 2_000;
                 match doover_core::hooks::effective_snapshot_budget() {
                     None => println!(
-                        "  [warn] snapshot budget is UNLIMITED (DOOVER_MAX_SNAPSHOT_MS=0) —                          the {t}s hook timeout can SIGKILL a long snapshot with nothing journaled"
+                        "  [warn] snapshot budget is UNLIMITED (DOOVER_MAX_SNAPSHOT_MS=0) — \
+                         the {t}s hook timeout can SIGKILL a long snapshot with nothing journaled"
                     ),
                     Some(b) if b.as_millis() as u64 + WRAP_UP_MARGIN_MS >= t * 1000 => println!(
-                        "  [warn] snapshot budget ({} ms) leaves no headroom inside the {t}s                          hook timeout — lower DOOVER_MAX_SNAPSHOT_MS or raise the timeout",
+                        "  [warn] snapshot budget ({} ms) leaves no headroom inside the {t}s \
+                         hook timeout — lower DOOVER_MAX_SNAPSHOT_MS or raise the timeout",
                         b.as_millis()
                     ),
                     Some(b) => println!(
@@ -889,6 +950,7 @@ fn run_doctor() -> i32 {
                 }
             }
         }
+        None if !unreadable.is_empty() => {}
         None => println!("  [warn] Claude Code hooks not found — run `doover init`"),
     }
 

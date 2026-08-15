@@ -153,7 +153,7 @@ The interesting parts:
   through `&&` chains, pipes, redirects, globs, and quoting. Anything it
   can't fully account for (command substitution, `eval`, unknown tools) is
   treated as potentially destructive, never assumed safe.
-- **A reversibility registry** of 137 [CC0-licensed](crates/doover-core/registry/)
+- **A reversibility registry** of 152 [CC0-licensed](crates/doover-core/registry/)
   YAML rules classifying the commands agents actually run, from `safe` to
   `irreversible`: what `rm`, `mv`, `git checkout`, `rsync --delete`, `gzip`,
   `wget -O` put at risk, and which paths to capture. Commands proven read-only

@@ -854,3 +854,200 @@ fn a_cwd_snapshot_never_captures_doover_home() {
         "the user's own file must still be captured"
     );
 }
+
+// --- dive 2026-08-15: journal failure mid-loop must not forfeit protection --
+
+/// Dive finding `journal-error-mid-loop-defeats-loud-gap`: `note_gap(..)?` and
+/// `attach_manifest(..)?` inside the pre-hook target loop propagated journal
+/// errors out of the whole handler — remaining targets were never snapshotted
+/// and `PreOutcome.gaps` never existed, so the PROTECTION INCOMPLETE warning
+/// was unreachable exactly when the journal (one of the two duty channels)
+/// was the broken part. A journal failure after start_action must degrade to
+/// loud in-memory gaps while the snapshot side keeps working.
+///
+/// The `.doover-test-journal-ro` marker (debug builds only) flips the hook's
+/// journal connection to query_only right after start_action — the
+/// deterministic cross-platform stand-in for the real trigger (a non-UTF-8
+/// filename failing manifest serialization on Linux, pinned separately below).
+#[test]
+fn journal_failure_mid_loop_keeps_snapshotting_and_stays_loud() {
+    let r = rig();
+    let a = r.cwd.join("aaa");
+    let z = r.cwd.join("zzz");
+    fs::create_dir_all(&a).unwrap();
+    fs::write(a.join("f"), "content-a").unwrap();
+    fs::create_dir_all(&z).unwrap();
+    fs::write(z.join("f"), "content-z").unwrap();
+    fs::create_dir_all(&r.cfg.doover_home).unwrap();
+    fs::write(r.cfg.doover_home.join(".doover-test-journal-ro"), "").unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json("s-jro", "t-jro", &r.cwd, "rm -rf aaa zzz")).unwrap();
+    let out = hooks::handle_pre(&r.cfg, &ev).expect(
+        "a journal write failure mid-loop must degrade to loud gaps, not abort the handler",
+    );
+
+    assert_eq!(
+        out.manifests_attached, 0,
+        "rig sanity: the read-only journal cannot have accepted a manifest"
+    );
+    assert!(
+        !out.gaps.is_empty(),
+        "the in-memory gap channel is the only loud path left and must survive"
+    );
+    // the SUMMARY line specifically — per-target gaps also mention the
+    // journal, so a substring match on "journal" alone would pass even if
+    // the journal_notes_failing summary block were deleted (review TQ-1)
+    assert!(
+        out.gaps
+            .iter()
+            .any(|g| g.contains("journal writes are failing")),
+        "the gap block must carry the journal-sick summary line: {:?}",
+        out.gaps
+    );
+    // the snapshot side kept working: both targets' content was promoted
+    // into the store even though no manifest row could reference it yet
+    let mut objects = 0usize;
+    for shard in fs::read_dir(r.cfg.doover_home.join("store/objects"))
+        .unwrap()
+        .flatten()
+    {
+        objects += fs::read_dir(shard.path()).unwrap().count();
+    }
+    assert!(
+        objects >= 2,
+        "later targets must still be snapshotted after a journal error (got {objects} objects)"
+    );
+}
+
+/// The post-hook twin: a journal error while attaching one path's POST
+/// manifest must not abandon the REMAINING paths' post capture (the conflict
+/// oracle for undo), though the error itself must still surface to the
+/// caller's stderr path.
+#[test]
+fn post_journal_failure_still_captures_remaining_post_state() {
+    let r = rig();
+    let a = r.cwd.join("aaa");
+    let z = r.cwd.join("zzz");
+    fs::create_dir_all(&a).unwrap();
+    fs::write(a.join("f"), "content-a").unwrap();
+    fs::create_dir_all(&z).unwrap();
+    fs::write(z.join("f"), "content-z").unwrap();
+
+    let pre =
+        hooks::parse_pre_event(&pre_json("s-pjro", "t-pjro", &r.cwd, "rm -rf aaa zzz")).unwrap();
+    let out = hooks::handle_pre(&r.cfg, &pre).unwrap();
+    assert_eq!(out.manifests_attached, 2, "rig sanity: healthy pre pass");
+
+    // the command "ran": BOTH dirs changed, so each path's POST capture must
+    // create a new store object. Changing both makes the assertion
+    // order-independent (review TQ-2): pre-fix code snapshots a path BEFORE
+    // the failing attach, so a single changed dir could be captured before
+    // the abort no matter which side of the loop it sat on — only +2 objects
+    // proves the loop genuinely continued past the first journal error.
+    fs::write(a.join("f"), "content-a-CHANGED").unwrap();
+    fs::write(z.join("f"), "content-z-CHANGED").unwrap();
+    let count_objects = || -> usize {
+        let mut n = 0;
+        for shard in fs::read_dir(r.cfg.doover_home.join("store/objects"))
+            .unwrap()
+            .flatten()
+        {
+            n += fs::read_dir(shard.path()).unwrap().count();
+        }
+        n
+    };
+    let before = count_objects();
+    fs::write(r.cfg.doover_home.join(".doover-test-journal-ro"), "").unwrap();
+
+    let post =
+        hooks::parse_post_event(&post_json("s-pjro", "t-pjro", &r.cwd, "rm -rf aaa zzz")).unwrap();
+    let res = hooks::handle_post(&r.cfg, &post);
+    assert!(
+        res.is_err(),
+        "the journal failure must still surface to the binary's warning path"
+    );
+    assert!(
+        count_objects() >= before + 2,
+        "BOTH paths' POST state must still be captured after the first \
+         path's journal error (loop used to abort); got {} new object(s)",
+        count_objects() - before
+    );
+}
+
+/// The real-world trigger behind the mid-loop finding, pinned end-to-end on
+/// the platform where it is constructible: ext4 permits non-UTF-8 filenames,
+/// and serde's PathBuf serialization refuses them — so ONE such file used to
+/// fail `attach_manifest` and forfeit every later target's protection. With
+/// isolation, the poisoned target degrades to a loud gap and the clean one
+/// is fully protected. (APFS enforces UTF-8, hence the Linux gate; the
+/// cross-platform injection test above covers the same loop on macOS.)
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_filename_in_one_target_does_not_forfeit_the_rest() {
+    use std::os::unix::ffi::OsStrExt;
+    let r = rig();
+    // sorts FIRST so the clean target exercises the loop's continuation
+    let evil = r.cwd.join("aaa-evil");
+    fs::create_dir_all(&evil).unwrap();
+    fs::write(
+        evil.join(std::ffi::OsStr::from_bytes(b"bad\xFFname")),
+        "evil",
+    )
+    .unwrap();
+    let good = r.cwd.join("zzz-good");
+    fs::create_dir_all(&good).unwrap();
+    fs::write(good.join("f"), "precious").unwrap();
+
+    let ev = hooks::parse_pre_event(&pre_json(
+        "s-nu8",
+        "t-nu8",
+        &r.cwd,
+        "rm -rf aaa-evil zzz-good",
+    ))
+    .unwrap();
+    let out = hooks::handle_pre(&r.cfg, &ev)
+        .expect("one unserializable manifest must not abort the handler");
+    assert_eq!(
+        out.manifests_attached, 1,
+        "the later, clean target must still be protected"
+    );
+    assert!(
+        out.gaps.iter().any(|g| g.contains("aaa-evil")),
+        "the poisoned target must be a loud gap: {:?}",
+        out.gaps
+    );
+}
+
+/// Review of the dive fixes: the unknown-policy cwd fallback must be FIRST in
+/// the target order. It is the safety floor when anything escaped accounting,
+/// and the targets share ONE deadline — ordered last it can be starved of
+/// budget by a long list of precise targets (the >10k-match glob keeps its
+/// 10,000 captured paths; those alone would consume the whole budget before
+/// the fallback walked a single entry).
+#[test]
+fn cwd_fallback_is_first_in_target_order() {
+    let r = rig();
+    let sub = r.cwd.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    fs::write(sub.join("f"), "x").unwrap();
+    // `rm -rf sub` captures a precise path; the trailing unregistered command
+    // makes the line partially unknown -> cwd fallback joins the targets
+    let ev = hooks::parse_pre_event(&pre_json(
+        "s-ord",
+        "t-ord",
+        &r.cwd,
+        "rm -rf sub; totally-unregistered-cmd",
+    ))
+    .unwrap();
+    let out = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    assert_eq!(out.manifests_attached, 2, "rig sanity: precise + fallback");
+    let pre = journal(&r.cfg)
+        .manifests_by_role(out.action_id, doover_core::journal::ManifestRole::Pre)
+        .unwrap();
+    assert_eq!(
+        pre[0].path,
+        doover_core::resolver::normalize_lexical(&r.cwd),
+        "the cwd fallback must be captured FIRST so precise targets cannot \
+         starve it of the shared snapshot budget"
+    );
+}

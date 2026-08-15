@@ -348,30 +348,77 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
         has_unknown: r.has_unknown,
     })?;
 
+    #[cfg(debug_assertions)]
+    consume_test_journal_ro_marker(cfg, &journal);
+
     // snapshot destructive+ scopes; the unknown policy adds a bounded cwd
-    // snapshot when anything escaped accounting
+    // snapshot when anything escaped accounting. The cwd fallback goes
+    // FIRST: it is the safety floor for whatever escaped accounting, and the
+    // targets share ONE deadline — ordered last it could be starved of
+    // budget by a long precise-target list (dive review 2026-08-15: a
+    // >10k-match glob keeps its 10,000 captured paths, which alone would
+    // exhaust the budget before the fallback walked a single entry)
     let mut targets: Vec<PathBuf> = Vec::new();
-    if r.severity >= Severity::Destructive {
-        targets.extend(r.paths.iter().cloned());
+    let cwd_fallback = (r.has_unknown && cfg.unknown_policy == UnknownPolicy::SnapshotCwd)
+        .then(|| crate::resolver::normalize_lexical(&ev.cwd));
+    if let Some(cwd) = &cwd_fallback {
+        targets.push(cwd.clone());
     }
-    if r.has_unknown && cfg.unknown_policy == UnknownPolicy::SnapshotCwd {
-        let cwd = crate::resolver::normalize_lexical(&ev.cwd);
-        if !targets.contains(&cwd) {
-            targets.push(cwd);
-        }
+    if r.severity >= Severity::Destructive {
+        targets.extend(
+            r.paths
+                .iter()
+                .filter(|p| cwd_fallback.as_ref() != Some(*p))
+                .cloned(),
+        );
     }
 
     let mut attached = 0usize;
     let mut gaps: Vec<String> = Vec::new();
+    let mut journal_notes_failing = false;
     // record a gap both in the journal (for `log`) and in the outcome (for
-    // the binary's runtime warning)
-    let mut note_gap = |journal: &Journal, msg: String| -> Result<(), HookError> {
-        journal.add_note(action, &msg)?;
+    // the binary's runtime warning). The journal write is itself allowed to
+    // fail: the in-memory gap keeps flowing, because when the JOURNAL is the
+    // broken part the stderr warning is the only loud channel left — a
+    // mid-loop journal error used to unwind the whole handler, skipping the
+    // remaining targets AND the warning block (dive 2026-08-15; one
+    // non-UTF-8 filename was a deterministic trigger)
+    fn note_gap(
+        journal: &Journal,
+        action: crate::journal::ActionId,
+        gaps: &mut Vec<String>,
+        failing: &mut bool,
+        msg: String,
+    ) {
+        if journal.add_note(action, &msg).is_err() {
+            *failing = true;
+        }
         gaps.push(msg);
-        Ok(())
+    }
+    // the store failing to open is the same duty-failure class as a sick
+    // journal: the action row exists, so it must surface as a loud gap for
+    // EVERY target, never unwind past the warning block (dive review)
+    let store = if targets.is_empty() {
+        None
+    } else {
+        match Store::open(cfg.doover_home.join("store")) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                note_gap(
+                    &journal,
+                    action,
+                    &mut gaps,
+                    &mut journal_notes_failing,
+                    format!(
+                        "UNPROTECTED: cannot open the snapshot store: {e} — \
+                         no targets were captured"
+                    ),
+                );
+                None
+            }
+        }
     };
-    if !targets.is_empty() {
-        let store = Store::open(cfg.doover_home.join("store"))?;
+    if let Some(store) = &store {
         let deadline = hook_deadline(&cfg.limits);
         for path in &targets {
             let skips = skip_policy_for(path);
@@ -387,34 +434,62 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
                     if manifest.truncated {
                         note_gap(
                             &journal,
+                            action,
+                            &mut gaps,
+                            &mut journal_notes_failing,
                             format!(
                                 "UNPROTECTED: snapshot of {} truncated at limits ({} files skipped)",
                                 path.display(),
                                 manifest.skipped
                             ),
-                        )?;
+                        );
                     }
                     if !manifest.warnings.is_empty() {
                         note_gap(
                             &journal,
+                            action,
+                            &mut gaps,
+                            &mut journal_notes_failing,
                             format!(
                                 "PARTIAL: snapshot gaps at {}: {}",
                                 path.display(),
                                 manifest.warnings.join("; ")
                             ),
-                        )?;
+                        );
                     }
-                    journal.attach_manifest(action, &manifest, ManifestRole::Pre)?;
-                    attached += 1;
+                    match journal.attach_manifest(action, &manifest, ManifestRole::Pre) {
+                        Ok(()) => attached += 1,
+                        Err(e) => note_gap(
+                            &journal,
+                            action,
+                            &mut gaps,
+                            &mut journal_notes_failing,
+                            format!(
+                                "UNPROTECTED: snapshot of {} was captured but could not be \
+                                 journaled: {e} — undo cannot use it",
+                                path.display()
+                            ),
+                        ),
+                    }
                 }
                 Err(e) => {
                     note_gap(
                         &journal,
+                        action,
+                        &mut gaps,
+                        &mut journal_notes_failing,
                         format!("UNPROTECTED: snapshot of {} failed: {e}", path.display()),
-                    )?;
+                    );
                 }
             }
         }
+    }
+    if journal_notes_failing {
+        gaps.push(
+            "journal writes are failing: some or all of the gaps above may be \
+             missing from `doover log`"
+                .to_string(),
+        );
     }
 
     Ok(PreOutcome {
@@ -425,39 +500,90 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
     })
 }
 
+/// Test-only failure injection (debug builds): a marker file in DOOVER_HOME
+/// flips the hook's journal connection read-only AFTER the action row exists —
+/// the mid-loop journal failure tests cannot otherwise reach deterministically
+/// on every platform. Single-shot and loud by design: the marker is consumed
+/// on read and announced on stderr, so a stray or planted marker degrades ONE
+/// invocation visibly instead of silently disabling journaling forever
+/// (review 2026-08-15: DOOVER_HOME is writable by the supervised agent).
+/// Release builds — everything users install — never check for it.
+#[cfg(debug_assertions)]
+fn consume_test_journal_ro_marker(cfg: &HookConfig, journal: &Journal) {
+    let marker = cfg.doover_home.join(".doover-test-journal-ro");
+    if marker.exists() {
+        let _ = std::fs::remove_file(&marker);
+        eprintln!("doover: TEST-ONLY journal failure injection active (debug build, single-shot)");
+        journal.set_query_only_for_test();
+    }
+}
+
 pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookError> {
     let journal = open_journal(cfg)?;
     let action = journal.complete_by_tool_use(&ev.session_id, &ev.tool_use_id, ev.duration_ms)?;
+
+    // test-only failure injection: see handle_pre
+    #[cfg(debug_assertions)]
+    consume_test_journal_ro_marker(cfg, &journal);
 
     // capture POST state for every path we pre-snapshotted: it is what redo
     // restores, and the conflict oracle for undo ("is the world still as the
     // action left it?"). Failures degrade to journal notes — undo still works
     // from the pre-manifests, just without conflict verification.
     let pre = journal.manifests_by_role(action, ManifestRole::Pre)?;
-    if !pre.is_empty() {
-        let store = Store::open(cfg.doover_home.join("store"))?;
+    let mut first_journal_err: Option<HookError> = None;
+    let store = if pre.is_empty() {
+        None
+    } else {
+        match Store::open(cfg.doover_home.join("store")) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                // same isolation as the pre loop: note it, keep going (the
+                // action still completes; only conflict verification is lost)
+                let _ = journal.add_note(
+                    action,
+                    &format!(
+                        "post-state snapshots skipped: cannot open the store: {e} \
+                         (redo/conflict checks unavailable)"
+                    ),
+                );
+                first_journal_err = Some(e.into());
+                None
+            }
+        }
+    };
+    if let Some(store) = &store {
         let deadline = hook_deadline(&cfg.limits);
         for m in &pre {
             let skips = skip_policy_for(&m.path);
-            match store.snapshot_scoped(
+            let recorded = match store.snapshot_scoped(
                 &m.path,
                 Some(&slice_limits(&cfg.limits, deadline)),
                 std::slice::from_ref(&cfg.doover_home),
                 &skips,
             ) {
-                Ok(post) => journal.attach_manifest(action, &post, ManifestRole::Post)?,
+                Ok(post) => journal.attach_manifest(action, &post, ManifestRole::Post),
                 Err(e) => journal.add_note(
                     action,
                     &format!(
                         "post-state snapshot of {} failed: {e} (redo/conflict checks unavailable)",
                         m.path.display()
                     ),
-                )?,
+                ),
+            };
+            // a journal error must not abandon the REMAINING paths' post
+            // capture (same isolation as the pre loop); the first error
+            // still surfaces to the binary's warning path after the loop
+            if let Err(e) = recorded {
+                first_journal_err.get_or_insert(e.into());
             }
         }
     }
     maybe_gc(cfg, &journal, action);
-    Ok(action)
+    match first_journal_err {
+        Some(e) => Err(e),
+        None => Ok(action),
+    }
 }
 
 /// How long a free-space breach waits between triggered passes. A low disk

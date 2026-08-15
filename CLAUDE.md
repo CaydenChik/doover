@@ -275,6 +275,72 @@ All fixes verified red-first by reverting in a worktree.
   old-correct and new-correct code. A regression test passing on old-correct code
   is right, not dishonest.
 
+## The 2026-08-15 deep-dive (29-agent audit + adversarial review of the fixes)
+
+A full-repo dive (8 subsystem maps → 5 hunt lenses → triage → 14 adversarial
+verifications, report in `../doover-deep-dive.md`) confirmed 14 findings; the
+four smallest/highest-value were fixed the same day, and the fix diff itself
+went through a 6-lens adversarial review (14 more findings, 6 refuted) before
+commit. Pins live in `tests/dive_regressions.rs` + additions to
+`tests/hooks.rs` / `cli.rs`.
+
+- **DONE: glob >10k-match cap marks unknown** (resolver.rs) — the excess used
+  to be silently unprotected while `contributed>0` defeated the no-paths
+  fallback; the brace cap always had the correct pattern. The review then
+  showed the routed fallback was STARVED: targets share one deadline and the
+  cwd fallback was ordered last, after 10,000 single-file snapshots. The cwd
+  fallback is now FIRST in the target order. ACCEPTED (loud-gap tier):
+  beyond-cap coverage is budget-bounded best-effort — the guarantee is the
+  journaled gap, not a snapshot.
+- **DONE: dedup re-promotes by rename** (snapshot.rs ingest_via). Adopting an
+  existing object used to leave its old mtime, so gc's round-14 grace window
+  (mtime-based) could not shield a pending action's just-adopted hash — the
+  exact mirror of round 14's "old row with a fresh object" assumption. The
+  fresh clone now renames over the existing object (atomic, young mtime,
+  known-good bytes — also stops a corrupted object absorbing new captures).
+  ACCEPTED residual: a gc pass already between its mtime stat and its unlink
+  can still reap the object; closing that needs store-wide locking.
+- **DONE: journal/store failure mid-hook degrades, never unwinds** (hooks.rs).
+  `note_gap(..)?`/`attach_manifest(..)?`/`Store::open(..)?` after
+  start_action used to abort remaining targets AND the PROTECTION INCOMPLETE
+  block — one non-UTF-8 filename (serde refuses non-UTF-8 paths) forfeited a
+  whole action's protection on Linux. Gaps now flow in-memory even when
+  add_note fails (summary line says `doover log` may be incomplete — "some or
+  all", a sticky bool cannot know which); attach failures become explicit
+  gaps; the post loop finishes all paths and surfaces the first error after.
+  Test injection: `.doover-test-journal-ro` marker in DOOVER_HOME, DEBUG
+  BUILDS ONLY, consumed on read + loud stderr line (an agent-planted marker
+  degrades one invocation visibly, never silently forever). The real
+  non-UTF-8 trigger is pinned Linux-gated — it compiles/runs only in the
+  ubuntu CI leg, never on the macOS dev machine.
+- **DONE: init IO-error and symlink honesty** (main.rs). An unreadable
+  settings.json read as empty via `unwrap_or_default()` and was atomically
+  REPLACED with a doover-only file (un-undoable — init is not a hook path),
+  while doctor read the same failure as "hooks not found — run `doover
+  init`". Reads now refuse on any non-NotFound error; a dangling settings
+  symlink refuses (read follows links, so it looked like NotFound and the
+  rename destroyed the link); a healthy symlink is written THROUGH
+  (canonicalize before write_atomic); doctor reports what it could not read
+  and never recommends init at it.
+- **STILL OPEN (Phase C, do next, in order): the restore-side
+  data-destroyers.** (1) restore() failure arms delete carried live skipped
+  dirs (never-captured `node_modules/` etc.) with no move-back, and the
+  rollback message lies ("nothing changed"); (2) undo of a cwd manifest with
+  DOOVER_HOME nested inside swap-deletes the live store/journal — the
+  round-21 exclusion exists ONLY on the hook path, not in undo's rollback
+  capture (`store.snapshot(path, None)`, no excludes, no limits) nor in
+  restore/carry; (3) redirect scoping holes: all-digit targets (`> 2024`)
+  return before contribute() and classify Safe (executed repro), glob
+  redirect targets resolve literally; (4) the single-file-root snapshot path
+  checks NEITHER limits NOR deadline (a >5 GiB file copies in full; a large
+  file on a non-reflink fs blows the 20s hook timeout → SIGKILL, no row);
+  (5) resolve()-time glob expansion has NO budget at all and runs BEFORE
+  start_action (unverified, possibly worse than 4).
+- **PROCESS: 0.2.0 shipped with audits but no second real-agent trial.** The
+  user-#1 lesson stands: contact with reality, not audit rounds, finds the
+  bugs that matter. Run a live trial on the released build before trusting
+  this round's fixes.
+
 ## Carried-forward design risks (address at the step noted; do not forget)
 
 - **DONE (D4): data-at-rest lockdown.** `ensure_private_home()` (hooks.rs)

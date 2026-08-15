@@ -1,13 +1,15 @@
-# Homebrew formula for doover. At launch this file moves to the public tap
-# repo (CaydenChik/homebrew-doover, Formula/doover.rb); the sha256 values
-# come from the SHA256SUMS asset of the tagged GitHub release.
+# TEMPLATE for the Homebrew formula. The LIVE formula is
+# Formula/doover.rb in the public tap repo (CaydenChik/homebrew-doover);
+# on each release, update that copy with the new version and the four
+# sha256 values from the SHA256SUMS asset of the tagged GitHub release
+# (see LAUNCH.md step 4). This file only tracks the intended shape.
 #
 #   brew tap caydenchik/doover
 #   brew install doover
 class Doover < Formula
   desc "Undo for AI agent shell commands"
   homepage "https://github.com/CaydenChik/doover"
-  version "0.1.0"
+  version "0.2.0"
   license "Apache-2.0"
 
   on_macos do

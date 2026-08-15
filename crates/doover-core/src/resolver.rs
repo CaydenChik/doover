@@ -107,6 +107,7 @@ const MAX_LITERAL_DEPTH: usize = 64;
 /// Cap on brace-expansion fan-out; beyond it the scope is treated as unknown
 /// rather than materializing a huge path list.
 const MAX_BRACE_EXPANSION: usize = 1024;
+const MAX_GLOB_MATCHES: usize = 10_000;
 
 /// Generous stack for the recursive-descent parser on pathological inputs;
 /// panics anywhere in resolution degrade to a conservative Unknown.
@@ -661,7 +662,23 @@ impl Walker<'_> {
         match glob::glob(&pattern) {
             Ok(matches) => {
                 let mut n = 0usize;
-                for m in matches.take(10_000).flatten() {
+                let mut seen = 0usize;
+                for m in matches.flatten() {
+                    seen += 1;
+                    if seen > MAX_GLOB_MATCHES {
+                        // matches past the enumeration cap are invisible to
+                        // scoping — the scope as a whole is unresolvable
+                        // (mirror of the brace fan-out cap above). Keep the
+                        // paths already captured (they still get precise
+                        // snapshots); has_unknown routes the cwd fallback,
+                        // which the hook orders FIRST so this long path list
+                        // cannot starve it of budget. Coverage of the excess
+                        // is still budget-bounded best-effort: past the
+                        // shared deadline the guarantee is the loud journaled
+                        // gap, not a snapshot.
+                        self.out.mark_unknown();
+                        break;
+                    }
                     let m_str = m.to_string_lossy();
                     let relative = match &base_prefix {
                         Some(p) => m_str.strip_prefix(p.as_str()).unwrap_or(&m_str),
