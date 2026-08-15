@@ -202,6 +202,7 @@ alone.
 |---|---|---|
 | `DOOVER_HOME` | `~/.doover` | Where snapshots and the journal live |
 | `DOOVER_MAX_SNAPSHOT_MS` | `5000` | Per-hook snapshot time limit (`0` = unlimited) |
+| `DOOVER_MAX_GLOB_MS` | `2000` | Time limit for resolving one glob's scope (`0` = unlimited); past it the command is treated as unknown |
 | `DOOVER_MAX_FILES` | `100000` | Max files per snapshot |
 | `DOOVER_MAX_BYTES` | `5 GiB` | Max bytes per snapshot |
 | `DOOVER_MAX_STORE_BYTES` | `5 GiB` | Store size cap; oldest history is evicted past it (`0` = uncapped) |

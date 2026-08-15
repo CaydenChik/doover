@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.2.1 — 2026-08-15
+
+The restore-hardening release: the remaining confirmed findings from the
+2026-08-15 deep-dive, focused on the paths where doover itself could destroy
+data. All fixes adversarially reviewed before landing.
+
+### Fixed — restore can no longer destroy what it never captured
+
+- **Failure recovery moves carried directories back.** When a restore swaps
+  in the rebuilt tree, live never-captured directories (`node_modules/`,
+  build dirs — and now a nested `~/.doover`) are carried across the swap.
+  Every failure path used to delete the staging directory WITH those live
+  carries inside; now each carry is inventoried and moved back on failure.
+  If a move-back itself fails, staging is preserved and the error (and a
+  durable journal note) names it and the stranded entries.
+- **A nested `DOOVER_HOME` survives undo.** Restoring a working-directory
+  snapshot with `.doover` inside it used to delete the live store and
+  journal (the capture-side exclusion never applied to the restore side),
+  and the undo engine's rollback capture re-ingested the journal into the
+  store. The store now derives its own home and — only when it is nested
+  strictly inside the restored tree — carries it live across the swap,
+  excludes it from rollback capture, ignores it in the conflict oracle
+  (both live drift and stale entries in pre-0.2.1 manifests), and prefers
+  the live home over any captured copy in a legacy manifest.
+- **Honest failure messages.** "The partial restore was rolled back —
+  nothing changed, safe to retry" is now said only when the target really
+  is intact; a disturbed target or preserved staging is reported as such,
+  with recovery instructions, and preserved-staging paths are recorded in
+  the journal.
+- **Undo refuses when it cannot be transactional**: if a complete rollback
+  point cannot be captured (an unreadable file in the tree), the undo is
+  refused up front instead of risking a partial rollback on failure.
+- **Restoring "this path did not exist" refuses to delete a path that now
+  contains the live `DOOVER_HOME`** — the one restore arm that could still
+  take the store and journal with it.
+
+### Fixed — protection
+
+- **Glob resolution is time-bounded** (`DOOVER_MAX_GLOB_MS`, default 2s,
+  ONE shared budget per command line — per-pattern budgets would stack).
+  Scope resolution runs before anything is journaled, and glob's recursive
+  walk follows directory symlinks: two cycle-forming symlinks in one
+  directory made `**` expansion effectively unbounded — the hook was killed
+  by the harness timeout with no journal row at all. Past the budget the
+  command is treated as unknown (working-directory fallback, loud gap).
+- **Single large files respect the snapshot budget.** The single-file
+  snapshot path checked neither size limits nor the deadline, and file
+  copy+hash was uninterruptible — one big file on a non-reflink filesystem
+  could blow past the hook timeout silently. Ingestion is now chunked with
+  per-chunk deadline checks, and over-limit or out-of-time captures
+  truncate loudly.
+- **One unreadable file no longer forfeits a whole tree's snapshot**: the
+  capture continues, the hole is a loud warning, and the manifest is marked
+  truncated so partial-restore protection governs it.
+- **Redirect targets are scoped like bash treats them**: an all-digit
+  filename (`> 2024`) is a real file, not a file descriptor; `>& file`
+  with a non-numeric target is the truncating write bash performs; an
+  unquoted glob target is expanded (one match = that file; none = the
+  literal; several = bash refuses, matches captured anyway).
+
 ## 0.2.0 — 2026-08-15
 
 The trial release: everything found by the first live-agent trial

@@ -31,6 +31,7 @@ use brush_parser::ast;
 use brush_parser::word::{TildeExpr, WordPiece, WordPieceWithSource};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 /// Classification severity. Extends registry [`Effect`] with `Unknown`,
 /// ordered so that a destructive-with-known-scope part still dominates an
@@ -108,6 +109,23 @@ const MAX_LITERAL_DEPTH: usize = 64;
 /// rather than materializing a huge path list.
 const MAX_BRACE_EXPANSION: usize = 1024;
 const MAX_GLOB_MATCHES: usize = 10_000;
+const DEFAULT_GLOB_BUDGET_MS: u64 = 2_000;
+
+/// Wall-clock budget for one glob expansion. Fail-safe parse, matching the
+/// snapshot-budget convention: unset or garbage → the 2s default; an explicit
+/// `0` → unlimited (documented opt-out). 2s glob + 5s snapshot + wrap-up
+/// stays far inside the 20s installed hook timeout, so the loud-gap
+/// guarantee always wins the race.
+fn glob_budget() -> Option<std::time::Duration> {
+    match std::env::var("DOOVER_MAX_GLOB_MS") {
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+            Err(_) => Some(std::time::Duration::from_millis(DEFAULT_GLOB_BUDGET_MS)),
+        },
+        Err(_) => Some(std::time::Duration::from_millis(DEFAULT_GLOB_BUDGET_MS)),
+    }
+}
 
 /// Generous stack for the recursive-descent parser on pathological inputs;
 /// panics anywhere in resolution degrade to a conservative Unknown.
@@ -137,6 +155,7 @@ fn resolve_inner(command: &str, registry: &Registry, ctx: &Ctx) -> Resolution {
         ctx,
         options: brush_parser::ParserOptions::default(),
         out: Out::default(),
+        glob_deadline: glob_budget().map(|d| Instant::now() + d),
     };
     let mut cur = Some(normalize_lexical(ctx.cwd));
     match brush_parser::tokenize_str(command) {
@@ -254,6 +273,13 @@ struct Walker<'a> {
     ctx: &'a Ctx<'a>,
     options: brush_parser::ParserOptions,
     out: Out,
+    /// ONE glob deadline for the whole resolve() — minted once, shared by
+    /// every glob word and every brace-expanded variant. A per-expansion
+    /// budget would stack: N pathological globs x 2s each blows past the
+    /// harness timeout before start_action, re-creating the exact
+    /// SIGKILL-with-no-journal-row blind spot round 19 forbade for
+    /// snapshot budgets (review 2026-08-15).
+    glob_deadline: Option<Instant>,
 }
 
 impl Walker<'_> {
@@ -658,46 +684,101 @@ impl Walker<'_> {
         // The glob crate's require_literal_leading_dot is unreliable (misses
         // `.h*`), so we glob permissively and filter per-component ourselves.
         let base_prefix = base.as_ref().map(|b| format!("{}/", b.to_string_lossy()));
-        let pat_components: Vec<&str> = rem_text.trim_matches('/').split('/').collect();
-        match glob::glob(&pattern) {
-            Ok(matches) => {
-                let mut n = 0usize;
-                let mut seen = 0usize;
-                for m in matches.flatten() {
-                    seen += 1;
-                    if seen > MAX_GLOB_MATCHES {
-                        // matches past the enumeration cap are invisible to
-                        // scoping — the scope as a whole is unresolvable
-                        // (mirror of the brace fan-out cap above). Keep the
-                        // paths already captured (they still get precise
-                        // snapshots); has_unknown routes the cwd fallback,
-                        // which the hook orders FIRST so this long path list
-                        // cannot starve it of budget. Coverage of the excess
-                        // is still budget-bounded best-effort: past the
-                        // shared deadline the guarantee is the loud journaled
-                        // gap, not a snapshot.
-                        self.out.mark_unknown();
-                        break;
-                    }
+        if glob::Pattern::new(&pattern).is_err() {
+            // an unexpandable pattern falls back to the literal; a WRITE
+            // target keeps its deref (review 2026-08-15: hardcoded `false`
+            // here silently dropped write-through-symlink capture for
+            // redirect targets with invalid glob syntax)
+            self.insert_scoped(literal, write_target);
+            return 1;
+        }
+
+        // The expansion runs on a DETACHED walker thread with a wall-clock
+        // budget (DOOVER_MAX_GLOB_MS, default 2s; 0 = unlimited opt-out,
+        // garbage = default — the parse_snapshot_budget convention). resolve()
+        // runs BEFORE start_action, so an unbounded walk here was the one
+        // place the harness timeout could SIGKILL the hook with NO journal
+        // row at all: glob 0.3 follows directory symlinks under `**`, and a
+        // single directory with two cycle-forming symlinks branches k^32 —
+        // measured 66+ seconds of CPU on a four-entry directory (dive
+        // 2026-08-15). Per-item deadline checks cannot fix this: a zero-match
+        // walk completes entirely inside the iterator's first next() call.
+        // On budget expiry: keep the matches already received (they still get
+        // precise snapshots) and mark unknown — identical semantics to the
+        // enumeration-cap overflow below; the abandoned walker does read-only
+        // IO until the (short-lived) hook process exits.
+        let pattern_owned = pattern.clone();
+        let base_prefix_owned = base_prefix.clone();
+        let pat_components_owned: Vec<String> = rem_text
+            .trim_matches('/')
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel::<PathBuf>();
+        std::thread::spawn(move || {
+            let Ok(matches) = glob::glob(&pattern_owned) else {
+                return;
+            };
+            let comps: Vec<&str> = pat_components_owned.iter().map(String::as_str).collect();
+            for m in matches.flatten() {
+                let allowed = {
                     let m_str = m.to_string_lossy();
-                    let relative = match &base_prefix {
+                    let relative = match &base_prefix_owned {
                         Some(p) => m_str.strip_prefix(p.as_str()).unwrap_or(&m_str),
                         None => m_str.trim_start_matches('/'),
                     };
-                    if glob_match_allowed(relative, &pat_components) {
-                        // a glob match is a concrete entry; rm removes the link
-                        // itself, not its target — no deref
-                        self.insert_scoped(normalize_lexical(&m), false);
-                        n += 1;
+                    glob_match_allowed(relative, &comps)
+                };
+                if allowed && tx.send(m).is_err() {
+                    return; // consumer gone (cap or budget) — stop walking
+                }
+            }
+        });
+
+        let deadline = self.glob_deadline;
+        let mut n = 0usize;
+        loop {
+            let received = match deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        self.out.mark_unknown();
+                        break;
+                    }
+                    match rx.recv_timeout(dl - now) {
+                        Ok(m) => Some(m),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            self.out.mark_unknown();
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
                     }
                 }
-                n
+                None => rx.recv().ok(),
+            };
+            let Some(m) = received else {
+                break; // walker finished cleanly
+            };
+            if n + 1 > MAX_GLOB_MATCHES {
+                // matches past the enumeration cap are invisible to scoping —
+                // the scope as a whole is unresolvable (mirror of the brace
+                // fan-out cap above). Keep the paths already captured (they
+                // still get precise snapshots); has_unknown routes the cwd
+                // fallback, which the hook orders FIRST so this long path
+                // list cannot starve it of budget. Coverage of the excess is
+                // still budget-bounded best-effort: past the shared deadline
+                // the guarantee is the loud journaled gap, not a snapshot.
+                self.out.mark_unknown();
+                break;
             }
-            Err(_) => {
-                self.insert_scoped(literal, false);
-                1
-            }
+            // a glob match is a concrete entry; rm removes the link itself,
+            // not its target — no deref for positionals. A WRITE target
+            // (redirect/path-flag) still writes THROUGH a matched symlink,
+            // so those keep their deref.
+            self.insert_scoped(normalize_lexical(&m), write_target);
+            n += 1;
         }
+        n
     }
 
     /// Record a scoped path. When `deref` and the path is a symlink, also scope
@@ -793,10 +874,31 @@ impl Walker<'_> {
                     // input redirects don't write a file, but the target word
                     // itself can execute (`< $(cmd)`), which must not pass as
                     // safe
-                    Kind::Read | Kind::DuplicateInput | Kind::DuplicateOutput => {
+                    Kind::Read | Kind::DuplicateInput => {
                         if let Target::Filename(word) = target {
                             if self.word_can_execute(&word.value) {
                                 self.out.mark_unknown();
+                            }
+                        }
+                        return;
+                    }
+                    // `>&2` duplicates an fd and `>&-` closes one — no write.
+                    // But bash treats `>&word` with a NON-numeric word as
+                    // "redirect stdout+stderr to the file", the same truncating
+                    // write as `&>` (dive 2026-08-15: `echo hi >& log`
+                    // truncated log with zero capture). brush parses BOTH
+                    // shapes as Target::Duplicate, so the word itself decides:
+                    // digit and `-` targets are fd operations; everything else
+                    // routes through redirect_to, which fail-closes on opaque
+                    // words.
+                    Kind::DuplicateOutput => {
+                        if let Target::Filename(word) | Target::Duplicate(word) = target {
+                            let is_fd_form = self.extract_word(&word.value).is_some_and(|w| {
+                                let t = w.text();
+                                t == "-" || (!t.is_empty() && t.chars().all(|c| c.is_ascii_digit()))
+                            });
+                            if !is_fd_form {
+                                self.redirect_to(">", &word.value, cur);
                             }
                         }
                         return;
@@ -834,19 +936,34 @@ impl Walker<'_> {
             return;
         };
         let text = word.text();
-        // numeric target is an fd, not a file
-        if (text.is_empty() && !word.tilde_home) || text.chars().all(|ch| ch.is_ascii_digit()) {
+        if text.is_empty() && !word.tilde_home {
             return;
         }
+        // NOTE: an all-digit target here IS a real file (`> 2024` truncates
+        // ./2024 — dive 2026-08-15). True fd forms never reach this point:
+        // brush parses `>&2`/`2>&1` as Fd/Duplicate targets and the
+        // DuplicateOutput arm screens digit/`-` words before routing here.
         let Some(rule) = self.registry.lookup_redirect(op) else {
             self.out.mark_unknown();
             return;
         };
         self.out.contribute(Severity::from(rule.effect), &rule.id);
-        if let Some(p) = self.resolve_literal(&word, cur) {
-            // redirects WRITE THROUGH symlinks: deref so the clobbered target
-            // content is snapshotted
-            self.insert_scoped(p, true);
+        // bash EXPANDS an unquoted glob in a redirect target: with one match
+        // the write lands on that file, not on the literal pattern (dive
+        // 2026-08-15: `echo x > *.conf` truncated app.conf while the literal
+        // was scoped as Absent). Multi-match is an "ambiguous redirect" error
+        // — no write happens; the matches are captured anyway (harmless
+        // overcapture, never undercapture). add_path also handles the plain
+        // non-glob word (inserts the literal, deref'd as a write target).
+        let n = self.add_path(&word, true, cur, true);
+        if n == 0 {
+            // zero glob matches: with nullglob off, bash creates a file
+            // literally named like the pattern — capture that literal
+            if let Some(p) = self.resolve_literal(&word, cur) {
+                // redirects WRITE THROUGH symlinks: deref so the clobbered
+                // target content is snapshotted
+                self.insert_scoped(p, true);
+            }
         }
     }
 

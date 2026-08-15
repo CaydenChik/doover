@@ -322,20 +322,74 @@ commit. Pins live in `tests/dive_regressions.rs` + additions to
   rename destroyed the link); a healthy symlink is written THROUGH
   (canonicalize before write_atomic); doctor reports what it could not read
   and never recommends init at it.
-- **STILL OPEN (Phase C, do next, in order): the restore-side
-  data-destroyers.** (1) restore() failure arms delete carried live skipped
-  dirs (never-captured `node_modules/` etc.) with no move-back, and the
-  rollback message lies ("nothing changed"); (2) undo of a cwd manifest with
-  DOOVER_HOME nested inside swap-deletes the live store/journal — the
-  round-21 exclusion exists ONLY on the hook path, not in undo's rollback
-  capture (`store.snapshot(path, None)`, no excludes, no limits) nor in
-  restore/carry; (3) redirect scoping holes: all-digit targets (`> 2024`)
-  return before contribute() and classify Safe (executed repro), glob
-  redirect targets resolve literally; (4) the single-file-root snapshot path
-  checks NEITHER limits NOR deadline (a >5 GiB file copies in full; a large
-  file on a non-reflink fs blows the 20s hook timeout → SIGKILL, no row);
-  (5) resolve()-time glob expansion has NO budget at all and runs BEFORE
-  start_action (unverified, possibly worse than 4).
+- **DONE (Phase C, same day): all five queued items landed as 0.2.1**, each
+  design pressure-tested by probe agents before implementation, each pinned
+  in `dive_regressions.rs`. (1) restore keeps a carry INVENTORY: every
+  carried live dir (skipped build dirs AND a nested DOOVER_HOME) is moved
+  back on any failure arm; a failed move-back PRESERVES staging and the
+  error + a journal note name it (`RestoreTargetDisturbed` /
+  `RestoreStagingPreserved`; "nothing changed" is now said only when true).
+  Injection: `.doover-test-restore-swap-fail` / `-moveback-fail` markers in
+  the store root (debug-only, single-shot, loud — the journal-ro precedent).
+  (2) Store derives `home = root.parent()` at open; nested-home protections
+  are GATED on home-strictly-inside-target (ungated they would blind the
+  oracle for every home-contains-target layout — probe amendment 1): undo
+  rollback captures via `snapshot_rollback` (home-excluding), restore
+  carries the live home FIRST and voids under-home entries in legacy
+  manifests (live home beats stale captured copy), compare_state skips home
+  on BOTH live and expected sides. (3) redirect scoping: all-digit targets
+  are real files (fd forms ride brush's Duplicate arms), `>&file`
+  non-numeric = write, glob targets expand (1 match = that file, 0 =
+  literal, >1 = bash refuses; matches captured anyway); corpus cases added.
+  (4) ingestion is CHUNKED with per-8MiB deadline checks (copy and hash;
+  reflink clones hash-bounded too) and the single-file root now respects
+  max_bytes + deadline; per-file ingest errors warn-and-continue and mark
+  the manifest TRUNCATED (refuse-by-default governs). (5) CONFIRMED by
+  probe (symlink cycles under `**` branch k^32 — 66s CPU on a 4-entry dir;
+  relative `ln -s .` links are the pathological form): glob expansion runs
+  on a detached walker thread under `DOOVER_MAX_GLOB_MS` (2s default,
+  fail-safe parse, 0=unlimited); expiry keeps received paths + marks
+  unknown. Per-item deadline checks were proven UNSOUND (a zero-match walk
+  completes inside the iterator's first next()).
+  ACCEPTED residuals (documented, do not "re-fix" blindly): gc's
+  stat-to-unlink instant vs dedup re-promotion; lexical home compare under
+  relative DOOVER_HOME; rescue-recreated parent dirs get default modes; an
+  abandoned glob walker does read-only IO until the hook process exits;
+  rollback capture remains unlimited (complete-or-refused, tracked
+  separately).
+- **DONE (Phase C review round, same day): a 6-lens adversarial review of
+  the 0.2.1 diff confirmed 27 findings; the serious ones fixed before
+  commit.** (a) the glob budget was PER-EXPANSION and stacked (N globs x
+  2s each — the round-19 "budgets must not stack" blind spot reborn in my
+  own fix): now ONE deadline per resolve(), minted on the Walker. (b)
+  rollback capture silently lost complete-or-refused when per-file errors
+  began degrading: a TRUNCATED rollback point now refuses the undo up
+  front (NotUndoable). (c) home nested inside a skipped build dir: the
+  home-first carry pre-created the skipped dir's staging slot → ENOTEMPTY
+  on every retry, a never-converging restore for a layout that worked in
+  0.2.0; the home now rides inside the wholesale skipped-dir carry. (d)
+  the Absent-root restore arm bypassed the whole nested-home gate →
+  RestoreWouldDeleteHome refusal. (e) dir-skeleton truncated manifests
+  (every ingest failed) were permanently InForce and hijacked bare-undo
+  selection → skipped in SELECTION only; explicit id keeps round-18
+  refuse-by-default. (f) smaller: rescue uses symlink_metadata (dangling-
+  symlink carries survive) and carries move-back errnos in the error;
+  write_in_place mid-write failure reports Disturbed, never "nothing
+  changed"; StagingPreserved during a ROLLBACK restore is journaled too;
+  invalid-glob redirect targets keep write-deref; SnapshotError is now
+  #[non_exhaustive] (three variants were added in a 0.x patch bump).
+  ACCEPTED/DEFERRED from the review (revisit deliberately, not
+  accidentally): doctor's orphaned-staging scan looks in the store but
+  staging lives beside the restore TARGET — discovery is inert; the
+  durable journal notes are the record for now. `doover diff` still
+  displays nested-home entries of legacy manifests (display-only,
+  degrade-not-lie unaffected). copy_hash_bounded has no byte cap beyond
+  the stat-time max_bytes check (a TOCTOU-grown file is bounded only by
+  the deadline). The mid-file Budget arm and glob write-deref through a
+  matched SYMLINK are unpinned (timing/fixture cost). chmod-000 rigs
+  assume a non-root runner. No bats/e2e scenario exercises the restore
+  failure arms or nested homes — add one with the debug markers when e2e
+  is next touched.
 - **PROCESS: 0.2.0 shipped with audits but no second real-agent trial.** The
   user-#1 lesson stands: contact with reality, not audit rounds, finds the
   bugs that matter. Run a live trial on the released build before trusting

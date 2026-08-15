@@ -306,6 +306,23 @@ impl<'a> UndoEngine<'a> {
             if pre.is_empty() {
                 continue;
             }
+            // A truncated manifest with NO file entries is a pure directory
+            // skeleton — a snapshot whose every file ingest failed (store
+            // unwritable). It holds nothing restorable, yet truncated→InForce
+            // would offer it to bare undo forever, ahead of real candidates,
+            // and restoring it deletes files (review 2026-08-15). Skip it in
+            // SELECTION only; explicit `undo <id>` still reaches it under the
+            // round-18 refuse-by-default partial gate.
+            let skeleton = pre.iter().all(|m| {
+                m.truncated
+                    && !m
+                        .entries
+                        .iter()
+                        .any(|e| matches!(e.kind, crate::snapshot::EntryKind::File { .. }))
+            });
+            if skeleton {
+                continue;
+            }
             // (a) Did this command change anything? A read-only command that got
             //     a defensive cwd snapshot has POST identical to PRE. Skip it:
             //     "undoing" it would revert later work, not this command.
@@ -501,7 +518,29 @@ impl<'a> UndoEngine<'a> {
         // restore transactionally, so refuse before touching anything.
         let mut rollback: Vec<Manifest> = Vec::with_capacity(restore_set.len());
         for m in restore_set {
-            match self.store.snapshot(&m.path, None) {
+            // snapshot_rollback, not snapshot: with DOOVER_HOME nested inside
+            // the target, a plain capture re-ingested the live journal/store
+            // (unbounded, secret-bearing) into the rollback manifest — round
+            // 21's exclusion applied only to the hook path (dive 2026-08-15)
+            match self.store.snapshot_rollback(&m.path) {
+                // complete-or-refused: a TRUNCATED rollback point (per-file
+                // capture errors now degrade instead of aborting) cannot make
+                // the undo transactional — restoring it on the failure arm
+                // would delete whatever it failed to capture (review
+                // 2026-08-15). Refuse up front, before touching anything.
+                Ok(current) if current.truncated => {
+                    return Err(UndoError::NotUndoable {
+                        id: journal_target.id,
+                        verb: "restored",
+                        reason: format!(
+                            "cannot capture a complete rollback point for {} ({}); \
+                             a partial rollback could destroy data on failure — fix \
+                             the unreadable paths and retry",
+                            m.path.display(),
+                            current.warnings.join("; ")
+                        ),
+                    });
+                }
                 Ok(current) => rollback.push(current),
                 Err(e) => {
                     return Err(UndoError::Snapshot(e));
@@ -522,8 +561,67 @@ impl<'a> UndoEngine<'a> {
                     let mut rollback_failures = Vec::new();
                     for done in rollback.iter().take(i) {
                         if let Err(re) = self.store.restore(done) {
+                            // a ROLLBACK restore can itself strand live data
+                            // in staging; that path must be journaled no
+                            // matter which error started the failure chain
+                            // (review 2026-08-15)
+                            if let SnapshotError::RestoreStagingPreserved {
+                                staging,
+                                remaining,
+                                ..
+                            } = &re
+                            {
+                                let _ = self.journal.add_note(
+                                    journal_target.id,
+                                    &format!(
+                                        "ROLLBACK FAILURE left live data in {} ({} stranded \
+                                         entrie(s)); move it back manually — do not delete",
+                                        staging.display(),
+                                        remaining.len()
+                                    ),
+                                );
+                            }
                             rollback_failures.push(format!("{}: {re}", done.path.display()));
                         }
+                    }
+                    // A restore that failed after DISTURBING the target, or
+                    // that left a staging dir holding live data, must never
+                    // be reported as "nothing changed, safe to retry" (dive
+                    // 2026-08-15). Surface those verbatim — their messages
+                    // carry the recovery instructions — and journal the
+                    // preserved-staging path durably: one stderr line is not
+                    // a record the user can find tomorrow.
+                    match &e {
+                        SnapshotError::RestoreStagingPreserved {
+                            staging, remaining, ..
+                        } => {
+                            let _ = self.journal.add_note(
+                                journal_target.id,
+                                &format!(
+                                    "RESTORE FAILURE left live data in {} ({} stranded \
+                                     entrie(s)); move it back manually — do not delete",
+                                    staging.display(),
+                                    remaining.len()
+                                ),
+                            );
+                            for f in &rollback_failures {
+                                let _ = self.journal.add_note(
+                                    journal_target.id,
+                                    &format!("rollback failure during failed undo: {f}"),
+                                );
+                            }
+                            return Err(UndoError::Snapshot(e));
+                        }
+                        SnapshotError::RestoreTargetDisturbed { .. } => {
+                            for f in &rollback_failures {
+                                let _ = self.journal.add_note(
+                                    journal_target.id,
+                                    &format!("rollback failure during failed undo: {f}"),
+                                );
+                            }
+                            return Err(UndoError::Snapshot(e));
+                        }
+                        _ => {}
                     }
                     if rollback_failures.is_empty() {
                         return Err(UndoError::PartialRolledBack {

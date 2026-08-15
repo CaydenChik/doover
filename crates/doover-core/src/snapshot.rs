@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SnapshotError {
     #[error("io error at {path}: {source}")]
     Io {
@@ -42,6 +43,30 @@ pub enum SnapshotError {
         "manifest entry path {0:?} is not a safe relative path (escapes the root); restore refused"
     )]
     UnsafeManifestPath(PathBuf),
+    #[error("snapshot time budget exhausted while capturing {path}")]
+    Budget { path: String },
+    #[error(
+        "restore of {path} failed after the target had been disturbed: {cause}. Carried \
+         directories were moved back; the target may be partially deleted. Re-run the undo \
+         (with --force if a conflict is reported) to converge"
+    )]
+    RestoreTargetDisturbed { path: PathBuf, cause: String },
+    #[error(
+        "restore failed and the staging directory {staging} could not be fully drained back \
+         ({cause}); it still holds LIVE data: {remaining:?}. Do NOT delete it — move those \
+         entries back into place manually"
+    )]
+    RestoreStagingPreserved {
+        staging: PathBuf,
+        cause: String,
+        remaining: Vec<PathBuf>,
+    },
+    #[error(
+        "restore would delete {path}, which now contains doover's own live home; \
+         refusing — move DOOVER_HOME out of the target (or delete the path yourself) \
+         and re-run"
+    )]
+    RestoreWouldDeleteHome { path: PathBuf },
 }
 
 /// A manifest `rel` must stay inside the restore root: relative, with only
@@ -276,6 +301,14 @@ pub struct RestoreReport {
 pub struct Store {
     objects: PathBuf,
     tmp: PathBuf,
+    /// The store's own DOOVER_HOME, derived lexically as root.parent() at
+    /// open time (the root is always DOOVER_HOME/store at every production
+    /// call site). Gates the nested-home protections: they activate ONLY
+    /// when home is a STRICT descendant of the tree being restored or
+    /// compared — when home contains (or equals) the tree, every path would
+    /// read as "under home" and the protections would blind the oracle and
+    /// no-op restores (dive probe, amendment 1).
+    home: Option<PathBuf>,
     opts: StoreOptions,
 }
 
@@ -298,7 +331,29 @@ impl Store {
         let tmp = root.join("tmp");
         fs::create_dir_all(&objects).map_err(|e| io_err(&objects, e))?;
         fs::create_dir_all(&tmp).map_err(|e| io_err(&tmp, e))?;
-        Ok(Self { objects, tmp, opts })
+        let home = normalize_abs(&root).parent().map(Path::to_path_buf);
+        Ok(Self {
+            objects,
+            tmp,
+            home,
+            opts,
+        })
+    }
+
+    /// When the store's own home is a STRICT descendant of `tree`, its path
+    /// relative to `tree`; otherwise None (gate off — see the field doc).
+    /// Lexical comparison on purpose, matching the round-21 exclusion stance:
+    /// symlink identity games must not dodge it, and the residual (a relative
+    /// DOOVER_HOME resolved from a different cwd) degrades to the old
+    /// behavior, never to new deletion.
+    fn nested_home_rel(&self, tree: &Path) -> Option<PathBuf> {
+        let home = self.home.as_ref()?;
+        let tree_abs = normalize_abs(tree);
+        if home != &tree_abs && home.starts_with(&tree_abs) {
+            home.strip_prefix(&tree_abs).ok().map(Path::to_path_buf)
+        } else {
+            None
+        }
     }
 
     /// Capture the pre-action state of `path` (file, directory tree, symlink,
@@ -309,6 +364,22 @@ impl Store {
         limits: Option<&Limits>,
     ) -> Result<Manifest, SnapshotError> {
         self.snapshot_scoped(path, limits, &[], &SkipPolicy::none())
+    }
+
+    /// Rollback capture for the undo engine: like [`snapshot`](Self::snapshot)
+    /// with no limits (deliberate — a rollback must be complete or refused),
+    /// but with the store's own NESTED home excluded, so undo of a cwd
+    /// manifest never re-ingests the live journal/store. Round 21 closed the
+    /// hook-side capture; this closes the undo side (dive 2026-08-15). The
+    /// strict-descendant gate keeps ordinary layouts (home outside or
+    /// containing the target) on plain unexcluded capture.
+    pub fn snapshot_rollback(&self, path: &Path) -> Result<Manifest, SnapshotError> {
+        match &self.home {
+            Some(h) if self.nested_home_rel(path).is_some() => {
+                self.snapshot_excluding(path, None, std::slice::from_ref(h))
+            }
+            _ => self.snapshot(path, None),
+        }
     }
 
     pub fn snapshot_excluding(
@@ -360,11 +431,36 @@ impl Store {
             Err(e) => return Err(io_err(path, e)),
         };
 
-        // single non-directory root
+        // wall-clock budget: stop the walk (and, since the dive, any single
+        // large file's copy+hash) cleanly before the hook runs past the
+        // harness timeout and is SIGKILLed with nothing journaled (bench D1).
+        // Checked between entries AND per 8 MiB chunk inside file ingestion.
+        let deadline = limits
+            .and_then(|l| l.max_duration)
+            .map(|d| Instant::now() + d);
+
+        // single non-directory root — the same limits apply as in the walk:
+        // this branch is the literal `rm big-file` case and used to consult
+        // NEITHER max_bytes NOR the deadline, so one huge file copied in full
+        // (dive 2026-08-15, `one-large-file-blows-hook-timeout`)
         if !meta.is_dir() || meta.file_type().is_symlink() {
-            match self.classify(path, PathBuf::new(), &meta)? {
-                Captured::Entry(entry) => manifest.entries.push(entry),
-                Captured::Skipped(reason) => {
+            if meta.is_file() && !meta.file_type().is_symlink() {
+                if let Some(l) = limits {
+                    if meta.len() > l.max_bytes || l.max_files < 1 {
+                        manifest.truncated = true;
+                        manifest.skipped = 1;
+                        manifest.warnings.push(format!(
+                            "{}: exceeds snapshot limits ({} bytes); NOT captured",
+                            path.display(),
+                            meta.len()
+                        ));
+                        return Ok(manifest);
+                    }
+                }
+            }
+            match self.classify(path, PathBuf::new(), &meta, deadline) {
+                Ok(Captured::Entry(entry)) => manifest.entries.push(entry),
+                Ok(Captured::Skipped(reason)) => {
                     // the root itself is uncapturable (e.g. a device node):
                     // record an absent-style marker is wrong, so warn and leave
                     // entries empty — restore of an empty Present manifest is a
@@ -374,6 +470,15 @@ impl Store {
                         .warnings
                         .push(format!("{}: {reason}", path.display()));
                 }
+                Err(SnapshotError::Budget { .. }) => {
+                    manifest.truncated = true;
+                    manifest.skipped = 1;
+                    manifest.warnings.push(format!(
+                        "{}: snapshot time budget exhausted mid-file; NOT captured",
+                        path.display()
+                    ));
+                }
+                Err(e) => return Err(e),
             }
             return Ok(manifest);
         }
@@ -382,12 +487,6 @@ impl Store {
         // recording a warning and continuing, never aborting the whole snapshot
         let mut files: u64 = 0;
         let mut bytes: u64 = 0;
-        // wall-clock budget: stop the walk cleanly before the hook runs past the
-        // harness timeout and is SIGKILLed with nothing journaled (bench D1).
-        // Checked between entries, so overshoot is bounded by one entry's cost.
-        let deadline = limits
-            .and_then(|l| l.max_duration)
-            .map(|d| Instant::now() + d);
         // normalized exclusion roots (DOOVER_HOME): any entry at or under one
         // is pruned so doover never snapshots its own state
         let excludes: Vec<PathBuf> = exclude.iter().map(|p| normalize_abs(p)).collect();
@@ -468,11 +567,40 @@ impl Store {
                 files += 1;
                 bytes += meta.len();
             }
-            match self.classify(item.path(), rel, &meta)? {
-                Captured::Entry(entry) => manifest.entries.push(entry),
-                Captured::Skipped(reason) => manifest
+            match self.classify(item.path(), rel, &meta, deadline) {
+                Ok(Captured::Entry(entry)) => manifest.entries.push(entry),
+                Ok(Captured::Skipped(reason)) => manifest
                     .warnings
                     .push(format!("{}: {reason}", item.path().display())),
+                Err(SnapshotError::Budget { .. }) => {
+                    // the budget died inside one file's copy/hash: same loud
+                    // truncation contract as the between-entries check above
+                    manifest.truncated = true;
+                    manifest.skipped += 1;
+                    manifest.warnings.push(format!(
+                        "snapshot time budget exceeded mid-file at {}; PARTIAL coverage — \
+                         stopped after {} entries",
+                        item.path().display(),
+                        manifest.entries.len()
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    // one uncapturable file (EACCES on a mode-000 file, a
+                    // TOCTOU-vanished path) must degrade to a loud per-file
+                    // warning, never abort the readable rest of the tree
+                    // (dive 2026-08-15, `unreadable-file-aborts-tree-snapshot`
+                    // — this `?` contradicted the never-abort comment above).
+                    // The manifest is TRUNCATED: coverage genuinely has a
+                    // hole, so the round-18 refuse-by-default partial-restore
+                    // machinery and the truncated-tolerant oracle must govern
+                    // it, exactly as for limit-skipped files.
+                    manifest.truncated = true;
+                    manifest.skipped += 1;
+                    manifest
+                        .warnings
+                        .push(format!("{}: uncapturable ({e})", item.path().display()));
+                }
             }
         }
         Ok(manifest)
@@ -485,6 +613,7 @@ impl Store {
         abs: &Path,
         rel: PathBuf,
         meta: &fs::Metadata,
+        deadline: Option<Instant>,
     ) -> Result<Captured, SnapshotError> {
         use std::os::unix::fs::FileTypeExt;
         let ft = meta.file_type();
@@ -504,7 +633,7 @@ impl Store {
             }));
         }
         if ft.is_file() {
-            return Ok(Captured::Entry(self.file_entry(abs, rel, meta)?));
+            return Ok(Captured::Entry(self.file_entry(abs, rel, meta, deadline)?));
         }
         if ft.is_fifo() {
             // recreated empty; never opened (opening a fifo for read blocks)
@@ -547,9 +676,44 @@ impl Store {
         }
 
         if manifest.root == Root::Absent {
+            // the one restore arm that mutates without the nested-home gate
+            // (review 2026-08-15): if the live home has since moved INSIDE
+            // this path, deleting it would take the store and journal —
+            // unrecoverably, since rollback capture excludes the home
+            if let Some(hr) = self.nested_home_rel(target_root) {
+                if fs::symlink_metadata(target_root.join(&hr)).is_ok() {
+                    return Err(SnapshotError::RestoreWouldDeleteHome {
+                        path: target_root.clone(),
+                    });
+                }
+            }
             remove_any(target_root)?;
             return Ok(report);
         }
+
+        // Legacy manifests (pre-round-21 hooks, or rollback captures from the
+        // old unexcluded undo path) can CONTAIN doover's own nested home.
+        // Those entries are void: materializing a stale journal.db over the
+        // live one would silently destroy every row journaled since the
+        // capture. Filter them from verification (a gc-pruned captured
+        // journal object must not hard-refuse the whole restore) and from the
+        // build; the LIVE home is carried across the swap below. The captured
+        // copy stays reachable in the object store.
+        let home_rel = self.nested_home_rel(target_root);
+        let filtered: Option<Manifest> = match &home_rel {
+            Some(hr) if manifest.entries.iter().any(|e| e.rel.starts_with(hr)) => {
+                report.warnings.push(format!(
+                    "manifest contained doover's own home ({}); live home preserved, \
+                     captured copy ignored (objects remain in the store)",
+                    hr.display()
+                ));
+                let mut m = manifest.clone();
+                m.entries.retain(|e| !e.rel.starts_with(hr));
+                Some(m)
+            }
+            _ => None,
+        };
+        let manifest = filtered.as_ref().unwrap_or(manifest);
 
         // fail-closed verification pass, deduped by hash — before any mutation
         let mut verified = std::collections::BTreeSet::new();
@@ -601,7 +765,15 @@ impl Store {
                         .is_some_and(|n| n > 1)
                     {
                         let object = self.object_path(hash);
-                        self.write_in_place(target_root, &object, *mode, *mtime)?;
+                        // in-place rewrite truncates before writing: a
+                        // mid-write failure (ENOSPC/EIO) leaves the target
+                        // partially written and must never read as "nothing
+                        // changed" (review 2026-08-15)
+                        self.write_in_place(target_root, &object, *mode, *mtime)
+                            .map_err(|e| SnapshotError::RestoreTargetDisturbed {
+                                path: target_root.clone(),
+                                cause: e.to_string(),
+                            })?;
                         report.files_restored += 1;
                         return Ok(report);
                     }
@@ -634,10 +806,37 @@ impl Store {
             return Err(e);
         }
 
-        // Carry the skipped (never-captured) dirs across the swap. We did not
-        // snapshot target/ or node_modules/, so we have nothing to restore for
-        // them — but swapping in a tree that omits them would DELETE them.
-        // Move them into staging first: undo leaves them exactly as they are.
+        // Carry live never-captured dirs across the swap: first the nested
+        // DOOVER_HOME (round 21 closed the capture side; the swap must never
+        // delete doover's own live store/journal — dive 2026-08-15), then the
+        // skipped build dirs. Every successful carry is recorded in an
+        // inventory so that ANY later failure can move the live data back —
+        // the old failure arms deleted staging WITH the carried dirs inside,
+        // which is the one way restore itself destroyed data it had promised
+        // to leave alone.
+        let mut carried: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if let Some(hr) = &home_rel {
+            // when the home sits INSIDE a to-be-carried skipped dir, the
+            // wholesale carry of that dir preserves it — carrying the home
+            // separately first would pre-create the skipped dir's staging
+            // slot and make the later rename fail ENOTEMPTY on every retry
+            // (review 2026-08-15: a deterministic never-converges restore
+            // for DOOVER_HOME-inside-gitignored-build-dir layouts)
+            let rides_inside_skipped = manifest.skipped_dirs.iter().any(|s| {
+                s.strip_prefix(target_root)
+                    .is_ok_and(|rel| rel_is_safe(rel) && hr.starts_with(rel) && s.exists())
+            });
+            let live_home = target_root.join(hr);
+            if !rides_inside_skipped && fs::symlink_metadata(&live_home).is_ok() {
+                if let Err(e) = carry(&live_home, &staging.join(hr), &mut carried) {
+                    return Err(self.rescue(&staging, &carried, target_root, false, e));
+                }
+                report.warnings.push(format!(
+                    "{}: doover's own home; left as it is now",
+                    hr.display()
+                ));
+            }
+        }
         for skipped in &manifest.skipped_dirs {
             let Ok(rel) = skipped.strip_prefix(target_root) else {
                 continue;
@@ -645,16 +844,8 @@ impl Store {
             if !rel_is_safe(rel) || !skipped.exists() {
                 continue;
             }
-            let dest = staging.join(rel);
-            if let Some(parent) = dest.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    let _ = remove_any(&staging);
-                    return Err(io_err(parent, e));
-                }
-            }
-            if let Err(e) = fs::rename(skipped, &dest) {
-                let _ = remove_any(&staging);
-                return Err(io_err(skipped, e));
+            if let Err(e) = carry(skipped, &staging.join(rel), &mut carried) {
+                return Err(self.rescue(&staging, &carried, target_root, false, e));
             }
             report.warnings.push(format!(
                 "{}: not captured (regenerable); left as it is now",
@@ -663,14 +854,104 @@ impl Store {
         }
 
         if let Err(e) = remove_any(target_root) {
-            let _ = remove_any(&staging);
-            return Err(e);
+            // the target is now (possibly partially) deleted: disturbed class
+            return Err(self.rescue(&staging, &carried, target_root, true, e));
         }
-        if let Err(e) = fs::rename(&staging, target_root) {
-            let _ = remove_any(&staging);
-            return Err(io_err(target_root, e));
+        let swap = if self.consume_test_marker(".doover-test-restore-swap-fail") {
+            Err(io_err(
+                target_root,
+                io::Error::other("injected swap failure (test marker)"),
+            ))
+        } else {
+            fs::rename(&staging, target_root).map_err(|e| io_err(target_root, e))
+        };
+        if let Err(e) = swap {
+            return Err(self.rescue(&staging, &carried, target_root, true, e));
         }
         Ok(report)
+    }
+
+    /// Failure recovery once carries have begun: move every carried live dir
+    /// back (reverse order; parents re-created — a partial remove_any may
+    /// have taken intermediates, and rescue-recreated parents get default
+    /// modes, acceptable because a retry restores the real ones). If all move
+    /// back, staging holds only store-derived content and is deleted — the
+    /// error keeps its original meaning for an intact target, or reports the
+    /// disturbance honestly. If ANY move-back fails, staging is LEFT IN PLACE
+    /// and the error names it and the stranded entries: preserved live data
+    /// beats tidy cleanup.
+    fn rescue(
+        &self,
+        staging: &Path,
+        carried: &[(PathBuf, PathBuf)],
+        target_root: &Path,
+        disturbed: bool,
+        cause: SnapshotError,
+    ) -> SnapshotError {
+        let mut inject_fail = self.consume_test_marker(".doover-test-restore-moveback-fail");
+        let mut remaining: Vec<PathBuf> = Vec::new();
+        let mut reasons: Vec<String> = Vec::new();
+        for (live, staged) in carried.iter().rev() {
+            // symlink_metadata, not exists(): a carried dangling-symlink home
+            // reads as absent through exists() and would be deleted with
+            // staging — the exact class this function protects
+            if fs::symlink_metadata(staged).is_err() {
+                continue;
+            }
+            if let Some(parent) = live.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let attempt = if inject_fail {
+                inject_fail = false;
+                Err(io::Error::other("injected move-back failure (test marker)"))
+            } else {
+                fs::rename(staged, live)
+            };
+            if let Err(e) = attempt {
+                reasons.push(format!("{}: {e}", live.display()));
+                remaining.push(live.clone());
+            }
+        }
+        if remaining.is_empty() {
+            let _ = remove_any(staging);
+            if disturbed {
+                SnapshotError::RestoreTargetDisturbed {
+                    path: target_root.to_path_buf(),
+                    cause: cause.to_string(),
+                }
+            } else {
+                cause
+            }
+        } else {
+            // the move-back errno dictates the user's manual fix — carry it
+            SnapshotError::RestoreStagingPreserved {
+                staging: staging.to_path_buf(),
+                cause: format!("{cause}; move-back failures: {}", reasons.join("; ")),
+                remaining,
+            }
+        }
+    }
+
+    /// Debug-build single-shot failure-injection marker in the store root —
+    /// same contract as the hook-side `.doover-test-journal-ro` marker:
+    /// consumed on read, loud, and never checked by release builds.
+    fn consume_test_marker(&self, name: &str) -> bool {
+        if !cfg!(debug_assertions) {
+            return false;
+        }
+        let Some(root) = self.objects.parent() else {
+            return false;
+        };
+        let marker = root.join(name);
+        if marker.exists() {
+            let _ = fs::remove_file(&marker);
+            eprintln!(
+                "doover: TEST-ONLY restore failure injection: {name} (debug build, single-shot)"
+            );
+            true
+        } else {
+            false
+        }
     }
 
     /// Materialize `manifest` at `base` (a fresh staging path). Directory modes
@@ -825,9 +1106,17 @@ impl Store {
         if fs::symlink_metadata(root).is_err() {
             return Ok(false);
         }
+        // A nested DOOVER_HOME is invisible to the oracle on BOTH sides:
+        // live (running doover mutates its own journal, so a nested layout
+        // would otherwise conflict SYSTEMATICALLY, training users onto
+        // --force) and expected (legacy manifests captured .doover before
+        // round 21; those entries can never match and must not count).
+        // Gated on home-strictly-inside-root, like restore (dive 2026-08-15).
+        let home_rel = self.nested_home_rel(root);
         let expected: BTreeMap<&Path, &EntryKind> = manifest
             .entries
             .iter()
+            .filter(|e| !home_rel.as_ref().is_some_and(|hr| e.rel.starts_with(hr)))
             .map(|e| (e.rel.as_path(), &e.kind))
             .collect();
         // The snapshot deliberately did not capture these (build dirs). The
@@ -848,6 +1137,14 @@ impl Store {
                 continue;
             }
             let rel = item.path().strip_prefix(root).unwrap_or(item.path());
+            if let Some(hr) = &home_rel {
+                if rel.starts_with(hr) {
+                    if item.file_type().is_dir() {
+                        walker.skip_current_dir();
+                    }
+                    continue;
+                }
+            }
             let Ok(meta) = fs::symlink_metadata(item.path()) else {
                 return Ok(false);
             };
@@ -1011,8 +1308,9 @@ impl Store {
         src: &Path,
         rel: PathBuf,
         meta: &fs::Metadata,
+        deadline: Option<Instant>,
     ) -> Result<Entry, SnapshotError> {
-        let (hash, len) = self.ingest(src)?;
+        let (hash, len) = self.ingest(src, deadline)?;
         Ok(Entry {
             rel,
             kind: EntryKind::File {
@@ -1027,26 +1325,38 @@ impl Store {
 
     /// Clone-then-hash: the clone freezes the content, so the recorded hash is
     /// correct even if the source mutates mid-snapshot.
-    fn ingest(&self, src: &Path) -> Result<(String, u64), SnapshotError> {
+    fn ingest(
+        &self,
+        src: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<(String, u64), SnapshotError> {
         let tmp = self.tmp_path();
         // any failure after the tmp file exists must remove it NOW — leaking
         // partials until clean_tmp's hour-long age gate would stack copies on
         // a disk that is likely already strained (ENOSPC is a failure mode
         // this path must expect)
-        let result = self.ingest_via(src, &tmp);
+        let result = self.ingest_via(src, &tmp, deadline);
         if result.is_err() {
             let _ = fs::remove_file(&tmp);
         }
         result
     }
 
-    fn ingest_via(&self, src: &Path, tmp: &Path) -> Result<(String, u64), SnapshotError> {
-        if self.opts.force_copy {
-            fs::copy(src, tmp).map_err(|e| io_err(src, e))?;
+    fn ingest_via(
+        &self,
+        src: &Path,
+        tmp: &Path,
+        deadline: Option<Instant>,
+    ) -> Result<(String, u64), SnapshotError> {
+        let hash = if self.opts.force_copy {
+            copy_hash_bounded(src, tmp, deadline)?
+        } else if reflink_copy::reflink(src, tmp).is_ok() {
+            // instant CoW clone; hashing still reads every byte — bound it
+            hash_file_bounded(tmp, deadline)?
         } else {
-            reflink_copy::reflink_or_copy(src, tmp).map_err(|e| io_err(src, e))?;
-        }
-        let hash = hash_file(tmp)?;
+            // non-reflink filesystem: chunked copy+hash in one bounded pass
+            copy_hash_bounded(src, tmp, deadline)?
+        };
         let len = fs::metadata(tmp).map_err(|e| io_err(tmp, e))?.len();
         let object = self.object_path(&hash);
         let parent = object.parent().expect("object path has parent");
@@ -1141,6 +1451,22 @@ fn read_xattrs(path: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+/// Move one live never-captured dir into staging, recording the (live,
+/// staged) pair in the inventory ONLY after the rename succeeds — rename(2)
+/// is atomic, so a failed carry leaves the live dir untouched and un-listed.
+fn carry(
+    live: &Path,
+    dest: &Path,
+    carried: &mut Vec<(PathBuf, PathBuf)>,
+) -> Result<(), SnapshotError> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    fs::rename(live, dest).map_err(|e| io_err(live, e))?;
+    carried.push((live.to_path_buf(), dest.to_path_buf()));
+    Ok(())
+}
+
 fn remove_any(path: &Path) -> Result<(), SnapshotError> {
     match fs::symlink_metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -1188,6 +1514,69 @@ pub fn free_bytes(_path: &Path) -> Option<u64> {
 }
 
 const MMAP_THRESHOLD: u64 = 1024 * 1024;
+
+const INGEST_CHUNK: usize = 8 << 20;
+
+/// Chunked copy+hash in one pass with a wall-clock bound checked per chunk.
+/// Hashes exactly the bytes written to `tmp`, preserving the clone-then-hash
+/// invariant (the recorded hash always describes the tmp/object content, even
+/// if the source mutates mid-copy). One large file used to be a single
+/// uninterruptible entry: on a non-reflink filesystem it could blow straight
+/// past the harness timeout — SIGKILL, no manifest, no loud gap (dive
+/// 2026-08-15, `one-large-file-blows-hook-timeout`).
+fn copy_hash_bounded(
+    src: &Path,
+    tmp: &Path,
+    deadline: Option<Instant>,
+) -> Result<String, SnapshotError> {
+    use std::io::{Read, Write};
+    let mut input = fs::File::open(src).map_err(|e| io_err(src, e))?;
+    let mut out = fs::File::create(tmp).map_err(|e| io_err(tmp, e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; INGEST_CHUNK];
+    loop {
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return Err(SnapshotError::Budget {
+                    path: src.display().to_string(),
+                });
+            }
+        }
+        let n = input.read(&mut buf).map_err(|e| io_err(src, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n]).map_err(|e| io_err(tmp, e))?;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// `hash_file` with a wall-clock bound checked per chunk — a reflink clone is
+/// created instantly, but HASHING it still reads every byte. With no deadline,
+/// defers to the fast mmap path.
+fn hash_file_bounded(path: &Path, deadline: Option<Instant>) -> Result<String, SnapshotError> {
+    let Some(dl) = deadline else {
+        return hash_file(path);
+    };
+    use std::io::Read;
+    let mut input = fs::File::open(path).map_err(|e| io_err(path, e))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; INGEST_CHUNK];
+    loop {
+        if Instant::now() >= dl {
+            return Err(SnapshotError::Budget {
+                path: path.display().to_string(),
+            });
+        }
+        let n = input.read(&mut buf).map_err(|e| io_err(path, e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
 
 pub(crate) fn hash_file(path: &Path) -> Result<String, SnapshotError> {
     let len = fs::metadata(path).map_err(|e| io_err(path, e))?.len();

@@ -486,3 +486,121 @@ fn undo_refuses_to_swap_in_a_truncated_partial_capture() {
         report.warnings
     );
 }
+
+// --- dive review 2026-08-15: honest failure surfacing through the engine ---
+
+/// A restore that strands live data in staging must surface the staging path
+/// VERBATIM (not "nothing changed, safe to retry") and journal it durably —
+/// one stderr line is not a record the user can find tomorrow. Drives the
+/// debug-only single-shot markers through the real engine.
+#[test]
+fn failed_restore_surfaces_preserved_staging_and_journals_it() {
+    let r = rig();
+    fs::create_dir_all(r.cwd.join("node_modules")).unwrap();
+    fs::write(r.cwd.join("node_modules/dep.js"), "SENTINEL").unwrap();
+    fs::write(r.cwd.join("data.txt"), "v1").unwrap();
+    // partially-unknown line -> cwd manifest with node_modules as a skipped
+    // (carried) dir, so the restore has a carry to strand
+    let id = r.run("s-sp", "t-sp", "rm -f data.txt; totally-unregistered-zz");
+
+    for m in [
+        ".doover-test-restore-swap-fail",
+        ".doover-test-restore-moveback-fail",
+    ] {
+        fs::write(r.cfg.doover_home.join("store").join(m), "").unwrap();
+    }
+    let j = r.journal();
+    let s = r.store();
+    let engine = UndoEngine::new(&j, &s);
+    let err = engine
+        .undo(Selector::Action(id), true, false)
+        .expect_err("the injected swap+moveback failure must fail the undo");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("LIVE data") && msg.contains(".doover-restore-"),
+        "the error must name the preserved staging verbatim: {msg}"
+    );
+    assert!(
+        !msg.contains("nothing changed"),
+        "a stranded-staging failure must never claim nothing changed: {msg}"
+    );
+    let note = j.action(id).unwrap().note.unwrap_or_default();
+    assert!(
+        note.contains("left live data in"),
+        "the staging path must be journaled durably, got note: {note:?}"
+    );
+}
+
+/// Complete-or-refused: if the rollback point cannot be captured completely
+/// (an unreadable file now sits in the tree), the undo must refuse up front
+/// instead of proceeding with a rollback that would delete what it failed to
+/// capture on the failure arm.
+#[test]
+fn truncated_rollback_point_refuses_the_undo() {
+    let r = rig();
+    fs::write(r.cwd.join("data.txt"), "v1").unwrap();
+    let id = r.run("s-tr", "t-tr", "rm -f data.txt; totally-unregistered-zz");
+
+    fs::create_dir_all(r.cwd.join("d")).unwrap();
+    fs::write(r.cwd.join("d/locked"), "x").unwrap();
+    fs::set_permissions(r.cwd.join("d/locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let j = r.journal();
+    let s = r.store();
+    let engine = UndoEngine::new(&j, &s);
+    let err = engine
+        .undo(Selector::Action(id), true, false)
+        .expect_err("an incomplete rollback point must refuse");
+    fs::set_permissions(r.cwd.join("d/locked"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        err.to_string().contains("complete rollback point"),
+        "got: {err}"
+    );
+    assert_eq!(
+        r.read("data.txt"),
+        None,
+        "refusal must happen BEFORE any restore touches the tree"
+    );
+}
+
+/// A truncated manifest with zero file entries (every ingest failed — store
+/// unwritable) is a pure directory skeleton: nothing restorable, yet
+/// truncated→InForce would offer it to bare undo forever, ahead of real
+/// candidates. Selection must skip it; the real action behind it must win.
+#[test]
+fn bare_undo_skips_skeleton_manifests() {
+    let r = rig();
+    fs::write(r.cwd.join("real.txt"), "keep").unwrap();
+    let a = r.run("s-sk", "t-a", "rm -f real.txt");
+
+    // newer action whose every file ingest fails: dir-skeleton manifest
+    fs::create_dir_all(r.cwd.join("tree")).unwrap();
+    fs::write(r.cwd.join("tree/f"), "x").unwrap();
+    let objects = r.cfg.doover_home.join("store/objects");
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o555)).unwrap();
+    let ev = hooks::parse_pre_event(&mkjson("s-sk", "t-b", &r.cwd, "rm -rf tree", false)).unwrap();
+    hooks::handle_pre(&r.cfg, &ev).unwrap();
+    fs::set_permissions(&objects, fs::Permissions::from_mode(0o755)).unwrap();
+    std::process::Command::new("bash")
+        .args(["--noprofile", "--norc", "-c", "rm -rf tree"])
+        .current_dir(&r.cwd)
+        .status()
+        .unwrap();
+    hooks::handle_post(
+        &r.cfg,
+        &hooks::parse_post_event(&mkjson("s-sk", "t-b", &r.cwd, "rm -rf tree", true)).unwrap(),
+    )
+    .unwrap();
+
+    let j = r.journal();
+    let s = r.store();
+    let engine = UndoEngine::new(&j, &s);
+    let report = engine
+        .undo(Selector::Latest, false, false)
+        .expect("bare undo must skip the skeleton and reach the real action");
+    assert_eq!(
+        report.target_action, a,
+        "the skeleton must not hijack selection"
+    );
+    assert_eq!(r.read("real.txt").as_deref(), Some("keep"));
+}

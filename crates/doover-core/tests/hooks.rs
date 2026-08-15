@@ -252,9 +252,13 @@ fn destructive_with_failed_snapshot_reports_a_protection_gap() {
     fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(outcome.severity >= doover_core::resolver::Severity::Destructive);
+    // Since the dive's per-file isolation fix, a tree whose file ingestions
+    // ALL fail still attaches a dir-skeleton manifest — but it is TRUNCATED
+    // (round-18 refuse-by-default governs any restore of it) and the gap
+    // stays exactly as loud as when nothing was attached at all.
     assert_eq!(
-        outcome.manifests_attached, 0,
-        "the snapshot could not be written"
+        outcome.manifests_attached, 1,
+        "the partial (truncated) manifest is attached; its files are gaps"
     );
     assert!(
         !outcome.gaps.is_empty(),
@@ -1049,5 +1053,37 @@ fn cwd_fallback_is_first_in_target_order() {
         doover_core::resolver::normalize_lexical(&r.cwd),
         "the cwd fallback must be captured FIRST so precise targets cannot \
          starve it of the shared snapshot budget"
+    );
+}
+
+/// Review TQ-3: the per-path snapshot-Err gap arm ("UNPROTECTED: snapshot of
+/// {} failed") lost its only coverage when the round-9 test's tree rig
+/// started yielding Ok(truncated). A SINGLE-FILE target whose ingest fails
+/// still returns Err from snapshot_scoped — re-pin that arm.
+#[test]
+fn single_file_snapshot_error_is_a_loud_gap() {
+    let r = rig();
+    fs::write(r.cwd.join("prime.txt"), "x").unwrap();
+    hooks::handle_pre(
+        &r.cfg,
+        &hooks::parse_pre_event(&pre_json("s0", "t0", &r.cwd, "rm prime.txt")).unwrap(),
+    )
+    .unwrap();
+    let objects = r.cfg.doover_home.join("store/objects");
+    fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    fs::write(r.cwd.join("victim.txt"), "precious").unwrap();
+    let ev = hooks::parse_pre_event(&pre_json("s1", "t1", &r.cwd, "rm victim.txt")).unwrap();
+    let outcome = hooks::handle_pre(&r.cfg, &ev).unwrap();
+    fs::set_permissions(&objects, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(outcome.manifests_attached, 0);
+    assert!(
+        outcome
+            .gaps
+            .iter()
+            .any(|g| g.contains("UNPROTECTED") && g.contains("failed")),
+        "the Err arm's gap must fire for a single-file ingest failure: {:?}",
+        outcome.gaps
     );
 }

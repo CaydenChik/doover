@@ -9,7 +9,7 @@
 class Doover < Formula
   desc "Undo for AI agent shell commands"
   homepage "https://github.com/CaydenChik/doover"
-  version "0.2.0"
+  version "0.2.1"
   license "Apache-2.0"
 
   on_macos do

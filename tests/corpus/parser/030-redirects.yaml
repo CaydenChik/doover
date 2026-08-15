@@ -38,3 +38,27 @@ cases:
   - name: redir-fd-dup-no-path
     cmd: "echo hi >&2"
     expect: { effect: safe, paths: [] }
+
+  # dive 2026-08-15: redirect-target scoping holes
+  - name: redir-all-digit-filename-is-a-file
+    cmd: "echo x > 2024"
+    cwd_fixture: ["2024"]
+    expect: { effect: destructive, paths: ["2024"], rule: shell.redirect-truncate }
+
+  - name: redir-dup-output-to-filename-is-a-write
+    cmd: "echo hi >& logfile"
+    cwd_fixture: ["logfile"]
+    expect: { effect: destructive, paths: ["logfile"], rule: shell.redirect-truncate }
+
+  - name: redir-fd-close-no-path
+    cmd: "echo hi 2>&-"
+    expect: { effect: safe, paths: [] }
+
+  - name: redir-glob-target-single-match-captures-match
+    cmd: "echo x > *.conf"
+    cwd_fixture: ["app.conf"]
+    expect: { effect: destructive, paths: ["app.conf"], rule: shell.redirect-truncate }
+
+  - name: redir-glob-target-no-match-keeps-literal
+    cmd: "echo x > *.xyz"
+    expect: { effect: destructive, paths: ["*.xyz"], rule: shell.redirect-truncate }
