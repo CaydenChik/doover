@@ -1,0 +1,18 @@
+{
+ "session_id": "00000000-0000-4000-8000-000000000232",
+ "transcript_path": "/Users/tester/.claude/projects/placeholder/transcript.jsonl",
+ "cwd": "/Users/tester/project",
+ "prompt_id": "placeholder-prompt",
+ "permission_mode": "auto",
+ "effort": {
+  "level": "xhigh"
+ },
+ "hook_event_name": "PreToolUse",
+ "tool_name": "Bash",
+ "tool_input": {
+  "command": "sleep 3 && rm -f f.txt",
+  "description": "Wait 3s then delete f.txt in background",
+  "run_in_background": true
+ },
+ "tool_use_id": "toolu_bg_1"
+}

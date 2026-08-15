@@ -95,15 +95,28 @@ fn all_golden_fixtures_parse() {
             let e = hooks::parse_pre_event(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(!e.command.is_empty(), "{name}");
             assert!(e.cwd.is_absolute(), "{name}");
+            // the background contract fixture must actually pin the flag —
+            // review 2026-08-15: without this, deleting the fixture (or the
+            // field) kept the gate green
+            assert_eq!(
+                e.background,
+                name.contains("run_in_background"),
+                "{name}: background flag mismatch"
+            );
             pre += 1;
         } else {
             let e = hooks::parse_post_event(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(e.duration_ms > 0, "{name}");
+            assert_eq!(
+                e.background,
+                name.contains("run_in_background"),
+                "{name}: background flag mismatch"
+            );
             post += 1;
         }
     }
     assert!(
-        pre >= 5 && post >= 3,
+        pre >= 6 && post >= 4,
         "fixture set shrank: {pre} pre / {post} post"
     );
 }
@@ -569,6 +582,7 @@ fn post_hook_gc_eviction_is_journaled_never_silent() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .unwrap();
     j.complete_by_tool_use("old-s", "t-old", 1).unwrap();
@@ -641,6 +655,7 @@ fn post_hook_free_space_floor_never_auto_evicts() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .unwrap();
     j.complete_by_tool_use("old-s", "t-old", 1).unwrap();
@@ -1085,5 +1100,64 @@ fn single_file_snapshot_error_is_a_loud_gap() {
             .any(|g| g.contains("UNPROTECTED") && g.contains("failed")),
         "the Err arm's gap must fire for a single-file ingest failure: {:?}",
         outcome.gaps
+    );
+}
+
+/// Trial 2026-08-15, measured live: PostToolUse for a run_in_background
+/// command fires at tool RETURN (duration_ms=4 for a 3-second command) and
+/// no later event ever comes. A POST snapshot taken there is a copy of PRE:
+/// it poisoned the conflict oracle (false conflicts prescribing --force),
+/// made bare undo skip the action (POST==PRE reads "changed nothing"), and
+/// made redo re-apply a no-op. A background action must record NO post
+/// state, routing undo into the round-10 honest "cannot verify" path.
+#[test]
+fn background_commands_record_no_post_state() {
+    let r = rig();
+    fs::write(r.cwd.join("victim.txt"), "precious").unwrap();
+    let bg = |json: String| {
+        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        v["tool_input"]["run_in_background"] = serde_json::json!(true);
+        v.to_string()
+    };
+    let pre = hooks::parse_pre_event(&bg(pre_json(
+        "s-bg",
+        "t-bg",
+        &r.cwd,
+        "sleep 3 && rm -f victim.txt",
+    )))
+    .unwrap();
+    let out = hooks::handle_pre(&r.cfg, &pre).unwrap();
+    assert!(
+        out.manifests_attached >= 1,
+        "the PRE capture is still correct at pre time"
+    );
+    // the harness fires post at tool RETURN — the command has not run yet
+    let post = hooks::parse_post_event(&bg(post_json(
+        "s-bg",
+        "t-bg",
+        &r.cwd,
+        "sleep 3 && rm -f victim.txt",
+    )))
+    .unwrap();
+    hooks::handle_post(&r.cfg, &post).unwrap();
+
+    let j = journal(&r.cfg);
+    let a = &j.session_actions("s-bg").unwrap()[0];
+    assert_eq!(a.status, ActionStatus::Completed);
+    let posts = j
+        .manifests_by_role(a.id, doover_core::journal::ManifestRole::Post)
+        .unwrap();
+    assert!(
+        posts.is_empty(),
+        "a POST taken at tool-return is a copy of PRE — record NONE"
+    );
+    assert!(
+        a.note.as_deref().is_some_and(|n| n.contains("background")),
+        "the missing post-state must be a journaled, explained gap: {:?}",
+        a.note
+    );
+    assert!(
+        a.background,
+        "the background flag must be journaled so undo selection can honor it"
     );
 }

@@ -411,8 +411,9 @@ byte-verified against pristine mirrors; every CLI surface exercised.
 - **CONFIRMED live: run_in_background POST==PRE** (the dive's premise-
   caveated HIGH). Background action journaled duration_ms=9 for an 8-second
   script — PostToolUse fires at tool RETURN, POST is a copy of PRE, no
-  corrective event. Fix design (mark background POST untrusted) is now
-  grounded; this is the top unfixed HIGH.
+  corrective event. FIXED in 0.2.2 (Phase D, below) — the shipped design
+  records NO post-state, journals a v3 `background` flag, and bare undo
+  skips background actions by design.
 - Harness note: in headless -p mode a run_in_background child DIES at
   session exit (the deletion never landed); interactive sessions are where
   the full hazard lives.
@@ -423,6 +424,45 @@ byte-verified against pristine mirrors; every CLI surface exercised.
   gitignored files, and warned about .doover before offering clean -fdx.
   The residual risk doover covers is user-confirmed mistakes and opaque
   scripts — both were the scenarios that needed recovery.
+
+## Phase D (2026-08-15) — 0.2.2: background undo, pin/unpin, and its review round
+
+The trial's confirmed HIGH fixed, plus the phantom pin feature — then the
+diff's own 4-lens adversarial review confirmed 14 findings (0 refuted),
+headlined by a HIGH design flaw in the first draft of the background fix.
+
+- **DONE: background commands (run_in_background).** Wire ground truth
+  captured live from harness 2.1.232 (fixtures + README finding #6): the
+  flag rides in tool_input on BOTH events, the post fires at tool RETURN
+  (duration_ms=4 for a 3s command), no completion event ever follows.
+  handle_post records NO post-state + a journaled explanation. THE REVIEW
+  CAUGHT THE FIRST DRAFT: with no POST, the changed-nothing filter died and
+  bare undo OFFERED background no-ops (dev servers), dead-ending users in a
+  --force whose execution reverts post-launch work. Shipped design: journal
+  schema v3 adds a `background` column (threaded from the pre event);
+  `undo_candidates` excludes background rows so bare undo skips them BY
+  DESIGN; explicit `undo <id>` reaches them with a precise refusal (never
+  "may have failed" — it says the outcome is unverifiable by harness
+  design, that forcing reverts later changes too, and that a forced undo
+  cannot be redone), a forced-undo warning, and a background-aware redo
+  error. Pinned at engine level (skip + shadowing + honest messages) and
+  fixture level (background fixtures assert the parsed flag; floors bumped
+  6 pre/4 post/10 files so deleting them breaks the gate).
+- **DONE: pin/unpin CLI** over the existing backend; `log` gained a
+  [pinned] flag (gc's "unpin" advice finally has an enumerable surface);
+  README documents the commands; unpin-RELEASES-to-gc is now pinned by a
+  maintenance test (survival alone was).
+- **DONE: `show` prints journal notes** (through redact(), round-13 belt) —
+  the durable gap/failure records were previously written but unreadable.
+- **DONE (review honesty round): the background note says exactly what
+  happens** (an earlier draft promised a live-filesystem fallback that does
+  not exist — same defect class as the round-13 mask lesson); note-write
+  failure is loud; S10b pins the exit-3 conflict BEFORE --force; CHANGELOG
+  rewritten to match reality.
+- **Process note: this is the third consecutive review round to catch a
+  serious flaw in freshly written protection code (Phase A: 14, Phase C:
+  27, Phase D: 14 findings). The review-before-commit rule has earned
+  permanence.**
 
 ## Carried-forward design risks (address at the step noted; do not forget)
 

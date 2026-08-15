@@ -604,3 +604,104 @@ fn bare_undo_skips_skeleton_manifests() {
     );
     assert_eq!(r.read("real.txt").as_deref(), Some("keep"));
 }
+
+// --- Phase D review 2026-08-15: background commands and undo ---------------
+
+impl Rig {
+    /// Pre + post with run_in_background=true injected into tool_input, like
+    /// harness 2.1.232 sends it (measured: the flag rides on BOTH events and
+    /// the post fires at tool return, before the command's effects exist).
+    /// The command is NOT executed — that is the point.
+    fn run_background(&self, session: &str, tool: &str, cmd: &str) -> i64 {
+        let bg = |json: String| {
+            let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v["tool_input"]["run_in_background"] = serde_json::json!(true);
+            v.to_string()
+        };
+        let pre =
+            hooks::parse_pre_event(&bg(mkjson(session, tool, &self.cwd, cmd, false))).unwrap();
+        let out = hooks::handle_pre(&self.cfg, &pre).unwrap();
+        let post =
+            hooks::parse_post_event(&bg(mkjson(session, tool, &self.cwd, cmd, true))).unwrap();
+        hooks::handle_post(&self.cfg, &post).unwrap();
+        out.action_id
+    }
+}
+
+/// A background no-op (a dev server) must NEVER be offered by bare undo —
+/// its outcome is unverifiable, and offering it dead-ends users in a --force
+/// whose execution reverts post-launch work. Bare undo must skip it AND
+/// still find the genuine destructive action behind it.
+#[test]
+fn bare_undo_skips_background_actions_and_finds_real_ones_behind() {
+    let r = rig();
+    fs::write(r.cwd.join("real.txt"), "keep").unwrap();
+    let real = r.run("s-bgu", "t-real", "rm -f real.txt");
+    // newer background "server" — unknown command, defensive cwd PRE, no POST
+    let _bg = r.run_background("s-bgu", "t-srv", "python server.py");
+    // the world drifts (an Edit-tool change no Bash hook sees)
+    fs::write(r.cwd.join("app.js"), "edited later").unwrap();
+
+    let j = r.journal();
+    let s = r.store();
+    let engine = UndoEngine::new(&j, &s);
+    let report = engine
+        .undo(Selector::Latest, false, false)
+        .expect("bare undo must skip the background action, not refuse on it");
+    assert_eq!(
+        report.target_action, real,
+        "the background no-op must not shadow the genuine destructive action"
+    );
+    assert_eq!(r.read("real.txt").as_deref(), Some("keep"));
+    assert_eq!(
+        r.read("app.js").as_deref(),
+        Some("edited later"),
+        "the skip means later edits are never collateral"
+    );
+}
+
+/// Explicit `undo <id>` of a background action: refuse without --force with
+/// a message that says WHY (by design, not "may have failed") and what
+/// forcing costs; with --force it proceeds, warns about redo, and a
+/// subsequent redo errors cleanly naming the background cause.
+#[test]
+fn explicit_undo_of_background_action_is_honest_end_to_end() {
+    let r = rig();
+    fs::write(r.cwd.join("f.txt"), "v1").unwrap();
+    let id = r.run_background("s-bge", "t-bge", "bash slow-task.sh");
+    // the background task later DID change something
+    fs::write(r.cwd.join("f.txt"), "v2-from-background-task").unwrap();
+
+    let j = r.journal();
+    let s = r.store();
+    let engine = UndoEngine::new(&j, &s);
+    let err = engine.undo(Selector::Action(id), false, false).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("background") && msg.contains("cannot be redone"),
+        "the refusal must diagnose the background design and the force cost: {msg}"
+    );
+    assert!(
+        !msg.contains("may have failed"),
+        "a background command did not fail; the message must not say so: {msg}"
+    );
+
+    let report = engine
+        .undo(Selector::Action(id), true, false)
+        .expect("--force must proceed");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("cannot be redone")),
+        "the forced undo must warn about the one-way door: {:?}",
+        report.warnings
+    );
+    assert_eq!(r.read("f.txt").as_deref(), Some("v1"));
+
+    let redo_err = engine.redo(Selector::Latest, false, false).unwrap_err();
+    assert!(
+        redo_err.to_string().contains("background"),
+        "redo must explain the background cause, not 'may have failed': {redo_err}"
+    );
+}

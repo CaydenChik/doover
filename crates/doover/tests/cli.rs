@@ -739,6 +739,7 @@ fn auto_gc_eviction_warns_on_stderr_through_the_real_binary() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .unwrap();
     j.complete_by_tool_use("old-s", "t-old", 1).unwrap();
@@ -1084,4 +1085,43 @@ fn init_writes_through_a_healthy_settings_symlink() {
         target.contains("doover hook pre") && target.contains("opus"),
         "the link target must receive the merged config"
     );
+}
+
+/// Dive finding `pin-phantom-feature`: gc honored pins, `show` printed
+/// "pinned: yes", gc's remediation said "unpin", README promised pinned
+/// survival — but no command could pin anything. The most predictable
+/// retention request ("keep the action that just saved me") needs a path.
+#[test]
+fn pin_and_unpin_are_real_commands() {
+    let (_tmp, dh) = journal_one_action("rm keep.txt");
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["pin", "1"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("pinned"));
+    let j = doover_core::journal::Journal::open(&dh.join("journal.db")).unwrap();
+    assert!(
+        j.action(1).unwrap().pinned,
+        "the journal row must be pinned"
+    );
+
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["unpin", "1"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("unpinned"));
+    assert!(!j.action(1).unwrap().pinned);
+
+    // unknown id is a clean error, not a silent success
+    Command::cargo_bin("doover")
+        .unwrap()
+        .args(["pin", "999"])
+        .env("DOOVER_HOME", &dh)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not found"));
 }

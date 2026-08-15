@@ -37,3 +37,17 @@ doover misparsing events in the field.
 3. Scrub: capture dir → `/Users/tester/project`, session/prompt/tool_use ids →
    fixed placeholder values, `transcript_path` → placeholder, `duration_ms` →
    42. Command text and structure are preserved verbatim.
+
+## 2026-08-15 addendum — background commands (captured from v2.1.232)
+
+`pre_bash_run_in_background.json` / `post_bash_run_in_background.json` pin a
+sixth contract finding, measured live during the 0.2.1 trial:
+
+6. **`run_in_background: true` rides in `tool_input` on BOTH events, and the
+   PostToolUse for a background command fires at tool RETURN** — the captured
+   post arrived with `duration_ms: 4` for a `sleep 3 && rm` command — with
+   `backgroundTaskId` added to `tool_response`. **No further event fires when
+   the background task actually completes.** doover therefore records no
+   post-state for background actions (the post would be a copy of the
+   pre-state) and journals why; undo's conflict checking falls back to the
+   round-10 "cannot verify (no post-state)" path.

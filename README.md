@@ -98,6 +98,8 @@ when it couldn't fully protect something. Then one day:
 | `doover diff 42` | What changed since that action's before-state |
 | `doover status` | Store size, session summary, cap headroom |
 | `doover gc` | Prune old history (runs automatically too) |
+| `doover pin 42` | Keep an action through any cleanup |
+| `doover unpin 42` | Release it back to normal retention |
 
 A few behaviors worth knowing:
 
@@ -186,8 +188,10 @@ protection covers **your working directory only**. A script that deletes
 
 Measured on Apple Silicon / APFS (run `bench/hook_latency.py` yourself):
 
-- **~4 ms** per command when nothing needs snapshotting, which is most
-  commands (`ls`, `cat`, `git status`, builds, tests).
+- **~5–10 ms** per command when nothing needs snapshotting, which is most
+  commands (`ls`, `cat`, `git status`, builds, tests) — re-measured
+  end-to-end in the 2026-08-15 live-agent trial (~6 ms pre + ~3 ms post,
+  including process spawn).
 - Snapshot cost scales with **file count**, not bytes: ~0.19 ms per file;
   a single 100 MB file costs ~70 ms.
 - Snapshots stop at **5 seconds** (configurable) so a huge tree can never
@@ -212,8 +216,8 @@ alone.
 | `DOOVER_UNKNOWN_POLICY` | `snapshot-cwd` | `passthrough` disables the working-directory fallback |
 | `DOOVER_SKIP_DIRS` | `target,node_modules,.venv,dist,…` | Build-dir names; a match is skipped only if git also ignores it (empty = skip nothing) |
 
-Pinned actions (`pinned` in the journal) survive any cleanup, and the most
-recent hour of history is never evicted for space.
+Pinned actions (`doover pin <id>`) survive any cleanup, and the most recent
+hour of history is never evicted for space.
 
 ## What doover is not
 

@@ -212,9 +212,21 @@ impl<'a> UndoEngine<'a> {
             .journal
             .manifests_by_role(original_id, ManifestRole::Post)?;
         if post.is_empty() {
+            let original = self.journal.action(original_id)?;
             return Err(UndoError::NothingToRestore {
                 id: original_id,
-                reason: "no post-state was recorded (the command may have failed)".into(),
+                reason: if original.background {
+                    // trial 2026-08-15: background commands NEVER get a post-
+                    // state (the harness reports completion at launch) — this
+                    // is by design, not a failure, and it makes a forced undo
+                    // of one a one-way door. Say so precisely.
+                    "background command: no post-state exists to re-apply (the \
+                     harness reports completion at launch); a forced undo of a \
+                     background command cannot be redone"
+                        .into()
+                } else {
+                    "no post-state was recorded (the command may have failed)".into()
+                },
             });
         }
         // conflict oracle after an undo: the world should equal the original's
@@ -450,7 +462,17 @@ impl<'a> UndoEngine<'a> {
                 // failed/abandoned command has no post-snapshot, so we CANNOT
                 // confirm the world is unchanged. Refusing-by-default is the
                 // safe choice — undoing might clobber the user's own work.
-                // --force proceeds.
+                // --force proceeds. Background commands land here BY DESIGN
+                // (their post-state is unverifiable — trial 2026-08-15), so
+                // diagnose them precisely instead of "may have failed".
+                None if journal_target.background => conflicts.push(format!(
+                    "{}: cannot verify it is unchanged — background commands \
+                     report completion at launch, so no post-state exists. \
+                     Forcing reverts EVERYTHING under this path to its \
+                     pre-command state, including changes made afterward, and \
+                     cannot be redone",
+                    m.path.display()
+                )),
                 None => conflicts.push(format!(
                     "{}: cannot verify it is unchanged (no post-state was recorded); \
                      the command may have failed",
@@ -460,6 +482,13 @@ impl<'a> UndoEngine<'a> {
         }
         if !conflicts.is_empty() && !force {
             return Err(UndoError::Conflicts(conflicts));
+        }
+        if force && journal_target.background {
+            warnings.push(
+                "forced undo of a background command cannot be redone: no post-state \
+                 exists to re-apply"
+                    .to_string(),
+            );
         }
 
         let plan: Vec<String> = restore_set

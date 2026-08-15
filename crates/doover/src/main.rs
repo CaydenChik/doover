@@ -73,6 +73,16 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Keep an action (and its snapshots) through any cleanup
+    Pin {
+        /// Journal action id (see `doover log`)
+        id: i64,
+    },
+    /// Release a pinned action back to normal retention
+    Unpin {
+        /// Journal action id (see `doover log`)
+        id: i64,
+    },
     /// Check hooks, store, and platform capabilities
     Doctor,
     /// Harness-facing hook entrypoints (stdin JSON)
@@ -104,6 +114,31 @@ fn main() {
         Command::Doctor => std::process::exit(run_doctor()),
         Command::Show { id } => std::process::exit(run_show(id)),
         Command::Diff { id } => std::process::exit(run_diff(id)),
+        Command::Pin { id } => std::process::exit(run_pin(id, true)),
+        Command::Unpin { id } => std::process::exit(run_pin(id, false)),
+    }
+}
+
+/// Pin/unpin an action. Pinned rows and their store objects survive every
+/// gc pass (retention, store cap, deficit eviction) — the backend has
+/// honored pins since D2; this is the user-facing path the 2026-08-15 dive
+/// found missing while `show`/`gc` already talked about pins.
+fn run_pin(id: i64, pinned: bool) -> i32 {
+    let cfg = doover_core::hooks::HookConfig::from_env();
+    let journal = open_journal_or_exit(&cfg);
+    match journal.set_pinned(id, pinned) {
+        Ok(()) => {
+            if pinned {
+                println!("action #{id} pinned: it and its snapshots survive `doover gc`");
+            } else {
+                println!("action #{id} unpinned: normal retention applies again");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("doover: {e}");
+            1
+        }
     }
 }
 
@@ -233,12 +268,26 @@ fn run_log(limit: i64) {
         if cmd.chars().count() > 60 {
             cmd = format!("{}…", cmd.chars().take(59).collect::<String>());
         }
-        let flags = match (a.has_unknown, a.note.is_some()) {
-            (true, true) => " [unknown, notes]",
-            (true, false) => " [unknown]",
-            (false, true) => " [notes]",
-            (false, false) => "",
-        };
+        // [pinned] included so gc's "unpin" advice has an enumerable surface
+        // (review 2026-08-15: users were told to unpin with no way to list)
+        let mut flags = String::new();
+        for (on, name) in [
+            (a.has_unknown, "unknown"),
+            (a.note.is_some(), "notes"),
+            (a.pinned, "pinned"),
+        ] {
+            if on {
+                if flags.is_empty() {
+                    flags.push_str(" [");
+                } else {
+                    flags.push_str(", ");
+                }
+                flags.push_str(name);
+            }
+        }
+        if !flags.is_empty() {
+            flags.push(']');
+        }
         println!("#{:<5} {status}  {:<13} {cmd}{flags}", a.id, a.effect);
     }
 }
@@ -485,6 +534,17 @@ fn run_show(id: i64) -> i32 {
     }
     if a.pinned {
         println!("  pinned:   yes (gc keeps it)");
+    }
+    // notes are the durable record of protection gaps and restore failures
+    // (`log` only marks their existence with [notes]) — a record nobody can
+    // read is not a record (review 2026-08-15)
+    if let Some(note) = &a.note {
+        // notes carry paths and error strings, never commands — but redact()
+        // is idempotent and cheap, and round 13's rule is that every
+        // user-facing journal-text surface goes through it (defense in depth)
+        for line in doover_core::redact::redact(note).lines() {
+            println!("  note:     {line}");
+        }
     }
 
     for (role, label) in [(ManifestRole::Pre, "pre"), (ManifestRole::Post, "post")] {

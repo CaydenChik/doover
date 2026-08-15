@@ -196,6 +196,9 @@ pub struct PreEvent {
     pub tool_name: String,
     pub cwd: PathBuf,
     pub command: String,
+    /// run_in_background rides in tool_input on the PRE event too (measured,
+    /// trial 2026-08-15) — journaled so undo selection can honor it.
+    pub background: bool,
 }
 
 #[derive(Debug)]
@@ -204,12 +207,19 @@ pub struct PostEvent {
     pub tool_use_id: String,
     pub tool_name: String,
     pub duration_ms: i64,
+    /// The Bash tool's run_in_background flag (trial 2026-08-15, measured on
+    /// harness 2.1.232: it rides in tool_input on BOTH pre and post events).
+    /// For background commands PostToolUse fires at tool RETURN — before the
+    /// command's effects exist — and no later event ever comes.
+    pub background: bool,
 }
 
 mod wire {
     #[derive(serde::Deserialize)]
     pub struct ToolInput {
         pub command: Option<String>,
+        #[serde(default)]
+        pub run_in_background: Option<bool>,
     }
     #[derive(serde::Deserialize)]
     pub struct Event {
@@ -246,6 +256,11 @@ pub fn parse_pre_event(json: &str) -> Result<PreEvent, HookError> {
     if e.tool_name != "Bash" {
         return Err(HookError::NotBash(e.tool_name));
     }
+    let background = e
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.run_in_background)
+        .unwrap_or(false);
     let command = e
         .tool_input
         .and_then(|t| t.command)
@@ -256,6 +271,7 @@ pub fn parse_pre_event(json: &str) -> Result<PreEvent, HookError> {
         tool_name: "Bash".into(),
         cwd: PathBuf::from(e.cwd),
         command,
+        background,
     })
 }
 
@@ -264,12 +280,18 @@ pub fn parse_post_event(json: &str) -> Result<PostEvent, HookError> {
     if e.tool_name != "Bash" {
         return Err(HookError::NotBash(e.tool_name));
     }
+    let background = e
+        .tool_input
+        .as_ref()
+        .and_then(|t| t.run_in_background)
+        .unwrap_or(false);
     Ok(PostEvent {
         session_id: e.session_id,
         tool_use_id: e.tool_use_id,
         tool_name: "Bash".into(),
         // the contract has no exit code; duration is the only post metric
         duration_ms: e.duration_ms.unwrap_or(0),
+        background,
     })
 }
 
@@ -346,6 +368,7 @@ pub fn handle_pre(cfg: &HookConfig, ev: &PreEvent) -> Result<PreOutcome, HookErr
         effect: r.severity.as_str(),
         rule_id: r.rule_id.as_deref(),
         has_unknown: r.has_unknown,
+        background: ev.background,
     })?;
 
     #[cfg(debug_assertions)]
@@ -525,6 +548,39 @@ pub fn handle_post(cfg: &HookConfig, ev: &PostEvent) -> Result<ActionId, HookErr
     // test-only failure injection: see handle_pre
     #[cfg(debug_assertions)]
     consume_test_journal_ro_marker(cfg, &journal);
+
+    // run_in_background: PostToolUse fires at tool RETURN — measured live at
+    // duration_ms=4 for a 3-second command, with no later event ever coming
+    // (trial 2026-08-15). A POST snapshot taken here is a copy of PRE: it
+    // poisoned the conflict oracle (systematic false conflicts prescribing
+    // --force), made bare undo skip the action (POST==PRE reads "changed
+    // nothing"), and made redo re-apply a no-op. Record NO post state and
+    // say why: the round-10 "cannot verify (no post-state)" honesty path
+    // governs undo of background actions.
+    if ev.background {
+        // the note must say exactly what happens, no more (review 2026-08-15:
+        // an earlier draft promised a live-filesystem fallback that does not
+        // exist). And its failure must be loud: without the note AND without
+        // post manifests, this row is indistinguishable from a killed command.
+        if journal
+            .add_note(
+                action,
+                "background command: no post-state exists (the harness reports \
+                 completion at launch, before the command's effects). Bare \
+                 `doover undo` will not select this action; undo it explicitly \
+                 by id — the outcome cannot be verified, so undoing requires \
+                 --force and cannot be redone",
+            )
+            .is_err()
+        {
+            eprintln!(
+                "doover: warning: could not journal the background-command note \
+                 for action #{action}"
+            );
+        }
+        maybe_gc(cfg, &journal, action);
+        return Ok(action);
+    }
 
     // capture POST state for every path we pre-snapshotted: it is what redo
     // restores, and the conflict oracle for undo ("is the world still as the

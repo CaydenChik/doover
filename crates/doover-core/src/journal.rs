@@ -18,7 +18,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Which side of an action a manifest captures: state before the command
@@ -122,6 +122,9 @@ pub struct NewAction<'a> {
     pub effect: &'a str,
     pub rule_id: Option<&'a str>,
     pub has_unknown: bool,
+    /// The Bash tool's run_in_background flag: no post-state will ever be
+    /// verifiable for this action (see the v3 migration note).
+    pub background: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -144,6 +147,9 @@ pub struct ActionRecord {
     pub started_at_ms: i64,
     pub duration_ms: Option<i64>,
     pub note: Option<String>,
+    /// run_in_background command: its post-state is unverifiable by harness
+    /// design, so bare undo never selects it (v3 migration note).
+    pub background: bool,
 }
 
 /// True for SQLITE_BUSY / SQLITE_LOCKED — the transient contention class the
@@ -279,6 +285,18 @@ impl Journal {
                         CHECK(role IN ('pre','post'));
                      PRAGMA user_version = 2;",
                 )?;
+                version = 2;
+            }
+            if version == 2 {
+                // v3: actions gain a background flag. run_in_background
+                // commands have NO verifiable post-state (the harness reports
+                // completion at launch — measured live, trial 2026-08-15), so
+                // bare `doover undo` must not select them; only an explicit
+                // `undo <id>` may, with the honest cannot-verify conflict.
+                conn.execute_batch(
+                    "ALTER TABLE actions ADD COLUMN background INTEGER NOT NULL DEFAULT 0;
+                     PRAGMA user_version = 3;",
+                )?;
             }
             Ok(())
         })();
@@ -318,8 +336,9 @@ impl Journal {
             )?;
             self.conn.execute(
                 "INSERT INTO actions(session_id, seq, kind, tool_use_id, raw_command,
-                                     effect, rule_id, has_unknown, status, started_at_ms)
-                 VALUES (?1, ?2, 'command', ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                                     effect, rule_id, has_unknown, background, status,
+                                     started_at_ms)
+                 VALUES (?1, ?2, 'command', ?3, ?4, ?5, ?6, ?7, ?9, 'pending', ?8)",
                 rusqlite::params![
                     new.session_id,
                     seq,
@@ -329,6 +348,7 @@ impl Journal {
                     new.rule_id,
                     new.has_unknown,
                     now_ms(),
+                    new.background,
                 ],
             )?;
             Ok(self.conn.last_insert_rowid())
@@ -482,6 +502,7 @@ impl Journal {
         let mut stmt = self.conn.prepare(&format!(
             "{SELECT_ACTION} WHERE kind = 'command'
                AND status IN ('completed','abandoned','undone')
+               AND background = 0
                AND EXISTS (SELECT 1 FROM manifests m
                            WHERE m.action_id = actions.id AND m.role = 'pre')
              ORDER BY id DESC LIMIT ?1"
@@ -857,7 +878,7 @@ impl Journal {
 
 const SELECT_ACTION: &str = "SELECT id, session_id, seq, kind, tool_use_id, raw_command, effect,
         rule_id, has_unknown, status, target_action_id, target_prior_status, pinned,
-        started_at_ms, duration_ms, note
+        started_at_ms, duration_ms, note, background
  FROM actions";
 
 fn row_to_action(r: &rusqlite::Row) -> Result<ActionRecord, rusqlite::Error> {
@@ -880,5 +901,6 @@ fn row_to_action(r: &rusqlite::Row) -> Result<ActionRecord, rusqlite::Error> {
         started_at_ms: r.get(13)?,
         duration_ms: r.get(14)?,
         note: r.get(15)?,
+        background: r.get(16)?,
     })
 }

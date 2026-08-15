@@ -26,6 +26,7 @@ fn new_action<'a>(session: &'a str, cmd: &'a str, tool_use: Option<&'a str>) -> 
         effect: "destructive",
         rule_id: Some("coreutils.rm"),
         has_unknown: false,
+        background: false,
     }
 }
 
@@ -138,7 +139,7 @@ fn a_v1_journal_migrates_to_v2_preserving_manifests_as_pre() {
         .unwrap();
     }
 
-    let j = Journal::open(&db).unwrap(); // migrates 1 -> 2
+    let j = Journal::open(&db).unwrap(); // migrates 1 -> current
     let pre = j.manifests_by_role(1, ManifestRole::Pre).unwrap();
     assert_eq!(pre.len(), 1, "legacy manifests default to role=pre");
     assert!(
@@ -146,11 +147,15 @@ fn a_v1_journal_migrates_to_v2_preserving_manifests_as_pre() {
             .unwrap()
             .is_empty()
     );
+    assert!(
+        !j.action(1).unwrap().background,
+        "legacy actions default to foreground (v3 column)"
+    );
     let v: i64 = rusqlite::Connection::open(&db)
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(v, 2);
+    assert_eq!(v, 3);
 }
 
 #[test]

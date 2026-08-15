@@ -54,6 +54,7 @@ impl Rig {
                 effect: "destructive",
                 rule_id: Some("coreutils.rm"),
                 has_unknown: false,
+                background: false,
             })
             .unwrap();
         self.journal.complete_by_tool_use("s1", tool, 1).unwrap();
@@ -364,6 +365,7 @@ fn prune_keeps_a_just_begun_empty_session_but_collects_old_ones() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .expect("in-flight session must still accept its first action");
 
@@ -420,6 +422,7 @@ fn dry_run_session_estimate_equals_real_deletion_exactly() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .unwrap();
     r.journal.complete_by_tool_use("B", "b-cmd", 1).unwrap();
@@ -438,6 +441,7 @@ fn dry_run_session_estimate_equals_real_deletion_exactly() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .unwrap();
 
@@ -782,6 +786,7 @@ fn gc_never_evicts_a_pending_actions_objects() {
             effect: "destructive",
             rule_id: None,
             has_unknown: false,
+            background: false,
         })
         .unwrap();
     r.journal
@@ -943,5 +948,36 @@ fn gc_keeps_objects_of_an_old_action_referenced_by_a_recent_undo() {
     assert!(
         !r.world.join("precious.txt").exists(),
         "redo re-applied the rm"
+    );
+}
+
+/// Phase D review PIN-2: pin survival was tested, RELEASE was not — nothing
+/// proved that unpinning actually lets gc collect. Pin an old action through
+/// a gc pass, unpin it, and the next pass must prune its objects.
+#[test]
+fn unpin_releases_an_action_back_to_gc() {
+    let r = rig();
+    let base = 1_000_000_000_000;
+    let (a, h) = r.action_at("unpin.txt", "unpin content", base, "t1");
+    // a recent anchor so the journal-relative cutoff makes `a` old
+    let (_anchor, _h2) = r.action_at("anchor.txt", "recent", base + 10 * DAY_MS, "t2");
+    r.journal.set_pinned(a, true).unwrap();
+    let opts = GcOptions {
+        keep_days: 7,
+        dry_run: false,
+        cap_bytes: None,
+        min_free_bytes: None,
+        time_budget: None,
+    };
+
+    maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+    assert!(r.object_exists(&h), "pinned action must survive gc");
+    assert!(r.journal.action(a).is_ok());
+
+    r.journal.set_pinned(a, false).unwrap();
+    maintenance::gc(&r.journal, &r.store, &r.dh, &opts).unwrap();
+    assert!(
+        !r.object_exists(&h),
+        "an unpinned action past retention must be collected by the next gc"
     );
 }

@@ -3,3 +3,6 @@
 .DS_Store
 *.log
 .claude/worktrees/
+
+# local trial/scratch workspaces (real machine data; never commit)
+/trial-workspace/

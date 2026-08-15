@@ -26,7 +26,7 @@ fn load(p: &Path) -> Value {
 #[test]
 fn all_fixtures_carry_the_contract_fields() {
     let files = fixtures();
-    assert!(files.len() >= 8, "fixture set has shrunk: {}", files.len());
+    assert!(files.len() >= 10, "fixture set has shrunk: {}", files.len());
     for path in &files {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let v = load(path);

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.2.2 — 2026-08-15
+
+Built on the results of the second live-agent trial (run against released
+0.2.1 with real Claude Code sessions).
+
+### Fixed
+
+- **Background commands no longer poison undo.** For `run_in_background`
+  Bash commands the harness fires PostToolUse at tool *return* — measured
+  live: 4 ms into a 3-second command, with no later event when the task
+  finishes. The recorded post-state was therefore a copy of the pre-state,
+  which caused false conflicts (training users onto `--force`), made bare
+  `undo` skip the action, and made `redo` a no-op. doover now records **no**
+  post-state for background actions and journals why; undo's conflict check
+  honestly reports "cannot verify (no post-state)" and checks the live
+  filesystem instead.
+- `doover show` now prints an action's journal notes (protection gaps,
+  restore-failure records). `log` marks them with `[notes]`; previously
+  nothing displayed their content.
+
+### Added
+
+- **`doover pin <id>` / `doover unpin <id>`** — keep an action and its
+  snapshots through every cleanup pass. The backend always honored pins;
+  the commands now exist (the docs and gc hints already referred to them).
+- Golden hook fixtures for background commands (captured live from Claude
+  Code v2.1.232), pinning the at-tool-return contract.
+- An e2e scenario driving the restore failure arms and the
+  nested-`DOOVER_HOME` layout through the real binary.
+
+### Changed
+
+- README latency claim re-measured end-to-end in the live trial: ~5–10 ms
+  per command (was "~4 ms").
+
 ## 0.2.1 — 2026-08-15
 
 The restore-hardening release: the remaining confirmed findings from the
