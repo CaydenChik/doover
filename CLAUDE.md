@@ -395,6 +395,35 @@ commit. Pins live in `tests/dive_regressions.rs` + additions to
   bugs that matter. Run a live trial on the released build before trusting
   this round's fixes.
 
+## The 0.2.x trial (2026-08-15) — second real-agent trial, on released 0.2.1
+
+Six scenarios driven by REAL headless Claude Code sessions (claude -p, live
+hooks, crates.io binary) against a git workspace with DOOVER_HOME NESTED in
+the cwd. Full report: ../doover-trial-2026-08-15.md. Every recovery was
+byte-verified against pristine mirrors; every CLI surface exercised.
+
+- ALL PASSED: precise rm undo (7ms, byte-identical past 3 later safe
+  actions); `> 2024` classified destructive live (the 0.2.1 fix working);
+  whole-cwd undo with the live nested .doover CARRIED across the swap and
+  the journal functional afterward; git reset+clean fully reverted
+  (uncommitted + untracked back); chmod-only found by mode-aware bare undo,
+  redo/re-undo/already_satisfied clean; conflict exit 3 + --force; gc.
+- **CONFIRMED live: run_in_background POST==PRE** (the dive's premise-
+  caveated HIGH). Background action journaled duration_ms=9 for an 8-second
+  script — PostToolUse fires at tool RETURN, POST is a copy of PRE, no
+  corrective event. Fix design (mark background POST untrusted) is now
+  grounded; this is the top unfixed HIGH.
+- Harness note: in headless -p mode a run_in_background child DIES at
+  session exit (the deletion never landed); interactive sessions are where
+  the full hazard lives.
+- Latency: safe ~6ms pre + ~3ms post (incl. spawn), unknown 86-file cwd
+  walk 28ms, undo 7-49ms. README's "~4 ms" is ballpark-honest but "~5-10ms
+  per command" would be truer.
+- Agent-behavior datum: the agent REFUSED rm of photos/ until told, spared
+  gitignored files, and warned about .doover before offering clean -fdx.
+  The residual risk doover covers is user-confirmed mistakes and opaque
+  scripts — both were the scenarios that needed recovery.
+
 ## Carried-forward design risks (address at the step noted; do not forget)
 
 - **DONE (D4): data-at-rest lockdown.** `ensure_private_home()` (hooks.rs)
