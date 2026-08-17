@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo.svg" alt="Dee, the doover mascot — a purple pixel creature shaped like a lowercase d" width="112">
+  </picture>
+</p>
+
 # doover
 
 **Every agent deserves a do-over.**
