@@ -1,0 +1,39 @@
+name: Bug report
+description: Something misbehaved — a restore, the CLI, the hooks.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Redact secrets** before pasting journal/log output. `doover log` and
+        `doover show` redact known credential shapes, but check anyway.
+  - type: input
+    id: version
+    attributes:
+      label: doover --version
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and filesystem
+      placeholder: macOS 15 / APFS · Ubuntu 24.04 / ext4 · WSL2 / ext4
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Include the command involved and the doover output verbatim.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: doover doctor output
+      render: text
+  - type: textarea
+    id: journal
+    attributes:
+      label: Relevant `doover log` / `doover show <id>` excerpts
+      render: text

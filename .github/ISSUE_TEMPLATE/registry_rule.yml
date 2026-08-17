@@ -1,0 +1,33 @@
+name: Registry rule proposal
+description: Teach doover a command's reversibility (CC0 contribution).
+labels: [registry]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read the safe-rule trap in CONTRIBUTING.md first: a `safe` rule is a
+        promise NOT to snapshot. Verify by EXECUTING the command, not by
+        reading its man page.
+  - type: input
+    id: command
+    attributes:
+      label: Command (and subcommand, if any)
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What does it write/truncate/delete, via which flags?
+      description: |
+        Include the flags that make a "read-only" command write (output
+        flags, in-place, exec hooks), and note BSD vs GNU differences you
+        verified by running it.
+    validations:
+      required: true
+  - type: checkboxes
+    id: verified
+    attributes:
+      label: Verification
+      options:
+        - label: I ran the command variants rather than trusting documentation
+        - label: I agree this data is dedicated to the public domain (CC0-1.0)

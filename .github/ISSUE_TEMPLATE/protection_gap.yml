@@ -1,0 +1,37 @@
+name: Protection gap
+description: A destructive command doover misclassified or under-captured.
+labels: [protection-gap, registry]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most valuable report doover gets. Note: for commands doover
+        cannot parse, the DOCUMENTED behavior is a working-directory-only
+        snapshot ("unknown") — that alone is not a gap. A gap is a destructive
+        command classified `safe`/`mutating`, or precise capture that missed
+        the real target, or a loud warning that never fired.
+  - type: input
+    id: command
+    attributes:
+      label: The exact command
+    validations:
+      required: true
+  - type: input
+    id: classification
+    attributes:
+      label: How doover classified it (from `doover log`)
+      placeholder: "#12  completed  safe  sort -o data data"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What it actually destroyed / should have captured
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS (BSD/GNU userland matters for flags)
+    validations:
+      required: true

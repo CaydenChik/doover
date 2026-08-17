@@ -44,9 +44,11 @@ confirm green → only then claim done. Build order and per-step test gates are 
   NOTICE propagates downstream and must carry attribution only.)
 - Unknown/opaque shell constructs must never classify as `safe` — `unknown` or
   stricter. This is a load-bearing safety invariant with property tests behind it.
-- Exit codes: 0 ok, 1 runtime error, 2 hook block decision, 3 undo conflict.
-  (64 not-implemented is retired — every subcommand is implemented as of
-  step 8.)
+- Exit codes: 0 ok, 1 runtime error, 3 undo conflict. Exit 2 is RESERVED
+  (it was specced as "hook block decision"; blocking was retired with
+  ask-mode and no code path produces it — if blocking ever returns, the
+  fail-open catch_unwind wrapper needs a deliberate carve-out). 64
+  not-implemented is retired — every subcommand is implemented.
 
 ## The user-#1 trial (2026-07-14) — read this before writing another audit
 
