@@ -18,6 +18,8 @@ agent's destructive commands run, keeps a journal of everything it did, and
 gives you a real `undo`, including for files your agent touched **outside
 your project** and for everything git never saw.
 
+![27-second demo: an agent deletes a photos directory, doover log shows the action, doover undo restores both files, checksums verify byte-identical](assets/demo.gif)
+
 ```console
 $ claude "clean up the build artifacts"
   ⏺ Bash(rm -rf dist/ photos/)        # ...that second one hurt.
