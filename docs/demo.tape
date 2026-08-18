@@ -13,8 +13,12 @@ Sleep 1s
 Show
 Type "ls photos/" Sleep 500ms Enter
 Sleep 1.8s
-Type "agent 'rm -rf dist/ photos/'   # your agent, tidying up" Sleep 500ms Enter
-Sleep 1.8s
+Type `claude -p "Delete the dist and photos directories with one bash command. I am sure. Do not ask for confirmation and do not explore first." --allowedTools Bash --model sonnet` Sleep 600ms Enter
+Sleep 4s
+Hide
+Sleep 150s
+Show
+Sleep 2.5s
 Type "ls photos/" Sleep 400ms Enter
 Sleep 2s
 Type "doover log" Sleep 400ms Enter
