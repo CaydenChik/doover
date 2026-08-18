@@ -430,26 +430,38 @@ impl Store {
         };
         let path = root.join(".restore-lock");
         let file = fs::File::create(&path).map_err(|e| io_err(&path, e))?;
-        let rc = unsafe {
-            libc::flock(
-                std::os::unix::io::AsRawFd::as_raw_fd(&file),
-                libc::LOCK_EX | libc::LOCK_NB,
-            )
-        };
-        if rc != 0 {
-            // ONLY contention means another restore is running; anything else
-            // (ENOTSUP/ENOLCK on network/FUSE mounts) must surface as the real
-            // error — a recovery tool refusing recovery with a false "wait for
-            // the other restore" diagnosis is the trial's headline defect
-            // class (round-2 review RL-2)
+        // Bounded retry on contention: flock + fork have a ghost window. A
+        // concurrently spawned child process (fork -> exec) briefly holds
+        // copies of every parent fd, including another thread's lock fd, so
+        // a release-then-reacquire (undo followed by redo) can see
+        // EWOULDBLOCK for microseconds after the lock was genuinely freed
+        // (caught as a 1-in-3 test-suite flake). Genuine contention holds
+        // for a restore's full duration; ~200ms of retry absorbs ghosts
+        // without materially delaying an honest refusal.
+        for attempt in 0..40 {
+            let rc = unsafe {
+                libc::flock(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+            };
+            if rc == 0 {
+                return Ok(RestoreLock { _file: file });
+            }
+            // ONLY contention means another restore is running; anything
+            // else (ENOTSUP/ENOLCK on network/FUSE mounts) must surface as
+            // the real error — a recovery tool refusing recovery with a
+            // false "wait for the other restore" diagnosis is the trial's
+            // headline defect class (round-2 review RL-2)
             let e = io::Error::last_os_error();
-            return Err(if e.kind() == io::ErrorKind::WouldBlock {
-                SnapshotError::RestoreInProgress
-            } else {
-                io_err(&path, e)
-            });
+            if e.kind() != io::ErrorKind::WouldBlock {
+                return Err(io_err(&path, e));
+            }
+            if attempt < 39 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
-        Ok(RestoreLock { _file: file })
+        Err(SnapshotError::RestoreInProgress)
     }
 
     /// Rollback capture for the undo engine: like [`snapshot`](Self::snapshot)
