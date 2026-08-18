@@ -1,13 +1,18 @@
 # doover: undo for your AI agent's shell commands
 
-Last month I watched a coding agent tidy up a project for me. I asked it to
-clean out the build artifacts. It ran `rm -rf dist/ photos/`, and the second
-directory was not build artifacts. It was photos. There was no trash can, no
-reflog, no checkpoint. The files were just gone.
+A while back a coding agent deleted files of mine while tidying up a
+project. Not build artifacts, files I needed, and there was no trash can,
+no reflog, no checkpoint. They were just gone.
 
-The uncomfortable part is that nothing malfunctioned. The agent did what I
-asked, sloppily, the way agents sometimes do. Every safety layer I thought I
-had stopped one step short of that command:
+I am not an unusual case. The Claude Code repo has a data-loss label with
+over 400 issues filed against it, more than 120 of them open as I write
+this. One user lost around 50GB to an rm -rf on a parent directory
+([#49129](https://github.com/anthropics/claude-code/issues/49129)).
+Another lost a three-year Unity project through git itself
+([#70687](https://github.com/anthropics/claude-code/issues/70687)).
+The uncomfortable part is that nothing malfunctions when this happens.
+Agents run shell commands all day, and shell commands have no undo. Every
+safety layer I thought I had stopped one step short:
 
 - Claude Code's checkpoints rewind edits made through its file tools, but
   commands run through the Bash tool are not checkpointed.
