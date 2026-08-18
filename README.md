@@ -18,7 +18,11 @@ agent's destructive commands run, keeps a journal of everything it did, and
 gives you a real `undo`, including for files your agent touched **outside
 your project** and for everything git never saw.
 
-![Demo: a real Claude Code session deletes dist and photos through the Bash tool, doover log shows the journaled destructive command, doover undo restores both directories, checksums verify byte-identical](assets/demo.gif)
+![Demo: an agent deletes dist and photos through doover's hooks, doover log shows the journaled destructive command, doover undo restores both directories, checksums verify byte-identical](assets/demo.gif)
+
+<sub>The `agent` command in the clip is a stand-in that drives the exact
+hook flow Claude Code drives. [Here is a recording of a real Claude Code
+session](assets/demo-real-session.gif) doing the same thing end to end.</sub>
 
 ```console
 $ claude "clean up the build artifacts"
