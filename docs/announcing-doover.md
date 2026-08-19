@@ -16,8 +16,9 @@ safety layer I thought I had stopped one step short:
 
 - Claude Code's checkpoints rewind edits made through its file tools, but
   commands run through the Bash tool are not checkpointed.
-- Sandboxes limit the blast radius to your workspace, which is exactly where
-  your files live.
+- Sandboxes prevent damage outside your workspace but are blind inside it,
+  which is exactly where your files live. And many setups run no sandbox at
+  all, so in practice there is often no fence to begin with.
 - git protects what you committed. It does nothing for untracked files,
   ignored files (your `.env`, your local database, your test data), or any
   folder that is not a repo. And the agent can destroy uncommitted work
